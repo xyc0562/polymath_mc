@@ -1,0 +1,39 @@
+# Polymarket Musk Tweet Count Trading Bot Configuration
+
+# Trading configuration
+trading:
+  # Edge thresholds (as decimal, e.g., 0.05 = 5%)
+  min_edge_to_buy: 0.05        # Minimum edge required to enter a position
+  min_edge_to_sell: 0.03       # Minimum edge required to exit a position
+
+  # Position limits (in USD)
+  max_position_size_usd: 100.0  # Maximum USD per single position
+  max_total_exposure_usd: 500.0 # Maximum total portfolio exposure
+
+  # Safety margins
+  error_margin: 0.02           # Safety margin for calculations
+
+  # Timing
+  check_interval_seconds: 300  # Seconds between market checks (5 min)
+
+  # Order execution
+  use_limit_orders: true       # Use limit orders (true) or market orders (false)
+  limit_order_offset: 0.01     # Offset from best price for limit orders
+
+  # Risk management
+  stop_loss_pct: 0.50          # Stop loss threshold (50% loss)
+  take_profit_pct: 0.30        # Take profit threshold (30% gain)
+
+  # Liquidity requirements
+  min_liquidity_usd: 100.0     # Minimum orderbook depth required
+  max_spread_pct: 0.10         # Maximum bid-ask spread (10%)
+
+  # Dry run mode - set to true to simulate without executing trades
+  dry_run: false
+
+# Fair value calculator configuration
+fair_value:
+  # Historical parameters for Gaussian model (placeholder)
+  historical_mean: 350.0       # Average tweets per 7-day period
+  historical_std: 100.0        # Standard deviation of tweet count
+  time_decay_factor: 0.8       # How uncertainty decreases over time (0-1)
