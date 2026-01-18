@@ -36,7 +36,8 @@ polymath/
     │
     ├── utils/                # Shared utilities
     │   ├── __init__.py
-    │   └── app_utils.py      # Logging, helpers
+    │   ├── app_utils.py      # Logging, helpers
+    │   └── crypto_utils.py   # Private key encryption/decryption
     │
     └── algo/                 # Trading algorithms
         ├── __init__.py
@@ -78,9 +79,37 @@ pip install -r requirements.txt
 
 ### 3. Configure Your Private Key
 
+Create a `.env` file in the project root:
+
+**Option A: Plain key (simple, less secure)**
 ```bash
-export POLYMARKET_PRIVATE_KEY="0xYourPrivateKeyHere"
+# .env file
+POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
 ```
+
+**Option B: Encrypted key (recommended)**
+```bash
+# Step 1: Encrypt your key (interactive, inputs are hidden)
+python -m src.utils.crypto_utils encrypt
+
+# Step 2: Add to .env file
+# .env file
+ENCRYPTED_POLYMARKET_PRIVATE_KEY=<output from step 1>
+
+# When you run the bot, it will prompt for your password
+```
+
+**Option C: Encrypted key in separate file**
+```bash
+# Step 1: Encrypt and save to file
+python -m src.utils.crypto_utils encrypt --output .encrypted_key
+
+# Step 2: Reference in .env
+# .env file
+ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE=.encrypted_key
+```
+
+**Important:** Add `.env` and `.encrypted_key` to your `.gitignore`!
 
 See the [Security Warning](#security-warning) section below.
 
@@ -130,15 +159,48 @@ To create a new trading algorithm:
 | `web3` / `eth-account` | Ethereum wallet operations |
 | `python-dotenv` | Load environment variables from .env files |
 | `ruamel.yaml` | Parse YAML configuration files |
+| `cryptography` | Private key encryption/decryption |
 
 ## Security Warning
 
 **Your private key controls your funds.** Anyone with access to it can drain your wallet.
 
-- Never commit your private key to version control
-- Never share it with anyone
-- Consider using a dedicated trading wallet with limited funds
-- See the [musk_tweet_count README](src/algo/musk_tweet_count/README.md#security-warning) for encryption recommendations
+### Risks of Plain Environment Variables
+
+Using `POLYMARKET_PRIVATE_KEY` directly exposes your key to:
+- Shell history (`~/.bash_history`, `~/.zsh_history`)
+- Process inspection (`/proc` on Linux)
+- Memory dumps
+- Shoulder surfing
+
+### Recommended: Use Encrypted Keys
+
+The project includes an encryption utility that protects your key with a password:
+
+```bash
+# Encrypt your private key
+python -m src.utils.crypto_utils encrypt
+# Enter private key to encrypt: ******** (hidden)
+# Enter encryption password: ******** (hidden)
+# Confirm password: ******** (hidden)
+# Output: Gk3J8f2mN...base64String...==
+
+# Set the encrypted key (safe to have in shell history)
+export ENCRYPTED_POLYMARKET_PRIVATE_KEY="Gk3J8f2mN...base64String...=="
+
+# Bot will prompt for password at startup
+python -m src.algo.musk_tweet_count.musk_tweet_count --once
+# Enter private key password: ******** (hidden)
+```
+
+### Best Practices
+
+- **Use a dedicated wallet** with limited funds for trading
+- **Never commit keys** to Git (add to `.gitignore`)
+- **Monitor your wallet** for unexpected transactions
+- **Rotate keys** if you suspect compromise
+
+See the [musk_tweet_count README](src/algo/musk_tweet_count/README.md#security-warning) for detailed security documentation.
 
 ## API References
 

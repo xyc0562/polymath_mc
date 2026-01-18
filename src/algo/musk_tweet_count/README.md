@@ -168,40 +168,113 @@ This installs all required packages:
 - `python-dotenv` - For loading environment variables
 - `ruamel.yaml` - For reading config files
 - `web3`, `eth-account` - For blockchain/wallet operations
+- `cryptography` - For private key encryption/decryption
 
 ### Step 4: Set Up Your Private Key
 
-The bot needs your wallet's private key to sign transactions.
+The bot needs your wallet's private key to sign transactions. There are multiple methods, from simplest to most secure.
 
-**Option A: Using a `.env` file (simpler but less secure)**
+#### Method A: Plain Private Key (Simple, Less Secure)
 
-Create a file named `.env` in the project root:
+Set the environment variable directly in your terminal:
 
-```bash
-# In the polymath folder, create .env file
-echo "POLYMARKET_PRIVATE_KEY=your_private_key_here" > .env
-```
-
-Replace `your_private_key_here` with your actual private key (starts with `0x`).
-
-**Option B: Set it directly in your terminal (temporary, more secure)**
-
-**macOS/Linux:**
 ```bash
 export POLYMARKET_PRIVATE_KEY="0xYourPrivateKeyHere"
 ```
 
-**Windows (Command Prompt):**
-```cmd
-set POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
+Or add to a `.env` file in the project root:
+
+```bash
+# .env file
+POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
 ```
 
-**Windows (PowerShell):**
-```powershell
-$env:POLYMARKET_PRIVATE_KEY = "0xYourPrivateKeyHere"
+See [Security Warning](#security-warning) for why plain keys are risky.
+
+#### Method B: Encrypted Private Key (Recommended)
+
+This method encrypts your key with a password. You'll enter the password each time the bot starts.
+
+**Step 1: Encrypt your private key**
+
+```bash
+# Interactive mode (prompts for key and password, both hidden)
+python -m src.utils.crypto_utils encrypt
 ```
 
-Note: This only lasts for the current terminal session.
+This outputs a base64-encoded encrypted string like:
+```
+Gk3J8f2mN...longBase64String...7xKp==
+```
+
+**Step 2: Save the encrypted key**
+
+You have three options:
+
+**Option 2a: Environment variable**
+```bash
+export ENCRYPTED_POLYMARKET_PRIVATE_KEY="Gk3J8f2mN...longBase64String...7xKp=="
+```
+
+**Option 2b: .env file (recommended)**
+
+Add to your `.env` file:
+```bash
+# .env file
+ENCRYPTED_POLYMARKET_PRIVATE_KEY=Gk3J8f2mN...longBase64String...7xKp==
+```
+
+**Option 2c: Separate file**
+
+Save to a file and reference it:
+```bash
+# Save encrypted key to file
+python -m src.utils.crypto_utils encrypt --output .encrypted_key
+
+# Set environment variable pointing to file
+export ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE=.encrypted_key
+
+# Or in .env file:
+# ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE=.encrypted_key
+```
+
+**Step 3: Run the bot**
+
+When you run the bot, it will prompt for your password:
+
+```bash
+python -m src.algo.musk_tweet_count.musk_tweet_count --once
+# Enter private key password: ********
+```
+
+**For testing/automation:** You can set `PK_PWD` to skip the prompt:
+
+```bash
+export PK_PWD="YourPassword"
+# Or in .env: PK_PWD=YourPassword
+```
+
+(Only use this for testing with small amounts - it defeats the purpose of encryption!)
+
+#### Example .env File
+
+```bash
+# .env file - add to .gitignore!
+
+# Option 1: Plain key (less secure)
+# POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
+
+# Option 2: Encrypted key (recommended)
+ENCRYPTED_POLYMARKET_PRIVATE_KEY=Gk3J8f2mN...base64...==
+
+# Option 3: Encrypted key in separate file
+# ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE=.encrypted_key
+
+# Optional: Password for automation (less secure)
+# PK_PWD=YourPassword
+```
+
+**Important:** Add `.env` and `.encrypted_key` to your `.gitignore` file!
 
 ---
 
@@ -319,104 +392,84 @@ Your private key is like the master password to your wallet. Anyone with it can:
 - Store it in plain text on a shared computer
 - Use it on a computer that might have malware
 
-### Current Method: Environment Variables
+### Why Plain Environment Variables Are Risky
 
-The current setup (using `POLYMARKET_PRIVATE_KEY` environment variable) is **convenient but not secure** because:
+Using `POLYMARKET_PRIVATE_KEY` directly is **convenient but not secure** because:
 
-1. **Shell history**: Your key may be saved in `~/.bash_history` or similar
-2. **Process list**: Other programs might see environment variables
+1. **Shell history**: Your key may be saved in `~/.bash_history` or `~/.zsh_history`
+2. **Process list**: Other programs might see environment variables via `/proc`
 3. **Memory dumps**: The key exists in plain text in RAM
 4. **.env files**: If someone accesses your computer, they can read the file
+5. **Shoulder surfing**: Someone might see your screen when you type the key
 
-### Recommended: Encrypt Your Private Key
+### Recommended: Use Encrypted Keys
 
-For better security, encrypt your private key and enter a password each time the bot starts.
+The bot supports encrypted private keys via the `ENCRYPTED_POLYMARKET_PRIVATE_KEY` environment variable. This provides:
 
-**Step 1: Create an encrypted key file**
+- **Password protection**: Even if someone gets the encrypted string, they can't use it without the password
+- **Hidden input**: Password is entered with obfuscation (not visible when typing)
+- **No history exposure**: The encryption tool uses `getpass`, which doesn't save to shell history
 
-Create a Python script `encrypt_key.py`:
+### Encryption/Decryption Tool
 
-```python
-import getpass
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
-import os
+The project includes a utility for encrypting and decrypting private keys:
 
-def encrypt_key():
-    # Get the private key (hidden input)
-    private_key = getpass.getpass("Enter your private key: ")
+```bash
+# Encrypt a private key (interactive, all inputs hidden)
+python -m src.utils.crypto_utils encrypt
 
-    # Get a password to encrypt it
-    password = getpass.getpass("Enter encryption password: ")
-    password_confirm = getpass.getpass("Confirm password: ")
+# Encrypt with arguments (for scripting/piping)
+python -m src.utils.crypto_utils encrypt --key 0xYourKey --password YourPassword
 
-    if password != password_confirm:
-        print("Passwords don't match!")
-        return
+# Pipe key from a file
+cat private_key.txt | python -m src.utils.crypto_utils encrypt --key -
 
-    # Generate encryption key from password
-    salt = os.urandom(16)
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=480000,
-    )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+# Save encrypted key to file
+python -m src.utils.crypto_utils encrypt --output encrypted_key.txt
 
-    # Encrypt the private key
-    f = Fernet(key)
-    encrypted = f.encrypt(private_key.encode())
+# Decrypt (to verify your password works)
+python -m src.utils.crypto_utils decrypt --encrypted "base64string..."
 
-    # Save salt + encrypted key
-    with open('.encrypted_key', 'wb') as file:
-        file.write(salt + encrypted)
-
-    print("Private key encrypted and saved to .encrypted_key")
-    print("Add .encrypted_key to your .gitignore!")
-
-if __name__ == "__main__":
-    encrypt_key()
+# Decrypt from file
+python -m src.utils.crypto_utils decrypt --encrypted "$(cat encrypted_key.txt)"
 ```
 
-**Step 2: Modify the bot to decrypt on startup**
+### How the Bot Loads Keys
 
-Add a decryption function that prompts for password:
+The bot automatically loads from `.env` file, then tries these methods in order:
 
-```python
-import getpass
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
+1. **POLYMARKET_PRIVATE_KEY** - If set, uses this directly (less secure)
+2. **ENCRYPTED_POLYMARKET_PRIVATE_KEY** - If set, decrypts it
+3. **ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE** - If set, reads file and decrypts
 
-def load_encrypted_key(filepath='.encrypted_key'):
-    """Load and decrypt the private key, prompting for password."""
-    password = getpass.getpass("Enter decryption password: ")
+For encrypted keys, password comes from:
+- **PK_PWD** environment variable (for testing/automation)
+- Interactive prompt (hidden input)
 
-    with open(filepath, 'rb') as file:
-        data = file.read()
+### Key Loading Priority
 
-    salt = data[:16]
-    encrypted = data[16:]
-
-    # Recreate encryption key from password
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=480000,
-    )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-
-    # Decrypt
-    f = Fernet(key)
-    return f.decrypt(encrypted).decode()
 ```
-
-This way, even if someone accesses your computer, they cannot use your key without knowing the password.
+┌─────────────────────────────────────────────────────────────┐
+│  Load .env file (if exists)                                 │
+│                              ↓                              │
+│  Is POLYMARKET_PRIVATE_KEY set?                             │
+│  YES → Use it directly (less secure)                        │
+│                              ↓ NO                           │
+│  Is ENCRYPTED_POLYMARKET_PRIVATE_KEY set?                   │
+│  YES → Decrypt with password ──────────────────────┐        │
+│                              ↓ NO                  │        │
+│  Is ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE set?     │        │
+│  YES → Read file, decrypt with password ───────────┤        │
+│                              ↓ NO                  │        │
+│  Error: No private key found                       │        │
+│                                                    ↓        │
+│                              ┌──────────────────────────┐   │
+│                              │ Get password:            │   │
+│                              │ 1. Try PK_PWD env var    │   │
+│                              │ 2. Prompt user (hidden)  │   │
+│                              └──────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Additional Security Tips
 
@@ -430,16 +483,30 @@ This way, even if someone accesses your computer, they cannot use your key witho
 
 5. **Run on a secure machine**: Use a dedicated computer or VM that you trust.
 
+6. **Rotate keys**: If you suspect any compromise, transfer funds to a new wallet immediately.
+
 ---
 
 ## Troubleshooting
 
-### "POLYMARKET_PRIVATE_KEY environment variable not set"
+### "No private key found"
 
-Make sure you've set the environment variable in your current terminal session:
+The bot couldn't find any private key. Set one of these:
+
 ```bash
+# Option 1: Plain key (less secure)
 export POLYMARKET_PRIVATE_KEY="0x..."
+
+# Option 2: Encrypted key (recommended)
+python -m src.utils.crypto_utils encrypt  # Follow prompts
+export ENCRYPTED_POLYMARKET_PRIVATE_KEY="<output from above>"
 ```
+
+### "Decryption failed: incorrect password or corrupted data"
+
+Your password is wrong or the encrypted string is corrupted. Try:
+1. Re-encrypt your key: `python -m src.utils.crypto_utils encrypt`
+2. Verify the password works: `python -m src.utils.crypto_utils decrypt --encrypted "..."`
 
 ### "No active Musk tweet markets found"
 

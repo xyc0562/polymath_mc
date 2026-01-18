@@ -83,7 +83,12 @@ celerybeat-schedule
 
 # Environments
 .env
+.env.*
 .venv
+
+# Encrypted private keys
+.encrypted_key
+*.encrypted_key
 env/
 venv*/
 ENV/
@@ -129,3 +134,5 @@ backtest/coingecko_prices
 backtest/token_shortlist
 
 config/hidden_files/*
+.encrypted_key
+.env

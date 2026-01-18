@@ -28,6 +28,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
 from src.utils.app_utils import get_logger
+from src.utils.crypto_utils import load_private_key
 
 # Load environment variables
 load_dotenv()
@@ -1555,7 +1556,7 @@ class PolymarketTradingBot:
         # Calculate fair prices
         fair_prices = self.fair_value_calculator.calculate_fair_prices(market)
 
-        logger.info(f"Fair prices for {market.question}...")
+        logger.info(f"Fair prices for {market.question}")
         for outcome, price in fair_prices.items():
             logger.info(f"  {outcome}: {price: .2%}")
 
@@ -2001,11 +2002,16 @@ def main():
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Load private key from environment
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        logger.error("POLYMARKET_PRIVATE_KEY environment variable not set")
-        print("Error: Please set POLYMARKET_PRIVATE_KEY environment variable")
+    # Load private key (supports plain or encrypted)
+    try:
+        private_key = load_private_key()
+    except ValueError as e:
+        logger.error(str(e))
+        print(f"Error: {e}")
+        print("\nTo use an encrypted key:")
+        print("  1. Encrypt: python -m src.utils.crypto_utils encrypt")
+        print("  2. Set: export ENCRYPTED_POLYMARKET_PRIVATE_KEY='<output>'")
+        print("  3. Run the bot (you'll be prompted for password)")
         return 1
 
     # Load config from YAML file
