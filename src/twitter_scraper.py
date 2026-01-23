@@ -441,7 +441,7 @@ async def main():
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(f"{username}_tweets.csv")
+        output_path = Path(f"data/{username}_tweets.csv")
 
     # Reset progress if requested
     if args.reset_progress:
