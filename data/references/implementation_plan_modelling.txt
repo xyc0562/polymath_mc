@@ -1,0 +1,407 @@
+Got it. Below is a **clean, self-contained Markdown spec** you can hand directly to Claude Code.
+It assumes **no prior context** beyond “Polymarket 7-day tweet count market” and a trading engine that already knows how to consume **probabilities per bin**.
+
+I’ve been **explicit**, opinionated, and implementation-oriented, and I’ve deliberately removed any dead branches (unofficial scaling, midnight days, etc.) so Claude doesn’t accidentally re-introduce them.
+
+---
+
+````markdown
+# Elon Musk 7-Day Tweet Count Forecasting Model
+**(Official-only, Noon-to-Noon, Intraday + Interday, Production Spec)**
+
+---
+
+## 0. Problem Definition
+
+We trade a Polymarket contract whose settlement value is:
+
+> **Total number of official Elon Musk posts (original posts + retweets)  
+> from 12:00pm US Eastern on Day 0 to 12:00pm US Eastern on Day 7.**
+
+Each trading session asks:
+> “How many posts will Elon Musk make in the next 7 days?”
+
+We receive **live official updates at least every 5 minutes**, with the same timeliness as any unofficial data source.
+
+**Goal:**  
+Given the current time and official posting history, estimate the **full probability distribution** of the 7-day total, so the trading engine can compute EV and position sizes for each bin.
+
+---
+
+## 1. Key Design Decisions (Do NOT change)
+
+These are hard constraints derived from analysis:
+
+1. **Use OFFICIAL data only**
+   - No scaling from unofficial data
+   - No reply inference
+   - No retweet inference
+   - Official is the ground truth and equally timely
+
+2. **Day boundary = 12:00pm → 12:00pm (US Eastern)**
+   - Midnight-to-midnight is WRONG for this market
+   - All aggregation and modeling must respect this
+
+3. **Separate intraday vs interday dynamics**
+   - Intraday burstiness → helps estimate *today*
+   - Interday autocorrelation / regime → dominates 1–6 day forecasts
+
+4. **Rolling / recency-weighted everything**
+   - Posting regime changes
+   - No global static parameters
+
+---
+
+## 2. Time Normalization & Contract-Day Definition
+
+### 2.1 Timezone
+- All timestamps must be parsed as `America/New_York`
+- Do NOT hardcode UTC-5 (DST matters)
+
+### 2.2 Contract-Day (CD)
+For every official event at timestamp `t` (ET):
+
+```python
+contract_date = date(t - 12 hours)
+````
+
+This means:
+
+* Contract-Day `d` covers `[d@12:00, d+1@12:00)`
+* This matches Polymarket settlement exactly
+
+### 2.3 Intraday Time Variable
+
+For each event in contract-day `d`:
+
+```text
+τ = minutes since d@12:00
+τ ∈ [0, 1440)
+```
+
+All intraday models operate on `τ`, **not clock hour**.
+
+---
+
+## 3. Target Variables
+
+### 3.1 Daily Atomic Unit
+
+Let:
+
+```text
+C_d = number of official posts in contract-day d
+```
+
+This is the unit used for:
+
+* regime modeling
+* interday forecasting
+* 7-day summation
+
+### 3.2 Market Target
+
+For a market starting at contract-day `d`:
+
+```text
+S_d = C_d + C_{d+1} + ... + C_{d+6}
+```
+
+We must estimate the **distribution** of `S_d`.
+
+---
+
+## 4. Model Architecture (High Level)
+
+The model has **three layers**:
+
+1. **Intraday Nowcast Model**
+
+   * Estimates today’s final `C_0` from partial data
+
+2. **Interday Regime Model**
+
+   * Forecasts `C_1 … C_6`
+
+3. **Monte Carlo Aggregation**
+
+   * Combines into 7-day distribution
+
+These layers are independent and must stay separate.
+
+---
+
+## 5. Intraday Model (Today Only)
+
+### 5.1 Purpose
+
+Estimate:
+
+```text
+C_0 = total posts in the current contract-day
+```
+
+given partial observations up to current time.
+
+---
+
+### 5.2 Intraday Progress Curve F(τ)
+
+Define:
+
+```text
+F(τ) = E[ C_d(τ) / C_d(1440) ]
+```
+
+Interpretation:
+
+* Expected fraction of a day’s total completed by minute `τ`
+
+#### Construction:
+
+* Bin τ in **5-minute intervals**
+* For each historical contract-day:
+
+  * Compute cumulative count at each τ
+  * Normalize by that day’s final total
+* Average across days using **exponential decay weighting**
+
+Recommended:
+
+* Half-life: **21 days**
+* Maintain separate curves for:
+
+  * weekday vs weekend (based on contract start day)
+
+---
+
+### 5.3 Burst / Session Features (Official Only)
+
+Maintain rolling features from official timestamps:
+
+| Feature        | Definition                                     |
+| -------------- | ---------------------------------------------- |
+| `count_15m`    | events in last 15 minutes                      |
+| `count_60m`    | events in last 60 minutes                      |
+| `count_180m`   | events in last 3 hours                         |
+| `last_gap_min` | minutes between last two events                |
+| `in_session`   | `last_gap_min ≤ 10`                            |
+| `max_10m_60m`  | max events in any 10-min window in last 60 min |
+
+These features **cross the 12:00 boundary naturally** — no information loss.
+
+---
+
+### 5.4 Intraday Nowcast Model
+
+**Target:** final `C_0`
+
+**Inputs (available live):**
+
+* `cum_so_far`
+* `τ`
+* `F(τ)`
+* burst features
+* weekday/weekend flag
+
+**Model type:**
+
+* Regularized regression (Ridge or Poisson GLM)
+* Trained only on official history
+* Predicts **expected final count**
+
+Optionally:
+
+* Estimate residual distribution for uncertainty bands
+
+---
+
+## 6. Interday Regime Model (Core for 1–6 Days Ahead)
+
+### 6.1 Motivation
+
+7-day markets are dominated by **interday persistence**, not intraday noise.
+
+---
+
+### 6.2 Latent Intensity
+
+Let:
+
+```text
+λ_d = latent posting intensity on contract-day d
+```
+
+We estimate this via:
+
+```python
+log(C_d + 1)
+```
+
+---
+
+### 6.3 State Update (EWMA / AR-like)
+
+Recommended v1 (simple, robust):
+
+```python
+λ̂_d = α * log(C_d + 1) + (1 - α) * λ̂_{d-1}
+```
+
+* α ≈ 0.15–0.25
+* Rolling / adaptive
+* Initialize from recent mean
+
+---
+
+### 6.4 Observation Model
+
+Counts are heavy-tailed → use **Negative Binomial**
+
+```text
+C_d ~ NegBin(mean = exp(λ̂_d), dispersion = k)
+```
+
+Estimate `k` from residuals on rolling window.
+
+---
+
+### 6.5 Covariates
+
+Include:
+
+* `is_weekend_start` (based on contract start day)
+  Optionally later:
+* Friday / Sunday indicators
+
+---
+
+## 7. Forecasting 1–6 Days Ahead
+
+### 7.1 Inputs
+
+* Completed contract-days
+* Today’s nowcast `Ĉ_0`
+* Current latent state `λ̂_0`
+
+---
+
+### 7.2 Simulation
+
+For horizon `h = 1..6`:
+
+```text
+λ_{h} ← regime evolution
+C_{h} ~ NegBin(exp(λ_h), k)
+```
+
+Use Monte Carlo:
+
+* 5,000–20,000 paths
+* Cheap and stable
+
+---
+
+## 8. 7-Day Sum Distribution
+
+For each simulation path:
+
+```text
+S = C_0 + C_1 + ... + C_6
+```
+
+From the simulated `S`:
+
+* Compute probability per Polymarket bin
+* Feed into trading engine (EV, Kelly sizing)
+
+---
+
+## 9. Live Update Loop (Every ~5 Minutes)
+
+### Maintained State
+
+* Official event timestamps (recent)
+* Contract-day aggregates (`C_d`)
+* Latent regime state (`λ̂`)
+* Intraday progress curves
+
+### On Each Update
+
+1. Update burst features
+2. Update intraday nowcast for today
+3. Update regime state
+4. Re-simulate 7-day distribution
+5. Push probabilities to trading logic
+
+---
+
+## 10. Validation & Backtesting
+
+Must backtest on rolling windows:
+
+### Targets
+
+* 1-day ahead `C_d`
+* 6-day ahead `C_{d+6}`
+* 7-day sum `S_d`
+
+### Metrics
+
+* MAE / RMSE
+* Interval calibration
+* Bin-level log score or Brier score
+
+### Ablation
+
+Compare:
+
+* interday-only vs intraday+interday
+* with vs without burst features
+* with vs without weekday flag
+
+---
+
+## 11. Explicit Non-Goals (Do NOT Implement)
+
+* ❌ No unofficial data scaling
+* ❌ No midnight day definition
+* ❌ No reply/retweet inference
+* ❌ No static parameters
+* ❌ No global intraday curve without recency weighting
+
+---
+
+## 12. Minimal Class Interface (Suggested)
+
+```python
+class Musk7DayForecaster:
+    def update_events(self, events): ...
+    def nowcast_today(self, now): ...
+    def forecast_future_days(self, n=6): ...
+    def forecast_7day_distribution(self): ...
+```
+
+---
+
+## 13. Final Note
+
+This model is **intentionally conservative**:
+
+* Official-only
+* Contract-aligned
+* Regime-aware
+* Burst-aware without overfitting
+
+It is designed for **real trading**, not academic elegance.
+
+```
+
+---
+
+If you want, next I can:
+- review Claude’s implementation for conceptual correctness
+- help you define **position sizing / Kelly integration** precisely
+- or help design **unit tests** to ensure no contract-boundary or DST bugs slip in
+```
+

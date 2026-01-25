@@ -1,0 +1,210 @@
+"""
+Configuration dataclasses for the forecasting model.
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+
+@dataclass
+class IntradayCurveConfig:
+    """Configuration for intraday progress curve F(τ)."""
+
+    # Bin size in minutes for curve discretization
+    bin_size_minutes: int = 5
+
+    # Half-life for exponential decay weighting (days)
+    half_life_days: float = 21.0
+
+    # Exclude days with zero tweets from curve fitting
+    exclude_zero_days: bool = True
+
+    # Minimum tweets required to include a day in curve fitting
+    min_tweets_per_day: int = 5
+
+
+@dataclass
+class BurstFeaturesConfig:
+    """Configuration for burst feature extraction."""
+
+    # Windows for count features (minutes)
+    window_15m: int = 15
+    window_60m: int = 60
+    window_180m: int = 180
+
+    # Gap threshold for "in session" detection (minutes)
+    session_gap_threshold: int = 10
+
+    # Window for max burst detection (minutes)
+    burst_window: int = 10
+
+
+@dataclass
+class NowcastConfig:
+    """Configuration for intraday nowcast model."""
+
+    # Ridge regression regularization parameter
+    ridge_alpha: float = 1.0
+
+    # Training window in days
+    training_window_days: int = 75
+
+    # Half-life for sample weighting (days)
+    weight_half_life_days: float = 21.0
+
+    # Threshold for implied rate feature (fraction of day)
+    implied_rate_threshold: float = 0.05
+
+    # Minimum training samples before using residual std
+    min_training_days: int = 10
+
+
+@dataclass
+class RegimeConfig:
+    """Configuration for interday regime model."""
+
+    # EWMA smoothing parameter
+    ewma_alpha: float = 0.20
+
+    # Window for initialization (days)
+    initialization_window_days: int = 45
+
+    # Mean reversion rate (per day)
+    mean_reversion_rate: float = 0.05
+
+    # Maximum log intensity (prevents overflow)
+    # ln(300) ≈ 5.70 for max 300 tweets/day
+    max_log_intensity: float = 5.70
+
+
+@dataclass
+class DispersionConfig:
+    """Configuration for dispersion parameter estimation."""
+
+    # Rolling window for k estimation (days)
+    estimation_window_days: int = 90
+
+    # Minimum k value (floor)
+    min_k: float = 0.5
+
+    # Buffer for underdispersion check (1.01 = 1% buffer)
+    underdispersion_buffer: float = 1.01
+
+
+@dataclass
+class WeekendConfig:
+    """Configuration for weekend effect estimation."""
+
+    # Days considered weekend (0=Mon, 5=Sat, 6=Sun)
+    weekend_days: Tuple[int, int] = (5, 6)
+
+    # Window for effect estimation (days)
+    estimation_window_days: int = 90
+
+
+@dataclass
+class MonteCarloConfig:
+    """Configuration for Monte Carlo simulation."""
+
+    # Number of simulations
+    n_simulations: int = 10000
+
+    # Random seed (None for random)
+    random_seed: int = None
+
+
+@dataclass
+class UpdateConfig:
+    """Configuration for update triggers."""
+
+    # Update on new tweet
+    update_on_new_tweet: bool = True
+
+    # Periodic update interval (seconds)
+    periodic_update_seconds: float = 180.0
+
+    # Cache TTL (seconds)
+    cache_ttl_seconds: float = 180.0
+
+
+@dataclass
+class ForecasterConfig:
+    """Main configuration for the forecasting model."""
+
+    # Timezone for contract-day calculations
+    timezone: str = "America/New_York"
+
+    # Contract-day boundary hour (12 = noon)
+    contract_boundary_hour: int = 12
+
+    # Component configs
+    intraday_curve: IntradayCurveConfig = field(default_factory=IntradayCurveConfig)
+    burst_features: BurstFeaturesConfig = field(default_factory=BurstFeaturesConfig)
+    nowcast: NowcastConfig = field(default_factory=NowcastConfig)
+    regime: RegimeConfig = field(default_factory=RegimeConfig)
+    dispersion: DispersionConfig = field(default_factory=DispersionConfig)
+    weekend: WeekendConfig = field(default_factory=WeekendConfig)
+    monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
+
+    # Polymarket bins (lower, upper) inclusive
+    # Default bins for Musk tweet count market
+    bins: List[Tuple[int, int]] = field(default_factory=lambda: [
+        (0, 74),
+        (75, 99),
+        (100, 124),
+        (125, 149),
+        (150, 174),
+        (175, 199),
+        (200, 224),
+        (225, 249),
+        (250, 274),
+        (275, 299),
+        (300, 324),
+        (325, 349),
+        (350, 374),
+        (375, 399),
+        (400, 424),
+        (425, 449),
+        (450, 474),
+        (475, 499),
+        (500, 524),
+        (525, 549),
+        (550, 10000),  # 550+ bin
+    ])
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ForecasterConfig":
+        """Create config from dictionary (e.g., from YAML)."""
+        # Extract nested configs
+        intraday_curve_data = data.pop("intraday_curve", data.pop("intraday", {}))
+        burst_features_data = data.pop("burst_features", {})
+        nowcast_data = data.pop("nowcast", {})
+        regime_data = data.pop("regime", data.pop("interday", {}))
+        dispersion_data = data.pop("dispersion", {})
+        weekend_data = data.pop("weekend", {})
+        monte_carlo_data = data.pop("monte_carlo", {})
+        update_data = data.pop("update", {})
+
+        # Handle bins
+        bins_data = data.pop("bins", None)
+        bins = None
+        if bins_data:
+            bins = [tuple(b) for b in bins_data]
+
+        config = cls(
+            intraday_curve=IntradayCurveConfig(**intraday_curve_data),
+            burst_features=BurstFeaturesConfig(**burst_features_data),
+            nowcast=NowcastConfig(**nowcast_data),
+            regime=RegimeConfig(**regime_data),
+            dispersion=DispersionConfig(**dispersion_data),
+            weekend=WeekendConfig(**weekend_data),
+            monte_carlo=MonteCarloConfig(**monte_carlo_data),
+            update=UpdateConfig(**update_data),
+            **data,
+        )
+
+        if bins:
+            config.bins = bins
+
+        return config
