@@ -99,7 +99,7 @@ class IntradayProgressCurve:
         else:
             self._weekend_curve = self._fallback_curve.copy()
 
-        logger.info(
+        logger.debug(
             f"Fitted progress curves: {len(weekday_curves)} weekdays, "
             f"{len(weekend_curves)} weekends"
         )
@@ -418,7 +418,7 @@ class IntradayNowcast:
         self._historical_mean = float(np.mean(y))
         self._historical_std = float(np.std(y))
 
-        logger.info(
+        logger.debug(
             f"Fitted nowcast model on {len(X)} samples, "
             f"residual_std={self._residual_std:.2f}"
         )

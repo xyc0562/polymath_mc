@@ -46,11 +46,11 @@ class NowcastConfig:
     # Ridge regression regularization parameter
     ridge_alpha: float = 1.0
 
-    # Training window in days
-    training_window_days: int = 75
+    # Training window in days - shorter for faster adaptation
+    training_window_days: int = 45
 
-    # Half-life for sample weighting (days)
-    weight_half_life_days: float = 21.0
+    # Half-life for sample weighting (days) - shorter for more reactivity
+    weight_half_life_days: float = 14.0
 
     # Threshold for implied rate feature (fraction of day)
     implied_rate_threshold: float = 0.05
@@ -64,10 +64,12 @@ class RegimeConfig:
     """Configuration for interday regime model."""
 
     # EWMA smoothing parameter
-    ewma_alpha: float = 0.20
+    # Higher α = faster adaptation to regime changes
+    # α=0.20 → ~5 day memory, α=0.35 → ~3 day memory, α=0.5 → ~2 day memory
+    ewma_alpha: float = 0.35
 
-    # Window for initialization (days)
-    initialization_window_days: int = 45
+    # Window for initialization (days) - shorter to use recent data
+    initialization_window_days: int = 21
 
     # Mean reversion rate (per day)
     mean_reversion_rate: float = 0.05
@@ -76,19 +78,26 @@ class RegimeConfig:
     # ln(300) ≈ 5.70 for max 300 tweets/day
     max_log_intensity: float = 5.70
 
+    # Half-life for recency weighting in initialization (days)
+    # Shorter = more weight on recent days
+    initialization_half_life_days: float = 7.0
+
 
 @dataclass
 class DispersionConfig:
     """Configuration for dispersion parameter estimation."""
 
     # Rolling window for k estimation (days)
-    estimation_window_days: int = 90
+    estimation_window_days: int = 45
 
     # Minimum k value (floor)
     min_k: float = 0.5
 
     # Buffer for underdispersion check (1.01 = 1% buffer)
     underdispersion_buffer: float = 1.01
+
+    # Half-life for recency weighting (days)
+    half_life_days: float = 14.0
 
 
 @dataclass
@@ -99,7 +108,10 @@ class WeekendConfig:
     weekend_days: Tuple[int, int] = (5, 6)
 
     # Window for effect estimation (days)
-    estimation_window_days: int = 90
+    estimation_window_days: int = 45
+
+    # Half-life for recency weighting (days)
+    half_life_days: float = 14.0
 
 
 @dataclass
@@ -111,6 +123,26 @@ class MonteCarloConfig:
 
     # Random seed (None for random)
     random_seed: int = None
+
+    # Bayesian regime adjustment parameters
+    # Minimum F(τ) to avoid division by near-zero
+    regime_adj_f_min: float = 0.05
+
+    # Prior standard deviation (how much regime can vary day-to-day)
+    regime_adj_sigma_prior: float = 0.35
+
+    # Observation noise parameter (higher = trust observation less)
+    regime_adj_sigma0: float = 1.00
+
+    # Adjustment clamp bounds (much tighter than old [0.7, 1.3])
+    regime_adj_min: float = 0.9
+    regime_adj_max: float = 1.1
+
+    # Minimum τ (minutes) before applying adjustment
+    regime_adj_tau_gate: int = 360
+
+    # Minimum F(τ) before applying adjustment
+    regime_adj_f_gate: float = 0.20
 
 
 @dataclass

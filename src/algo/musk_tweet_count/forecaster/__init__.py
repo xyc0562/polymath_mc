@@ -80,6 +80,14 @@ from .backtest import (
     run_quick_backtest,
 )
 
+from .run_backtest import (
+    fetch_historical_data,
+    run_full_backtest,
+    run_quick_backtest as run_quick,
+    run_ablation_study,
+    XTRACKER_START_DATE,
+)
+
 __all__ = [
     # Main forecaster
     "Musk7DayForecaster",
@@ -131,6 +139,12 @@ __all__ = [
     "AblationStudy",
     "load_data_for_backtest",
     "run_quick_backtest",
+
+    # Run backtest script
+    "fetch_historical_data",
+    "run_full_backtest",
+    "run_ablation_study",
+    "XTRACKER_START_DATE",
 ]
 
 __version__ = "1.0.0"

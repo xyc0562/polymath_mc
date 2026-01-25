@@ -44,6 +44,11 @@ class BacktestConfig:
     # Default: evaluate at 25%, 50%, 75% of day
     tau_values: List[int] = field(default_factory=lambda: [360, 720, 1080])
 
+    # Forecast horizons to evaluate (in days)
+    # 1 = today only, 7 = full 7-day period
+    # Default: test all horizons
+    horizons: List[int] = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
+
     # Number of Monte Carlo simulations per forecast
     n_simulations: int = 5000
 
@@ -63,19 +68,31 @@ class SingleForecastResult:
 
     forecast_date: date
     tau: int
+    horizon: int  # Forecast horizon in days (1-7)
     forecast: ForecastResult
     actual_today: int
-    actual_7day: int
+    actual_horizon: int  # Actual count for the horizon period
 
     # Pre-computed metrics
     mae_today: float
-    mae_7day: float
+    mae_horizon: float  # MAE for the horizon forecast
     log_score: float
     brier_score: float
 
     # Calibration checks
     in_50_interval: bool
     in_90_interval: bool
+
+    # Backward compatibility
+    @property
+    def actual_7day(self) -> int:
+        """Backward compatibility: return actual_horizon."""
+        return self.actual_horizon
+
+    @property
+    def mae_7day(self) -> float:
+        """Backward compatibility: return mae_horizon."""
+        return self.mae_horizon
 
 
 @dataclass
@@ -206,21 +223,23 @@ class Backtester:
             test_start_date = sorted_dates[test_start_idx]
 
         if test_end_date is None:
-            # End 7 days before last date (need actual 7-day sum)
-            test_end_idx = len(sorted_dates) - 7
+            # End max_horizon days before last date
+            max_horizon = max(self.backtest_config.horizons)
+            test_end_idx = len(sorted_dates) - max_horizon
             test_end_date = sorted_dates[test_end_idx]
 
-        # Compute actual 7-day sums
-        actual_7day_sums = self._compute_7day_sums(events_by_date, sorted_dates)
+        # Compute actual N-day sums for each horizon
+        actual_sums_by_horizon = {}
+        for horizon in self.backtest_config.horizons:
+            actual_sums_by_horizon[horizon] = self._compute_nday_sums(
+                events_by_date, sorted_dates, horizon
+            )
 
         # Run forecasts
         forecasts = []
 
         for forecast_date in sorted_dates:
             if forecast_date < test_start_date or forecast_date > test_end_date:
-                continue
-
-            if forecast_date not in actual_7day_sums:
                 continue
 
             # Determine training window
@@ -231,36 +250,43 @@ class Backtester:
             if len(training_dates) < self.backtest_config.min_training_days:
                 continue
 
-            # Forecast at each τ value
-            for tau in self.backtest_config.tau_values:
-                try:
-                    result = self._run_single_forecast(
-                        events_by_date,
-                        forecast_date,
-                        tau,
-                        training_dates,
-                        actual_7day_sums[forecast_date],
-                    )
-                    forecasts.append(result)
-
-                    if self.backtest_config.verbose:
-                        logger.info(
-                            f"Forecast {forecast_date} τ={tau}: "
-                            f"actual={result.actual_7day}, pred={result.forecast.mean:.1f}, "
-                            f"MAE={result.mae_7day:.1f}"
-                        )
-
-                except Exception as e:
-                    logger.warning(f"Failed forecast for {forecast_date} τ={tau}: {e}")
+            # Forecast at each horizon and τ value
+            for horizon in self.backtest_config.horizons:
+                # Skip if we don't have actual data for this horizon
+                if forecast_date not in actual_sums_by_horizon[horizon]:
                     continue
+
+                for tau in self.backtest_config.tau_values:
+                    try:
+                        result = self._run_single_forecast(
+                            events_by_date,
+                            forecast_date,
+                            tau,
+                            horizon,
+                            training_dates,
+                            actual_sums_by_horizon[horizon][forecast_date],
+                        )
+                        forecasts.append(result)
+
+                        if self.backtest_config.verbose:
+                            logger.debug(
+                                f"Forecast {forecast_date} h={horizon}d τ={tau}: "
+                                f"actual={result.actual_horizon}, pred={result.forecast.mean:.1f}, "
+                                f"MAE={result.mae_horizon:.1f}"
+                            )
+
+                    except Exception as e:
+                        logger.warning(f"Failed forecast for {forecast_date} h={horizon} τ={tau}: {e}")
+                        continue
 
         # Compute aggregate metrics
         metrics_by_tau = self._compute_metrics_by_tau(forecasts)
         overall_metrics = self._compute_overall_metrics(forecasts)
 
-        # Compute baseline comparisons
+        # Compute baseline comparisons (use 7-day actuals for baselines)
         baseline_metrics = None
         if self.backtest_config.include_naive_baseline or self.backtest_config.include_interday_baseline:
+            actual_7day_sums = actual_sums_by_horizon.get(7, {})
             baseline_metrics = self._compute_baselines(
                 events_by_date,
                 forecasts,
@@ -280,8 +306,9 @@ class Backtester:
         events_by_date: Dict[date, List[TweetEvent]],
         forecast_date: date,
         tau: int,
+        horizon: int,
         training_dates: List[date],
-        actual_7day: int,
+        actual_horizon: int,
     ) -> SingleForecastResult:
         """Run a single forecast and compute metrics."""
         # Prepare training data
@@ -301,7 +328,7 @@ class Backtester:
         # Fit nowcast
         forecaster.nowcast.fit(training_events, training_counts)
 
-        # Fit interday
+        # Fit interday (not needed for horizon=1, but fit anyway for consistency)
         forecaster.interday.fit(training_counts)
 
         # Create Monte Carlo
@@ -320,27 +347,28 @@ class Backtester:
         start_dt, _ = self.contract_utils.get_contract_day_bounds(forecast_date)
         now = start_dt + timedelta(minutes=tau)
 
-        # Run simulation
-        forecast = monte_carlo.simulate(today_events, forecast_date, now)
+        # Run simulation with specified horizon
+        forecast = monte_carlo.simulate_horizon(today_events, forecast_date, now, horizon=horizon)
 
         # Compute metrics
         mae_today = abs(forecast.today_estimate - actual_today)
-        mae_7day = abs(forecast.mean - actual_7day)
-        log_score = compute_log_score(forecast, actual_7day)
-        brier_score = compute_brier_score(forecast, actual_7day)
+        mae_horizon = abs(forecast.mean - actual_horizon)
+        log_score = compute_log_score(forecast, actual_horizon)
+        brier_score = compute_brier_score(forecast, actual_horizon)
 
         # Calibration checks
-        in_50_interval = forecast.p25 <= actual_7day <= forecast.p75
-        in_90_interval = forecast.p5 <= actual_7day <= forecast.p95
+        in_50_interval = forecast.p25 <= actual_horizon <= forecast.p75
+        in_90_interval = forecast.p5 <= actual_horizon <= forecast.p95
 
         return SingleForecastResult(
             forecast_date=forecast_date,
             tau=tau,
+            horizon=horizon,
             forecast=forecast,
             actual_today=actual_today,
-            actual_7day=actual_7day,
+            actual_horizon=actual_horizon,
             mae_today=mae_today,
-            mae_7day=mae_7day,
+            mae_horizon=mae_horizon,
             log_score=log_score,
             brier_score=brier_score,
             in_50_interval=in_50_interval,
@@ -377,31 +405,67 @@ class Backtester:
         )
         return forecaster
 
+    def _compute_nday_sums(
+        self,
+        events_by_date: Dict[date, List[TweetEvent]],
+        sorted_dates: List[date],
+        horizon: int,
+    ) -> Dict[date, int]:
+        """Compute actual N-day sums for each date."""
+        sums = {}
+
+        for i, d in enumerate(sorted_dates):
+            if i + horizon - 1 >= len(sorted_dates):
+                break
+
+            # Check all N days are present
+            n_days = sorted_dates[i:i + horizon]
+            if all(day in events_by_date for day in n_days):
+                total = sum(len(events_by_date[day]) for day in n_days)
+                sums[d] = total
+
+        return sums
+
     def _compute_7day_sums(
         self,
         events_by_date: Dict[date, List[TweetEvent]],
         sorted_dates: List[date],
     ) -> Dict[date, int]:
-        """Compute actual 7-day sums for each date."""
-        sums = {}
+        """Compute actual 7-day sums for each date (backward compatibility)."""
+        return self._compute_nday_sums(events_by_date, sorted_dates, 7)
 
-        for i, d in enumerate(sorted_dates):
-            if i + 6 >= len(sorted_dates):
-                break
+    def _compute_metrics_by_horizon_tau(
+        self,
+        forecasts: List[SingleForecastResult],
+    ) -> Dict[Tuple[int, int], Dict[str, float]]:
+        """Compute metrics grouped by (horizon, τ) pairs."""
+        metrics = {}
 
-            # Check all 7 days are present
-            seven_days = sorted_dates[i:i + 7]
-            if all(day in events_by_date for day in seven_days):
-                total = sum(len(events_by_date[day]) for day in seven_days)
-                sums[d] = total
+        for horizon in self.backtest_config.horizons:
+            for tau in self.backtest_config.tau_values:
+                key_forecasts = [f for f in forecasts if f.horizon == horizon and f.tau == tau]
 
-        return sums
+                if not key_forecasts:
+                    continue
+
+                metrics[(horizon, tau)] = {
+                    "mae_today": np.mean([f.mae_today for f in key_forecasts]),
+                    "mae_horizon": np.mean([f.mae_horizon for f in key_forecasts]),
+                    "rmse_horizon": np.sqrt(np.mean([f.mae_horizon ** 2 for f in key_forecasts])),
+                    "avg_log_score": np.mean([f.log_score for f in key_forecasts]),
+                    "avg_brier_score": np.mean([f.brier_score for f in key_forecasts]),
+                    "coverage_50": np.mean([f.in_50_interval for f in key_forecasts]),
+                    "coverage_90": np.mean([f.in_90_interval for f in key_forecasts]),
+                    "n_forecasts": len(key_forecasts),
+                }
+
+        return metrics
 
     def _compute_metrics_by_tau(
         self,
         forecasts: List[SingleForecastResult],
     ) -> Dict[int, Dict[str, float]]:
-        """Compute metrics grouped by τ value."""
+        """Compute metrics grouped by τ value (backward compatibility)."""
         metrics_by_tau = {}
 
         for tau in self.backtest_config.tau_values:
@@ -467,18 +531,26 @@ class Backtester:
             }
 
         if self.backtest_config.include_interday_baseline:
-            # Interday-only baseline: no intraday adjustment
-            # Uses cum_so_far = 0 for today's prediction
-            # This is a simplified version - just uses regime forecast
+            # Interday-only baseline: pure regime forecast without intraday adjustments
+            # Uses regime intensity for all 7 days (no nowcast, no regime_adjustment)
 
             interday_errors = []
             for f in forecasts:
-                # Use the future days estimate + historical mean for today
-                # This approximates interday-only
-                regime_estimate = f.forecast.future_days_estimate + (
-                    f.forecast.mean - f.forecast.future_days_estimate
-                )
-                interday_errors.append(abs(regime_estimate - f.actual_7day))
+                # future_days_estimate = sum(regime forecasts for days 1-6) * regime_adjustment
+                # We need to un-adjust to get pure regime forecast
+                regime_adj = f.forecast.regime_adjustment
+                if regime_adj > 0:
+                    pure_future_estimate = f.forecast.future_days_estimate / regime_adj
+                else:
+                    pure_future_estimate = f.forecast.future_days_estimate
+
+                # Average daily intensity from regime (6 future days)
+                avg_daily_intensity = pure_future_estimate / 6
+
+                # Interday-only estimate: 7 days of pure regime forecast
+                interday_only_estimate = avg_daily_intensity * 7
+
+                interday_errors.append(abs(interday_only_estimate - f.actual_7day))
 
             if interday_errors:
                 baselines["interday_only"] = {

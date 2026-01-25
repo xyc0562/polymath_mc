@@ -127,7 +127,10 @@ class XTrackerClient:
 
     BASE_URL = "https://xtracker.polymarket.com/api"
 
-    def __init__(self, timeout: int = 30):
+    # XTracker data availability start date
+    DATA_START_DATE = date(2025, 11, 1)
+
+    def __init__(self, timeout: int = 60):
         """
         Initialize XTracker client.
 
@@ -137,44 +140,199 @@ class XTrackerClient:
         self.session = requests.Session()
         self.timeout = timeout
 
-    def get_posts(
+    def fetch_all_posts(
         self,
-        start_date: str,
-        end_date: str,
+        start_date: date,
+        end_date: date,
         handle: str = "elonmusk",
     ) -> List[Dict]:
         """
-        Fetch posts from XTracker API.
+        Fetch all posts in a date range with a single API call.
+
+        The XTracker API returns all posts without pagination.
 
         Args:
-            start_date: ISO format start date (UTC)
-            end_date: ISO format end date (UTC)
+            start_date: Start date (inclusive)
+            end_date: End date (inclusive)
             handle: Twitter handle
 
         Returns:
-            List of post dictionaries
+            List of raw post dictionaries from API
         """
         url = f"{self.BASE_URL}/users/{handle}/posts"
+
+        # Format dates as UTC ISO strings
+        start_str = f"{start_date.isoformat()}T00:00:00.000Z"
+        end_str = f"{end_date.isoformat()}T23:59:59.999Z"
+
         params = {
-            "startDate": start_date,
-            "endDate": end_date,
+            "startDate": start_str,
+            "endDate": end_str,
         }
+
+        logger.info(f"Fetching posts from {start_date} to {end_date}...")
 
         try:
             response = self.session.get(url, params=params, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
 
-            # Handle various response formats
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                return data.get("posts", data.get("data", []))
-            return []
+            # API returns {"success": true, "data": [...]}
+            if isinstance(data, dict):
+                if not data.get("success", False):
+                    logger.error(f"API returned success=false")
+                    return []
+                posts = data.get("data", [])
+            elif isinstance(data, list):
+                posts = data
+            else:
+                posts = []
+
+            logger.info(f"Fetched {len(posts)} total posts")
+            return posts
 
         except requests.RequestException as e:
             logger.error(f"Failed to fetch posts: {e}")
             return []
+
+    def _parse_post(self, post: Dict) -> Optional[TweetEvent]:
+        """
+        Parse a single post from API response into TweetEvent.
+
+        API response format:
+        {
+            "id": "...",
+            "platformId": "...",
+            "content": "RT @user: ..." or "regular tweet",
+            "createdAt": "2026-01-25T13:06:41.000Z",
+            "importedAt": "...",
+            "metrics": null
+        }
+        """
+        try:
+            # Parse timestamp from createdAt field
+            ts_str = post.get("createdAt")
+            if not ts_str:
+                return None
+
+            # Handle Z suffix -> +00:00 for fromisoformat
+            ts_str = ts_str.replace("Z", "+00:00")
+            timestamp = datetime.fromisoformat(ts_str)
+
+            # Determine event type from content
+            content = post.get("content", "")
+            event_type = "retweet" if content.startswith("RT @") else "tweet"
+
+            return TweetEvent(
+                timestamp=timestamp,
+                event_type=event_type,
+                event_id=post.get("id"),
+            )
+
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse post: {e}")
+            return None
+
+    def fetch_all_events(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        handle: str = "elonmusk",
+    ) -> List[TweetEvent]:
+        """
+        Fetch all events in a date range.
+
+        Args:
+            start_date: Start date (default: XTracker start date)
+            end_date: End date (default: today)
+            handle: Twitter handle
+
+        Returns:
+            List of TweetEvent objects sorted by timestamp
+        """
+        if start_date is None:
+            start_date = self.DATA_START_DATE
+
+        if end_date is None:
+            end_date = date.today()
+
+        # Ensure we don't go before data availability
+        if start_date < self.DATA_START_DATE:
+            start_date = self.DATA_START_DATE
+
+        posts = self.fetch_all_posts(start_date, end_date, handle)
+
+        events = []
+        for post in posts:
+            event = self._parse_post(post)
+            if event:
+                events.append(event)
+
+        # Sort by timestamp
+        events.sort(key=lambda e: e.timestamp)
+
+        logger.info(f"Parsed {len(events)} events")
+        return events
+
+    def fetch_events_by_contract_day(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        contract_utils: Optional[ContractDayUtils] = None,
+        handle: str = "elonmusk",
+    ) -> Dict[date, List[TweetEvent]]:
+        """
+        Fetch all events and group by contract-day.
+
+        This fetches all data in a single API call, then groups locally.
+
+        Args:
+            start_date: Start date (default: XTracker start date)
+            end_date: End date (default: today)
+            contract_utils: Contract-day utilities (creates new if None)
+            handle: Twitter handle
+
+        Returns:
+            Dict mapping contract_date -> List[TweetEvent]
+        """
+        if contract_utils is None:
+            contract_utils = ContractDayUtils()
+
+        # Fetch all events
+        events = self.fetch_all_events(start_date, end_date, handle)
+
+        # Group by contract-day
+        events_by_date: Dict[date, List[TweetEvent]] = {}
+
+        for event in events:
+            contract_date = contract_utils.get_contract_date(event.timestamp)
+
+            if contract_date not in events_by_date:
+                events_by_date[contract_date] = []
+
+            events_by_date[contract_date].append(event)
+
+        # Sort events within each day
+        for contract_date in events_by_date:
+            events_by_date[contract_date].sort(key=lambda e: e.timestamp)
+
+        logger.info(f"Grouped into {len(events_by_date)} contract-days")
+
+        return events_by_date
+
+    # Legacy methods for backward compatibility
+
+    def get_posts(
+        self,
+        start_date: str,
+        end_date: str,
+        handle: str = "elonmusk",
+    ) -> List[Dict]:
+        """Legacy method: Fetch posts from XTracker API."""
+        # Parse ISO date strings to date objects
+        start = datetime.fromisoformat(start_date.replace("Z", "+00:00")).date()
+        end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).date()
+        return self.fetch_all_posts(start, end, handle)
 
     def get_contract_day_posts(
         self,
@@ -182,55 +340,24 @@ class XTrackerClient:
         contract_utils: ContractDayUtils,
         handle: str = "elonmusk",
     ) -> List[TweetEvent]:
-        """
-        Fetch all posts for a specific contract-day.
-
-        Args:
-            contract_date: The contract date
-            contract_utils: Contract-day utilities
-            handle: Twitter handle
-
-        Returns:
-            List of TweetEvent objects
-        """
+        """Legacy method: Fetch all posts for a specific contract-day."""
+        # For single day, still use the bulk fetch but filter
         start_dt, end_dt = contract_utils.get_contract_day_bounds(contract_date)
 
-        # Convert to UTC for API
-        utc = ZoneInfo("UTC")
-        start_utc = start_dt.astimezone(utc)
-        end_utc = end_dt.astimezone(utc) - timedelta(seconds=1)  # Exclusive end
+        # Fetch with buffer to ensure we get all posts
+        events = self.fetch_all_events(
+            start_date=contract_date,
+            end_date=contract_date + timedelta(days=1),
+            handle=handle,
+        )
 
-        start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        end_str = end_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        # Filter to just this contract-day
+        result = [
+            e for e in events
+            if contract_utils.get_contract_date(e.timestamp) == contract_date
+        ]
 
-        posts = self.get_posts(start_str, end_str, handle)
-
-        events = []
-        for post in posts:
-            try:
-                # Parse timestamp
-                ts_str = post.get("timestamp", post.get("created_at", ""))
-                if not ts_str:
-                    continue
-
-                # Handle various timestamp formats
-                ts_str = ts_str.replace("Z", "+00:00")
-                timestamp = datetime.fromisoformat(ts_str)
-
-                event = TweetEvent(
-                    timestamp=timestamp,
-                    event_type=post.get("type", "tweet"),
-                    event_id=post.get("id"),
-                )
-                events.append(event)
-
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Failed to parse post: {e}")
-                continue
-
-        # Sort by timestamp
-        events.sort(key=lambda e: e.timestamp)
-        return events
+        return result
 
     def fetch_historical(
         self,
@@ -239,26 +366,23 @@ class XTrackerClient:
         handle: str = "elonmusk",
     ) -> Dict[date, List[TweetEvent]]:
         """
-        Fetch historical posts for training.
+        Legacy method: Fetch historical posts for training.
 
-        Args:
-            n_days: Number of days to fetch
-            contract_utils: Contract-day utilities
-            handle: Twitter handle
-
-        Returns:
-            Dict mapping contract_date -> List[TweetEvent]
+        Now fetches all data in a single API call.
         """
-        history = {}
         today = contract_utils.get_current_contract_date()
+        start_date = today - timedelta(days=n_days)
 
-        for days_ago in range(1, n_days + 1):
-            contract_date = today - timedelta(days=days_ago)
-            events = self.get_contract_day_posts(contract_date, contract_utils, handle)
-            history[contract_date] = events
-            logger.debug(f"Fetched {len(events)} events for {contract_date}")
+        # Ensure we don't go before data availability
+        if start_date < self.DATA_START_DATE:
+            start_date = self.DATA_START_DATE
 
-        return history
+        return self.fetch_events_by_contract_day(
+            start_date=start_date,
+            end_date=today,
+            contract_utils=contract_utils,
+            handle=handle,
+        )
 
 
 class EventStore:

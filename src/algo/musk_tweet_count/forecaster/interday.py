@@ -59,7 +59,9 @@ class RegimeModel:
 
     def initialize(self, historical_counts: Dict[date, int]) -> None:
         """
-        Initialize regime state from historical data.
+        Initialize regime state from historical data with recency weighting.
+
+        More recent days have higher weight, using exponential decay.
 
         Args:
             historical_counts: Dict mapping contract_date -> count
@@ -78,12 +80,36 @@ class RegimeModel:
         window_days = self.config.initialization_window_days
         recent_dates = sorted_dates[-window_days:] if len(sorted_dates) > window_days else sorted_dates
 
-        # Compute log counts
-        log_counts = [np.log(historical_counts[d] + 1) for d in recent_dates]
+        # Reference date for weighting (most recent date)
+        reference_date = recent_dates[-1]
+        half_life = self.config.initialization_half_life_days
 
-        # Initialize λ̂ as mean of recent log counts
-        self._log_intensity = float(np.mean(log_counts))
-        self._long_term_mean = self._log_intensity
+        # Compute weighted log counts with exponential decay
+        log_counts = []
+        weights = []
+
+        for d in recent_dates:
+            log_count = np.log(historical_counts[d] + 1)
+            days_ago = (reference_date - d).days
+            weight = np.exp(-days_ago / half_life * np.log(2))
+
+            log_counts.append(log_count)
+            weights.append(weight)
+
+        # Normalize weights
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+
+        # Initialize λ̂ as weighted mean of recent log counts
+        self._log_intensity = float(np.average(log_counts, weights=weights))
+
+        # Long-term mean uses less recency weighting (longer half-life)
+        long_term_weights = np.array([
+            np.exp(-(reference_date - d).days / (half_life * 3) * np.log(2))
+            for d in recent_dates
+        ])
+        long_term_weights = long_term_weights / long_term_weights.sum()
+        self._long_term_mean = float(np.average(log_counts, weights=long_term_weights))
 
         # Apply cap
         self._log_intensity = min(self._log_intensity, self.config.max_log_intensity)
@@ -95,7 +121,8 @@ class RegimeModel:
         logger.info(
             f"Initialized regime: λ̂={self._log_intensity:.3f}, "
             f"intensity={np.exp(self._log_intensity):.1f}, "
-            f"from {len(recent_dates)} days"
+            f"long_term_mean={np.exp(self._long_term_mean):.1f}, "
+            f"from {len(recent_dates)} days (half_life={half_life}d)"
         )
 
     def update(self, contract_date: date, count: int) -> None:
@@ -212,9 +239,10 @@ class DispersionEstimator:
 
     def estimate(self, historical_counts: Dict[date, int]) -> float:
         """
-        Estimate k from historical count data.
+        Estimate k from historical count data with recency weighting.
 
-        Uses method of moments: k = μ² / (Var - μ)
+        Uses weighted method of moments: k = μ² / (Var - μ)
+        where μ and Var are computed with exponential decay weights.
 
         Args:
             historical_counts: Dict mapping contract_date -> count
@@ -230,18 +258,51 @@ class DispersionEstimator:
         today = self.contract_utils.get_current_contract_date()
         window_start = today - timedelta(days=self.config.estimation_window_days)
 
-        recent_counts = [
-            count for d, count in historical_counts.items()
+        recent_data = [
+            (d, count) for d, count in historical_counts.items()
             if d >= window_start
         ]
 
-        if len(recent_counts) < 10:
-            logger.warning(f"Only {len(recent_counts)} days for k estimation, using default")
+        if len(recent_data) < 10:
+            logger.warning(f"Only {len(recent_data)} days for k estimation, using default")
             return self._k
 
-        counts = np.array(recent_counts)
-        mean = np.mean(counts)
-        variance = np.var(counts, ddof=1)  # Sample variance
+        # Sort by date
+        recent_data.sort(key=lambda x: x[0])
+
+        # Reference date for weighting
+        reference_date = recent_data[-1][0]
+        half_life = self.config.half_life_days
+
+        # Compute weights with exponential decay
+        counts = []
+        weights = []
+
+        for d, count in recent_data:
+            days_ago = (reference_date - d).days
+            weight = np.exp(-days_ago / half_life * np.log(2))
+            counts.append(count)
+            weights.append(weight)
+
+        counts = np.array(counts)
+        weights = np.array(weights)
+
+        # Normalize weights
+        weights = weights / weights.sum()
+
+        # Compute weighted mean
+        mean = np.average(counts, weights=weights)
+
+        # Compute weighted variance
+        # Var = E[(X - μ)²] = E[X²] - μ²
+        mean_sq = np.average(counts ** 2, weights=weights)
+        variance = mean_sq - mean ** 2
+
+        # Apply bias correction for weighted variance (approximate)
+        # This is a simplification; exact correction depends on effective sample size
+        n_eff = 1.0 / np.sum(weights ** 2)  # Effective sample size
+        if n_eff > 1:
+            variance = variance * n_eff / (n_eff - 1)
 
         # Handle underdispersion or near-Poisson cases
         # Use buffer to avoid division instability
@@ -260,8 +321,8 @@ class DispersionEstimator:
         self._k = k
 
         logger.info(
-            f"Estimated dispersion: k={k:.2f} from {len(recent_counts)} days "
-            f"(μ={mean:.1f}, Var={variance:.1f})"
+            f"Estimated dispersion: k={k:.2f} from {len(recent_data)} days "
+            f"(weighted μ={mean:.1f}, Var={variance:.1f}, half_life={half_life}d)"
         )
 
         return self._k
@@ -295,13 +356,13 @@ class WeekendEffect:
 
     def estimate(self, historical_counts: Dict[date, int]) -> float:
         """
-        Estimate weekend effect from historical data.
+        Estimate weekend effect from historical data with recency weighting.
 
         Args:
             historical_counts: Dict mapping contract_date -> count
 
         Returns:
-            Weekend effect (ratio of weekend to weekday mean)
+            Weekend effect (ratio of weekend to weekday weighted mean)
         """
         if not historical_counts:
             logger.warning("No data for weekend effect estimation")
@@ -311,17 +372,28 @@ class WeekendEffect:
         today = self.contract_utils.get_current_contract_date()
         window_start = today - timedelta(days=self.config.estimation_window_days)
 
+        # Reference date for weighting
+        reference_date = max(historical_counts.keys())
+        half_life = self.config.half_life_days
+
         weekday_counts = []
+        weekday_weights = []
         weekend_counts = []
+        weekend_weights = []
 
         for d, count in historical_counts.items():
             if d < window_start:
                 continue
 
+            days_ago = (reference_date - d).days
+            weight = np.exp(-days_ago / half_life * np.log(2))
+
             if d.weekday() in self.config.weekend_days:
                 weekend_counts.append(count)
+                weekend_weights.append(weight)
             else:
                 weekday_counts.append(count)
+                weekday_weights.append(weight)
 
         if len(weekday_counts) < 5 or len(weekend_counts) < 2:
             logger.warning(
@@ -330,8 +402,12 @@ class WeekendEffect:
             )
             return self._effect
 
-        weekday_mean = np.mean(weekday_counts)
-        weekend_mean = np.mean(weekend_counts)
+        # Compute weighted means
+        weekday_weights = np.array(weekday_weights)
+        weekend_weights = np.array(weekend_weights)
+
+        weekday_mean = np.average(weekday_counts, weights=weekday_weights)
+        weekend_mean = np.average(weekend_counts, weights=weekend_weights)
 
         if weekday_mean > 0:
             self._effect = weekend_mean / weekday_mean
@@ -340,7 +416,7 @@ class WeekendEffect:
 
         logger.info(
             f"Estimated weekend effect: {self._effect:.3f} "
-            f"(weekend μ={weekend_mean:.1f}, weekday μ={weekday_mean:.1f})"
+            f"(weekend μ={weekend_mean:.1f}, weekday μ={weekday_mean:.1f}, half_life={half_life}d)"
         )
 
         return self._effect
@@ -417,7 +493,7 @@ class InterdayForecaster:
 
         self._fitted = True
 
-        logger.info("Interday forecaster fitted successfully")
+        logger.debug("Interday forecaster fitted successfully")
 
     def update(self, contract_date: date, count: int) -> None:
         """

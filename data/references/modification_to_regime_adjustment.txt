@@ -1,0 +1,240 @@
+# Option C: Shrinkage / Bayesian (Kalman-style) Regime Adjustment
+
+## Goal
+Use today's *partial-day* information to **nudge** the interday regime daily intensity, but **avoid aggressive scaling** of the remaining week based on a noisy single-day observation.
+
+We replace the current multiplicative `regime_adjustment` (based on `raw_ratio ** 1/3` with clamps) with a **shrinkage update** that:
+- trusts the interday regime as a **prior**
+- treats today's implied full-day count as a **noisy observation**
+- computes a **data-dependent weight** `w(tau)` that is small early and grows later
+- optionally decays the effect by horizon (can be added later; not required for Option C)
+
+This is effectively a 1D Kalman filter update on **log daily intensity**.
+
+---
+
+## Notation
+
+At time `now` on contract day `d`:
+
+- `cum_so_far`: tweets observed so far today
+- `tau`: minutes since contract start (12pm ET) to `now`, in minutes
+- `F_tau`: expected progress fraction by `tau` from progress curve, in (0, 1]
+- `implied_today`: implied full-day count from partial observation
+- `lambda_prior`: current regime daily intensity from interday model (expected daily tweets)
+- `m_prior = log(lambda_prior + 1)`: log-intensity prior (stabilized with +1)
+- `y_obs = log(implied_today + 1)`: log-intensity observation
+
+We form posterior:
+- `m_post = (1-w)*m_prior + w*y_obs`
+- `lambda_post = exp(m_post) - 1`
+
+Then we set:
+- `regime_adjustment = lambda_post / lambda_prior`
+and use it to scale future-day means (or you can later decide to apply it only to nearer horizons).
+
+---
+
+## Step-by-step algorithm
+
+### 1) Compute implied full-day count from partial day
+```python
+F_tau = progress_curve.get_expected_progress(tau, is_weekend)
+# Guard to avoid divide-by-near-zero:
+F_tau = max(F_tau, F_min)
+
+implied_today = cum_so_far / F_tau
+Recommended constants
+
+F_min = 0.05 (avoid exploding implied_today early)
+
+keep your existing gating like tau >= 360 and F_tau >= 0.20 if you want additional safety
+
+2) Prior from interday regime
+python
+Copy code
+lambda_prior = interday.regime.current_intensity  # > 0
+m_prior = log(lambda_prior + 1.0)
+3) Observation in log space
+python
+Copy code
+y_obs = log(implied_today + 1.0)
+Why log?
+
+counts are heavy-tailed; log stabilizes variance
+
+multiplicative errors become additive
+
+your existing regime model already works on log counts, so this is consistent
+
+4) Compute weight w(tau) using uncertainty (Kalman-style)
+We want:
+
+w near 0 early (observation is noisy)
+
+w increases as F_tau grows (more of the day observed → less noisy)
+
+4.1 Choose a simple observation variance model
+A practical model:
+
+counts are roughly Poisson-like, so variance ~ mean
+
+variance of implied full-day count scales roughly like 1 / F_tau
+
+in log space, we can approximate observation variance as:
+
+text
+Copy code
+sigma_obs2(tau) = sigma0^2 / F_tau
+Where:
+
+sigma0 is a tunable constant (higher = trust observation less)
+
+F_tau in (0,1]
+
+4.2 Prior variance
+Set a constant prior variance (how much regime can move day-to-day):
+
+text
+Copy code
+sigma_prior2 = constant
+Given your EWMA alpha=0.5 (half-life ~1 day), prior variance should not be tiny.
+
+4.3 Kalman weight
+text
+Copy code
+w = sigma_prior2 / (sigma_prior2 + sigma_obs2(tau))
+So:
+
+early: F_tau small ⇒ sigma_obs2 large ⇒ w small
+
+late: F_tau close to 1 ⇒ sigma_obs2 shrinks ⇒ w increases
+
+Recommended default parameters (start here)
+sigma_prior = 0.35 (so sigma_prior2 = 0.1225)
+
+sigma0 = 1.00 (so sigma0^2 = 1.0)
+
+Then:
+
+at F_tau=0.20: sigma_obs2=5.0 ⇒ w≈0.1225/(5.1225)=0.0239 (very small)
+
+at F_tau=0.50: sigma_obs2=2.0 ⇒ w≈0.1225/(2.1225)=0.0577
+
+at F_tau=0.80: sigma_obs2=1.25 ⇒ w≈0.1225/(1.3725)=0.0892
+This is intentionally conservative.
+
+If you want a bit more responsiveness, increase sigma_prior or reduce sigma0.
+
+5) Posterior update + adjustment factor
+python
+Copy code
+m_post = (1.0 - w) * m_prior + w * y_obs
+lambda_post = exp(m_post) - 1.0
+
+# Adjustment multiplier applied to future means:
+regime_adjustment = lambda_post / lambda_prior
+6) Clamp adjustment (still recommended)
+Even with shrinkage, keep gentle clamps to avoid rare blow-ups:
+
+python
+Copy code
+regime_adjustment = clamp(regime_adjustment, adj_min, adj_max)
+Recommended:
+
+adj_min = 0.90
+
+adj_max = 1.10
+
+(These can be tuned. They are much tighter than the old [0.7, 1.3].)
+
+Where to plug this in (code integration)
+Replace the current _compute_regime_adjustment(...) in monte_carlo.py with this logic.
+
+Current usage:
+
+_sample_future_days() multiplies each horizon mean by regime_adjustment.
+
+With Option C, keep that structure but the multiplier is now conservative and data-weighted.
+
+Pseudocode (drop-in)
+python
+Copy code
+def compute_regime_adjustment_shrinkage(
+    cum_so_far: float,
+    tau_minutes: int,
+    contract_date: date,
+    progress_curve,
+    interday,
+    is_weekend: bool,
+    *,
+    F_min: float = 0.05,
+    sigma_prior: float = 0.35,
+    sigma0: float = 1.00,
+    adj_min: float = 0.90,
+    adj_max: float = 1.10,
+    tau_gate: int = 360,
+    F_gate: float = 0.20,
+) -> float:
+    # Optional gates (keep if you want)
+    if tau_minutes < tau_gate:
+        return 1.0
+
+    F_tau = progress_curve.get_expected_progress(tau_minutes, is_weekend)
+    if F_tau < F_gate:
+        return 1.0
+
+    F_tau = max(F_tau, F_min)
+
+    implied_today = cum_so_far / F_tau
+
+    lambda_prior = max(interday.regime.current_intensity, 1e-6)
+    m_prior = math.log(lambda_prior + 1.0)
+    y_obs = math.log(implied_today + 1.0)
+
+    sigma_prior2 = sigma_prior ** 2
+    sigma_obs2 = (sigma0 ** 2) / F_tau
+
+    w = sigma_prior2 / (sigma_prior2 + sigma_obs2)
+
+    m_post = (1.0 - w) * m_prior + w * y_obs
+    lambda_post = math.exp(m_post) - 1.0
+    lambda_post = max(lambda_post, 1e-6)
+
+    adj = lambda_post / lambda_prior
+    adj = min(max(adj, adj_min), adj_max)
+    return adj
+Explanation (for Claude)
+What’s wrong with the current approach?
+The current raw_ratio approach effectively says:
+
+"If today's partial activity implies a low full-day count, scale down the next 6 days."
+
+But today's partial is high variance (bursty), so this creates noise and can harm MAE and calibration.
+
+What does Option C do differently?
+It treats:
+
+the interday regime daily intensity as a prior belief
+
+the implied full-day count from partial day as a noisy measurement
+
+Then it computes how much to trust the measurement:
+
+early day ⇒ noisy ⇒ tiny weight
+
+late day ⇒ less noisy ⇒ larger weight
+
+This prevents overreaction while still letting strong evidence shift the regime slightly.
+
+Why log space?
+Tweet counts have multiplicative variability (bursts, quiet days). Log compresses extremes and stabilizes variance. It also matches the interday regime's EWMA on log counts.
+
+What should be tuned?
+sigma_prior and sigma0 control aggressiveness
+
+adj_min/adj_max caps worst-case impact
+
+gates tau_gate, F_gate reduce early noise
+
+Start conservative, then re-run backtest.
