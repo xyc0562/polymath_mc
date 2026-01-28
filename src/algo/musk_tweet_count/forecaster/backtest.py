@@ -7,8 +7,10 @@ Supports:
 - Calibration analysis
 - Ablation studies
 - Visualization helpers
+- Ensemble forecasting (combining fast/slow EWMA models)
 """
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -105,10 +107,13 @@ class BacktestResults:
     # Individual forecast results
     forecasts: List[SingleForecastResult]
 
-    # Aggregate metrics by τ
+    # Aggregate metrics by horizon
+    metrics_by_horizon: Dict[int, Dict[str, float]]
+
+    # Aggregate metrics by τ (for backward compatibility, horizon=7 only)
     metrics_by_tau: Dict[int, Dict[str, float]]
 
-    # Overall metrics
+    # Overall metrics (for backward compatibility, horizon=7 only)
     overall_metrics: Dict[str, float]
 
     # Baseline comparisons (if computed)
@@ -122,13 +127,25 @@ class BacktestResults:
         lines.append(f"Date range: {self.forecasts[0].forecast_date} to {self.forecasts[-1].forecast_date}")
         lines.append("")
 
-        lines.append("OVERALL METRICS:")
+        lines.append("METRICS BY HORIZON:")
+        lines.append("-" * 40)
+        for horizon in sorted(self.metrics_by_horizon.keys()):
+            metrics = self.metrics_by_horizon[horizon]
+            lines.append(f"  Horizon {horizon}d:")
+            lines.append(f"    mae_horizon: {metrics.get('mae_horizon', 0):.4f}")
+            lines.append(f"    rmse_horizon: {metrics.get('rmse_horizon', 0):.4f}")
+            lines.append(f"    coverage_50: {metrics.get('coverage_50', 0):.4f}")
+            lines.append(f"    coverage_90: {metrics.get('coverage_90', 0):.4f}")
+            lines.append(f"    n_forecasts: {metrics.get('n_forecasts', 0):.0f}")
+        lines.append("")
+
+        lines.append("OVERALL METRICS (7-day horizon):")
         lines.append("-" * 40)
         for metric, value in self.overall_metrics.items():
             lines.append(f"  {metric}: {value:.4f}")
         lines.append("")
 
-        lines.append("METRICS BY τ (minutes since noon):")
+        lines.append("METRICS BY τ (7-day horizon only):")
         lines.append("-" * 40)
         for tau, metrics in sorted(self.metrics_by_tau.items()):
             lines.append(f"  τ = {tau} ({tau/60:.1f} hours):")
@@ -171,6 +188,7 @@ class Backtester:
         self,
         forecaster_config: Optional[ForecasterConfig] = None,
         backtest_config: Optional[BacktestConfig] = None,
+        use_ensemble: bool = False,
     ):
         """
         Initialize backtester.
@@ -178,9 +196,11 @@ class Backtester:
         Args:
             forecaster_config: Configuration for forecaster
             backtest_config: Configuration for backtesting
+            use_ensemble: Whether to use ensemble forecasting (fast+slow EWMA)
         """
         self.forecaster_config = forecaster_config or ForecasterConfig()
         self.backtest_config = backtest_config or BacktestConfig()
+        self.use_ensemble = use_ensemble
 
         # Contract utils
         self.contract_utils = ContractDayUtils(
@@ -265,6 +285,7 @@ class Backtester:
                             horizon,
                             training_dates,
                             actual_sums_by_horizon[horizon][forecast_date],
+                            use_ensemble=self.use_ensemble,
                         )
                         forecasts.append(result)
 
@@ -279,9 +300,13 @@ class Backtester:
                         logger.warning(f"Failed forecast for {forecast_date} h={horizon} τ={tau}: {e}")
                         continue
 
-        # Compute aggregate metrics
-        metrics_by_tau = self._compute_metrics_by_tau(forecasts)
-        overall_metrics = self._compute_overall_metrics(forecasts)
+        # Compute aggregate metrics by horizon
+        metrics_by_horizon = self._compute_metrics_by_horizon(forecasts)
+
+        # For backward compatibility, compute τ and overall metrics for horizon=7 only
+        forecasts_7d = [f for f in forecasts if f.horizon == 7]
+        metrics_by_tau = self._compute_metrics_by_tau(forecasts_7d)
+        overall_metrics = self._compute_overall_metrics(forecasts_7d)
 
         # Compute baseline comparisons (use 7-day actuals for baselines)
         baseline_metrics = None
@@ -296,6 +321,7 @@ class Backtester:
         return BacktestResults(
             config=self.backtest_config,
             forecasts=forecasts,
+            metrics_by_horizon=metrics_by_horizon,
             metrics_by_tau=metrics_by_tau,
             overall_metrics=overall_metrics,
             baseline_metrics=baseline_metrics,
@@ -309,6 +335,7 @@ class Backtester:
         horizon: int,
         training_dates: List[date],
         actual_horizon: int,
+        use_ensemble: bool = False,
     ) -> SingleForecastResult:
         """Run a single forecast and compute metrics."""
         # Prepare training data
@@ -328,17 +355,6 @@ class Backtester:
         # Fit nowcast
         forecaster.nowcast.fit(training_events, training_counts)
 
-        # Fit interday (not needed for horizon=1, but fit anyway for consistency)
-        forecaster.interday.fit(training_counts)
-
-        # Create Monte Carlo
-        monte_carlo = MonteCarloForecaster(
-            self.forecaster_config,
-            forecaster.nowcast,
-            forecaster.interday,
-            self.contract_utils,
-        )
-
         # Get today's events
         today_events = events_by_date.get(forecast_date, [])
         actual_today = len(today_events)
@@ -347,8 +363,63 @@ class Backtester:
         start_dt, _ = self.contract_utils.get_contract_day_bounds(forecast_date)
         now = start_dt + timedelta(minutes=tau)
 
-        # Run simulation with specified horizon
-        forecast = monte_carlo.simulate_horizon(today_events, forecast_date, now, horizon=horizon)
+        if use_ensemble:
+            # Ensemble mode: combine fast and slow EWMA forecasters
+            from .ensemble import EnsembleMonteCarloForecaster
+
+            ensemble_cfg = self.forecaster_config.ensemble
+
+            # Create slow interday forecaster
+            config_slow = copy.deepcopy(self.forecaster_config)
+            config_slow.regime.ewma_alpha = ensemble_cfg.alpha_slow
+            interday_slow = InterdayForecaster(
+                config_slow.regime,
+                config_slow.dispersion,
+                config_slow.weekend,
+                self.contract_utils,
+            )
+            interday_slow.fit(training_counts)
+
+            # Create fast interday forecaster
+            config_fast = copy.deepcopy(self.forecaster_config)
+            config_fast.regime.ewma_alpha = ensemble_cfg.alpha_fast
+            interday_fast = InterdayForecaster(
+                config_fast.regime,
+                config_fast.dispersion,
+                config_fast.weekend,
+                self.contract_utils,
+            )
+            interday_fast.fit(training_counts)
+
+            # Create ensemble forecaster
+            ensemble_mc = EnsembleMonteCarloForecaster(
+                self.forecaster_config,
+                forecaster.nowcast,
+                [interday_slow, interday_fast],
+                self.contract_utils,
+                weights=[ensemble_cfg.weight_slow, ensemble_cfg.weight_fast],
+            )
+
+            # Run simulation
+            forecast = ensemble_mc.simulate_horizon(
+                today_events, forecast_date, now, horizon=horizon
+            )
+        else:
+            # Single forecaster mode
+            forecaster.interday.fit(training_counts)
+
+            # Create Monte Carlo
+            monte_carlo = MonteCarloForecaster(
+                self.forecaster_config,
+                forecaster.nowcast,
+                forecaster.interday,
+                self.contract_utils,
+            )
+
+            # Run simulation with specified horizon
+            forecast = monte_carlo.simulate_horizon(
+                today_events, forecast_date, now, horizon=horizon
+            )
 
         # Compute metrics
         mae_today = abs(forecast.today_estimate - actual_today)
@@ -486,6 +557,32 @@ class Backtester:
             }
 
         return metrics_by_tau
+
+    def _compute_metrics_by_horizon(
+        self,
+        forecasts: List[SingleForecastResult],
+    ) -> Dict[int, Dict[str, float]]:
+        """Compute metrics grouped by horizon."""
+        metrics_by_horizon = {}
+
+        for horizon in self.backtest_config.horizons:
+            h_forecasts = [f for f in forecasts if f.horizon == horizon]
+
+            if not h_forecasts:
+                continue
+
+            metrics_by_horizon[horizon] = {
+                "mae_today": np.mean([f.mae_today for f in h_forecasts]),
+                "mae_horizon": np.mean([f.mae_horizon for f in h_forecasts]),
+                "rmse_horizon": np.sqrt(np.mean([f.mae_horizon ** 2 for f in h_forecasts])),
+                "avg_log_score": np.mean([f.log_score for f in h_forecasts]),
+                "avg_brier_score": np.mean([f.brier_score for f in h_forecasts]),
+                "coverage_50": np.mean([f.in_50_interval for f in h_forecasts]),
+                "coverage_90": np.mean([f.in_90_interval for f in h_forecasts]),
+                "n_forecasts": len(h_forecasts),
+            }
+
+        return metrics_by_horizon
 
     def _compute_overall_metrics(
         self,

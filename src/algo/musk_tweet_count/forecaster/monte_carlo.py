@@ -109,7 +109,7 @@ class MonteCarloForecaster:
         Args:
             config: Full forecaster configuration
             nowcast: Fitted intraday nowcast model
-            interday: Fitted interday forecaster
+            interday: Fitted interday forecaster (EWMA-based)
             contract_utils: Contract-day utilities
         """
         self.config = config
@@ -185,21 +185,30 @@ class MonteCarloForecaster:
         """
         samples = []
 
+        # Get dispersion inflation factor from config
+        # k' = k / s, where s >= 1 increases variance
+        dispersion_inflation = self.mc_config.dispersion_inflation_factor
+
         for h in horizons:
             mean, k = self.interday.forecast_day(h, base_date)
 
             # Apply regime adjustment from today's observation
             adjusted_mean = mean * regime_adjustment
 
+            # Apply dispersion inflation: k' = k / s
+            # This increases variance without changing mean
+            # NB variance = μ + μ²/k, so smaller k -> larger variance
+            k_inflated = k / dispersion_inflation
+
             # Negative Binomial sampling
-            # scipy uses (n, p) where n = k, p = k / (k + μ)
-            p = k / (k + adjusted_mean)
+            # numpy uses (n, p) where n = k, p = k / (k + μ)
+            p = k_inflated / (k_inflated + adjusted_mean)
 
             # Handle edge cases
-            if p <= 0 or p >= 1 or k <= 0:
+            if p <= 0 or p >= 1 or k_inflated <= 0:
                 samples.append(int(round(adjusted_mean)))
             else:
-                sample = rng.negative_binomial(k, p)
+                sample = rng.negative_binomial(k_inflated, p)
                 samples.append(int(sample))
 
         return samples
@@ -315,6 +324,12 @@ class MonteCarloForecaster:
         today_mean, today_std = self.nowcast.predict(events, contract_date, now)
         cum_so_far = len([e for e in events if e.timestamp < now])
 
+        # Apply today's std inflation if configured
+        # today_std' = today_std * sqrt(s) to inflate variance by factor s
+        today_std_inflation = self.mc_config.today_std_inflation_factor
+        if today_std_inflation > 1.0:
+            today_std = today_std * np.sqrt(today_std_inflation)
+
         # For horizon=1, just return today's forecast (no interday component)
         if horizon == 1:
             sums = np.zeros(n_simulations)
@@ -355,25 +370,26 @@ class MonteCarloForecaster:
 
             return result
 
-        # For horizon > 1, compute regime adjustment
-        tau = self.contract_utils.get_tau(now, contract_date)
-        regime_adjustment = self._compute_regime_adjustment(cum_so_far, tau, contract_date)
-
         # Future horizons: days 1 through (horizon-1)
         future_horizons = list(range(1, horizon))
+
+        # Compute regime adjustment
+        tau = self.contract_utils.get_tau(now, contract_date)
+        regime_adjustment = self._compute_regime_adjustment(cum_so_far, tau, contract_date)
 
         # Run simulations
         sums = np.zeros(n_simulations)
 
         for i in range(n_simulations):
-            # Sample today
             today_sample = self._sample_today(today_mean, today_std, cum_so_far, rng)
-
-            # Sample future days (with regime adjustment)
-            future_samples = self._sample_future_days(contract_date, future_horizons, rng, regime_adjustment)
-
-            # Sum
+            future_samples = self._sample_future_days(
+                contract_date, future_horizons, rng, regime_adjustment
+            )
             sums[i] = today_sample + sum(future_samples)
+
+        # Get expected future mean from interday model
+        future_params = self.interday.get_forecast_params(future_horizons, contract_date)
+        future_means = [m for m, _ in future_params]
 
         # Compute statistics
         mean = float(np.mean(sums))
@@ -386,10 +402,6 @@ class MonteCarloForecaster:
 
         # Compute bin probabilities
         bin_probs = self._compute_bin_probabilities(sums)
-
-        # Component breakdown
-        future_params = self.interday.get_forecast_params(future_horizons, contract_date)
-        future_means = [m for m, _ in future_params]
 
         elapsed_ms = (time.time() - start_time) * 1000
 

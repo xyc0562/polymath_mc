@@ -32,6 +32,7 @@ from .config import (
     WeekendConfig,
     MonteCarloConfig,
     UpdateConfig,
+    EnsembleConfig,
 )
 
 from .data import (
@@ -54,6 +55,10 @@ from .interday import (
     DispersionEstimator,
     WeekendEffect,
     InterdayForecaster,
+)
+
+from .ensemble import (
+    EnsembleMonteCarloForecaster,
 )
 
 from .monte_carlo import (
@@ -123,6 +128,10 @@ __all__ = [
     "DispersionEstimator",
     "WeekendEffect",
     "InterdayForecaster",
+
+    # Ensemble
+    "EnsembleConfig",
+    "EnsembleMonteCarloForecaster",
 
     # Monte Carlo
     "BinProbability",

@@ -134,7 +134,7 @@ class MonteCarloConfig:
     # Observation noise parameter (higher = trust observation less)
     regime_adj_sigma0: float = 1.00
 
-    # Adjustment clamp bounds (much tighter than old [0.7, 1.3])
+    # Adjustment clamp bounds
     regime_adj_min: float = 0.9
     regime_adj_max: float = 1.1
 
@@ -143,6 +143,20 @@ class MonteCarloConfig:
 
     # Minimum F(τ) before applying adjustment
     regime_adj_f_gate: float = 0.20
+
+    # Dispersion inflation factor for Negative Binomial sampling
+    # k' = k / dispersion_inflation_factor
+    # Higher values -> wider distribution -> better coverage
+    #
+    # Grid search results:
+    #   - Unofficial data (560+ days): s=1.5 → Coverage90=92.5%
+    #   - XTracker official (87 days): s=2.0 → Coverage90=78.4%
+    dispersion_inflation_factor: float = 2.0
+
+    # Standard deviation inflation factor for today's nowcast
+    # today_std' = today_std * sqrt(today_std_inflation_factor)
+    # Set to same as dispersion_inflation_factor for consistency
+    today_std_inflation_factor: float = 2.0
 
 
 @dataclass
@@ -157,6 +171,26 @@ class UpdateConfig:
 
     # Cache TTL (seconds)
     cache_ttl_seconds: float = 180.0
+
+
+@dataclass
+class EnsembleConfig:
+    """Configuration for ensemble forecaster.
+
+    Combines multiple EWMA-based interday forecasters with different
+    adaptation speeds (α values) via sample-level pooling.
+    """
+
+    # EWMA alpha values for ensemble members
+    # Slow (0.2): ~5 day memory, stable but slow to adapt
+    # Fast (0.5): ~2 day memory, quick adaptation but noisy
+    alpha_slow: float = 0.2
+    alpha_fast: float = 0.5
+
+    # Weights for each ensemble member [slow, fast]
+    # Must sum to 1.0
+    weight_slow: float = 0.5
+    weight_fast: float = 0.5
 
 
 @dataclass
@@ -178,6 +212,7 @@ class ForecasterConfig:
     weekend: WeekendConfig = field(default_factory=WeekendConfig)
     monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
 
     # Polymarket bins (lower, upper) inclusive
     # Default bins for Musk tweet count market
@@ -217,6 +252,7 @@ class ForecasterConfig:
         weekend_data = data.pop("weekend", {})
         monte_carlo_data = data.pop("monte_carlo", {})
         update_data = data.pop("update", {})
+        ensemble_data = data.pop("ensemble", {})
 
         # Handle bins
         bins_data = data.pop("bins", None)
@@ -233,6 +269,7 @@ class ForecasterConfig:
             weekend=WeekendConfig(**weekend_data),
             monte_carlo=MonteCarloConfig(**monte_carlo_data),
             update=UpdateConfig(**update_data),
+            ensemble=EnsembleConfig(**ensemble_data),
             **data,
         )
 

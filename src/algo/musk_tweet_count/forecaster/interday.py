@@ -237,7 +237,7 @@ class DispersionEstimator:
         # Estimated k
         self._k: float = 2.0  # Default
 
-    def estimate(self, historical_counts: Dict[date, int]) -> float:
+    def estimate(self, historical_counts: Dict[date, int], reference_date: date = None) -> float:
         """
         Estimate k from historical count data with recency weighting.
 
@@ -246,6 +246,7 @@ class DispersionEstimator:
 
         Args:
             historical_counts: Dict mapping contract_date -> count
+            reference_date: Reference date for window filtering (default: max date in data)
 
         Returns:
             Estimated k value
@@ -255,8 +256,10 @@ class DispersionEstimator:
             return self._k
 
         # Get recent counts within window
-        today = self.contract_utils.get_current_contract_date()
-        window_start = today - timedelta(days=self.config.estimation_window_days)
+        # Use reference_date if provided, otherwise use max date from data
+        if reference_date is None:
+            reference_date = max(historical_counts.keys())
+        window_start = reference_date - timedelta(days=self.config.estimation_window_days)
 
         recent_data = [
             (d, count) for d, count in historical_counts.items()
@@ -354,12 +357,13 @@ class WeekendEffect:
         # Estimated effect (multiplicative)
         self._effect: float = 1.0  # Default: no effect
 
-    def estimate(self, historical_counts: Dict[date, int]) -> float:
+    def estimate(self, historical_counts: Dict[date, int], reference_date: date = None) -> float:
         """
         Estimate weekend effect from historical data with recency weighting.
 
         Args:
             historical_counts: Dict mapping contract_date -> count
+            reference_date: Reference date for window filtering (default: max date in data)
 
         Returns:
             Weekend effect (ratio of weekend to weekday weighted mean)
@@ -369,11 +373,10 @@ class WeekendEffect:
             return self._effect
 
         # Get recent counts within window
-        today = self.contract_utils.get_current_contract_date()
-        window_start = today - timedelta(days=self.config.estimation_window_days)
-
-        # Reference date for weighting
-        reference_date = max(historical_counts.keys())
+        # Use reference_date if provided, otherwise use max date from data
+        if reference_date is None:
+            reference_date = max(historical_counts.keys())
+        window_start = reference_date - timedelta(days=self.config.estimation_window_days)
         half_life = self.config.half_life_days
 
         weekday_counts = []

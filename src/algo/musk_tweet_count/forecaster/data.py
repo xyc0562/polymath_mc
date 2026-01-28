@@ -5,8 +5,10 @@ Handles:
 - XTracker API client for fetching official post data
 - Event storage and retrieval
 - Contract-day calculations with proper timezone handling
+- CSV data loading for unofficial historical data
 """
 
+import csv
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
@@ -383,6 +385,106 @@ class XTrackerClient:
             contract_utils=contract_utils,
             handle=handle,
         )
+
+
+def load_events_from_csv(
+    csv_path: str,
+    contract_utils: Optional[ContractDayUtils] = None,
+    filter_originals: bool = False,
+) -> Dict[date, List[TweetEvent]]:
+    """
+    Load events from CSV file and group by contract-day.
+
+    CSV format:
+        tweet_id,post_date,content,type
+        2014182947297930000,21/1/26 22:46,Correct,original
+
+    Args:
+        csv_path: Path to CSV file
+        contract_utils: Contract-day utilities (creates new if None)
+        filter_originals: If True, only include type="original" (exclude retweets)
+
+    Returns:
+        Dict mapping contract_date -> List[TweetEvent]
+    """
+    if contract_utils is None:
+        contract_utils = ContractDayUtils()
+
+    events_by_date: Dict[date, List[TweetEvent]] = {}
+    tz = contract_utils.tz
+
+    logger.info(f"Loading events from CSV: {csv_path}")
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            # Skip retweets if filtering
+            if filter_originals and row.get('type') != 'original':
+                continue
+
+            try:
+                # Parse post_date: format "DD/M/YY HH:MM" (e.g., "21/1/26 22:46")
+                post_date_str = row['post_date']
+
+                # Split into date and time parts
+                date_part, time_part = post_date_str.split(' ')
+                if '-' in date_part:
+                    year, month, day = date_part.split('-')
+                    hour, minute, second = time_part.split(':')
+                    year_full = int(year)
+                else:
+                    day, month, year = date_part.split('/')
+                    hour, minute = time_part.split(':')
+                    second = 0
+                    year_full = int(year) + 2000
+                # Convert 2-digit year to 4-digit (YY -> 20YY)
+
+                # Create timezone-aware datetime (already in EST)
+                timestamp = datetime(
+                    year_full,
+                    int(month),
+                    int(day),
+                    int(hour),
+                    int(minute),
+                    int(second),
+                    tzinfo=tz
+                )
+
+                # Determine event type (retweet vs tweet)
+                content = row.get('content', '')
+                event_type = "retweet" if content.startswith("RT @") else "tweet"
+
+                # Create TweetEvent
+                event = TweetEvent(
+                    timestamp=timestamp,
+                    event_type=event_type,
+                    event_id=row.get('tweet_id'),
+                )
+
+                # Group by contract-day
+                contract_date = contract_utils.get_contract_date(timestamp)
+
+                if contract_date not in events_by_date:
+                    events_by_date[contract_date] = []
+
+                events_by_date[contract_date].append(event)
+
+            except (ValueError, KeyError, IndexError) as e:
+                logger.warning(f"Failed to parse row: {e} - {row}")
+                continue
+
+    # Sort events within each day
+    for contract_date in events_by_date:
+        events_by_date[contract_date].sort(key=lambda e: e.timestamp)
+
+    total_events = sum(len(events) for events in events_by_date.values())
+    logger.info(
+        f"Loaded {total_events} events from CSV, "
+        f"grouped into {len(events_by_date)} contract-days"
+    )
+
+    return events_by_date
 
 
 class EventStore:
