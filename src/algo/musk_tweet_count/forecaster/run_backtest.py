@@ -151,9 +151,10 @@ def run_full_backtest(
     events_by_date: Dict[date, List[TweetEvent]],
     n_simulations: int = 5000,
     use_ensemble: bool = False,
+    use_gas: bool = False,
 ) -> None:
     """Run full backtest with multiple τ values."""
-    logger.info(f"Running full backtest (ensemble={use_ensemble})...")
+    logger.info(f"Running full backtest (ensemble={use_ensemble}, gas={use_gas})...")
 
     # Configure for available data
     # With ~85 days, use 45-day training to maximize test window
@@ -167,7 +168,7 @@ def run_full_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble)
+    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas)
     results = backtester.run(events_by_date)
 
     # Print results
@@ -266,9 +267,10 @@ def run_quick_backtest(
     events_by_date: Dict[date, List[TweetEvent]],
     n_simulations: int = 2000,
     use_ensemble: bool = False,
+    use_gas: bool = False,
 ) -> None:
     """Run quick backtest with single τ value."""
-    logger.info(f"Running quick backtest (ensemble={use_ensemble})...")
+    logger.info(f"Running quick backtest (ensemble={use_ensemble}, gas={use_gas})...")
 
     config = BacktestConfig(
         training_window_days=45,
@@ -280,7 +282,7 @@ def run_quick_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble)
+    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas)
     results = backtester.run(events_by_date)
 
     print(results.summary())
@@ -329,6 +331,7 @@ def run_dispersion_grid_search(
     events_by_date: Dict[date, List[TweetEvent]],
     n_simulations: int = 2000,
     inflation_values: List[float] = None,
+    use_gas: bool = False,
 ) -> None:
     """
     Grid search for optimal dispersion inflation factor.
@@ -372,6 +375,7 @@ def run_dispersion_grid_search(
         backtester = Backtester(
             forecaster_config=forecaster_config,
             backtest_config=backtest_config,
+            use_gas=use_gas,
         )
 
         try:
@@ -485,6 +489,11 @@ def main():
         action="store_true",
         help="Use ensemble forecasting (combines fast and slow EWMA models)",
     )
+    parser.add_argument(
+        "--gas",
+        action="store_true",
+        help="Use NB-GAS regime model instead of EWMA (MLE-optimized reactivity)",
+    )
 
     args = parser.parse_args()
 
@@ -517,13 +526,13 @@ def main():
 
     # Run appropriate backtest
     if args.grid_search:
-        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations)
+        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations, use_gas=args.gas)
     elif args.ablation:
         run_ablation_study(events_by_date, n_simulations=args.n_simulations)
     elif args.quick:
-        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble)
+        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas)
     else:
-        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble)
+        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas)
 
 
 if __name__ == "__main__":

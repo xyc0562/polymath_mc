@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy import stats
 
-from .config import RegimeConfig, DispersionConfig, WeekendConfig
+from .config import RegimeConfig, DispersionConfig, WeekendConfig, GASConfig
 from .data import ContractDayUtils
 
 logger = logging.getLogger(__name__)
@@ -617,3 +617,129 @@ class InterdayForecaster:
     def current_regime_state(self) -> RegimeState:
         """Get current regime state."""
         return self.regime.get_state()
+
+
+class GASInterdayForecaster:
+    """
+    Interday forecaster using NB-GAS regime model.
+
+    Same interface as InterdayForecaster so MonteCarloForecaster works unchanged.
+    Uses GASRegimeModel instead of EWMA-based RegimeModel.
+    """
+
+    def __init__(
+        self,
+        gas_config: GASConfig,
+        dispersion_config: DispersionConfig,
+        weekend_config: WeekendConfig,
+        contract_utils: ContractDayUtils,
+    ):
+        self.gas_config = gas_config
+        self.contract_utils = contract_utils
+
+        # Reuse existing components
+        self.dispersion = DispersionEstimator(dispersion_config, contract_utils)
+        self.weekend = WeekendEffect(weekend_config, contract_utils)
+
+        # GAS regime model (created on fit)
+        self.regime = None
+        self._fitted = False
+
+    def fit(self, historical_counts: Dict[date, int]) -> None:
+        """Fit the GAS model on historical daily counts.
+
+        1. Estimate k using existing DispersionEstimator
+        2. Estimate weekend effect using existing WeekendEffect
+        3. Fit GAS parameters (ω, α, β) via MLE
+        """
+        from .gas import GASRegimeModel
+
+        # Estimate dispersion k
+        self.dispersion.estimate(historical_counts)
+
+        # Estimate weekend effect
+        self.weekend.estimate(historical_counts)
+
+        # Fit GAS model
+        self.regime = GASRegimeModel(self.gas_config)
+        sorted_dates = sorted(historical_counts.keys())
+        daily_counts = [historical_counts[d] for d in sorted_dates]
+        self.regime.fit(daily_counts, self.dispersion.k)
+
+        self._fitted = True
+        logger.debug("GAS interday forecaster fitted successfully")
+
+    def update(self, contract_date: date, count: int) -> None:
+        """Update model with new observation."""
+        if not self._fitted:
+            raise RuntimeError("GAS interday forecaster not fitted")
+        self.regime.update(count)
+
+    def forecast_day(
+        self,
+        horizon: int,
+        base_date: Optional[date] = None,
+    ) -> Tuple[float, float]:
+        """Forecast count distribution for a single future day.
+
+        Returns:
+            Tuple of (mean, k) for Negative Binomial distribution.
+        """
+        if not self._fitted:
+            raise RuntimeError("GAS interday forecaster not fitted")
+
+        if base_date is None:
+            base_date = self.contract_utils.get_current_contract_date()
+
+        log_intensity = self.regime.forecast_intensity(horizon)
+        mean = np.exp(log_intensity)
+
+        # Apply weekend effect
+        target_date = base_date + timedelta(days=horizon)
+        weekend_effect = self.weekend.get_effect(target_date)
+        mean *= weekend_effect
+
+        return mean, self.dispersion.k
+
+    def sample_day(
+        self,
+        horizon: int,
+        base_date: Optional[date] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        """Sample from NegBin for a future day."""
+        if rng is None:
+            rng = np.random.default_rng()
+
+        mean, k = self.forecast_day(horizon, base_date)
+        p = k / (k + mean)
+        return int(rng.negative_binomial(k, p))
+
+    def sample_trajectory(
+        self,
+        horizons: List[int],
+        base_date: Optional[date] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> List[int]:
+        """Sample counts for multiple future days."""
+        if rng is None:
+            rng = np.random.default_rng()
+        return [self.sample_day(h, base_date, rng) for h in horizons]
+
+    def get_forecast_params(
+        self,
+        horizons: List[int],
+        base_date: Optional[date] = None,
+    ) -> List[Tuple[float, float]]:
+        """Get forecast parameters for multiple horizons."""
+        return [self.forecast_day(h, base_date) for h in horizons]
+
+    @property
+    def current_regime_state(self) -> RegimeState:
+        """Get current regime state (compatible interface)."""
+        if self.regime is None:
+            return RegimeState(log_intensity=0.0, intensity=1.0)
+        return RegimeState(
+            log_intensity=self.regime.f,
+            intensity=self.regime.intensity,
+        )

@@ -150,13 +150,14 @@ class MonteCarloConfig:
     #
     # Grid search results:
     #   - Unofficial data (560+ days): s=1.5 → Coverage90=92.5%
-    #   - XTracker official (87 days): s=2.0 → Coverage90=78.4%
-    dispersion_inflation_factor: float = 2.0
+    #   - XTracker official EWMA (87 days): s=2.0 → Coverage90=78.4%
+    #   - XTracker official GAS (89 days): s=2.5 → Coverage90=88.7%
+    dispersion_inflation_factor: float = 2.5
 
     # Standard deviation inflation factor for today's nowcast
     # today_std' = today_std * sqrt(today_std_inflation_factor)
     # Set to same as dispersion_inflation_factor for consistency
-    today_std_inflation_factor: float = 2.0
+    today_std_inflation_factor: float = 2.5
 
 
 @dataclass
@@ -171,6 +172,25 @@ class UpdateConfig:
 
     # Cache TTL (seconds)
     cache_ttl_seconds: float = 180.0
+
+
+@dataclass
+class GASConfig:
+    """Configuration for NB-GAS (Negative Binomial GAS) regime model."""
+
+    # Initial parameter guesses for MLE
+    omega_init: float = 0.1
+    alpha_init: float = 0.05
+    beta_init: float = 0.95
+
+    # Parameter bounds for optimization
+    beta_max: float = 0.999      # Stationarity constraint
+    alpha_min: float = 0.001
+    alpha_max: float = 0.5
+
+    # Max log-intensity (safety cap)
+    # ln(300) ≈ 5.70 for max 300 tweets/day
+    max_log_intensity: float = 5.70
 
 
 @dataclass
@@ -213,6 +233,7 @@ class ForecasterConfig:
     monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    gas: GASConfig = field(default_factory=GASConfig)
 
     # Polymarket bins (lower, upper) inclusive
     # Default bins for Musk tweet count market
@@ -253,6 +274,7 @@ class ForecasterConfig:
         monte_carlo_data = data.pop("monte_carlo", {})
         update_data = data.pop("update", {})
         ensemble_data = data.pop("ensemble", {})
+        gas_data = data.pop("gas", {})
 
         # Handle bins
         bins_data = data.pop("bins", None)
@@ -270,6 +292,7 @@ class ForecasterConfig:
             monte_carlo=MonteCarloConfig(**monte_carlo_data),
             update=UpdateConfig(**update_data),
             ensemble=EnsembleConfig(**ensemble_data),
+            gas=GASConfig(**gas_data),
             **data,
         )
 

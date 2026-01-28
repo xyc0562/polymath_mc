@@ -33,6 +33,7 @@ from .config import (
     MonteCarloConfig,
     UpdateConfig,
     EnsembleConfig,
+    GASConfig,
 )
 
 from .data import (
@@ -55,6 +56,11 @@ from .interday import (
     DispersionEstimator,
     WeekendEffect,
     InterdayForecaster,
+    GASInterdayForecaster,
+)
+
+from .gas import (
+    GASRegimeModel,
 )
 
 from .ensemble import (
@@ -109,6 +115,7 @@ __all__ = [
     "WeekendConfig",
     "MonteCarloConfig",
     "UpdateConfig",
+    "GASConfig",
 
     # Data layer
     "TweetEvent",
@@ -128,6 +135,8 @@ __all__ = [
     "DispersionEstimator",
     "WeekendEffect",
     "InterdayForecaster",
+    "GASInterdayForecaster",
+    "GASRegimeModel",
 
     # Ensemble
     "EnsembleConfig",

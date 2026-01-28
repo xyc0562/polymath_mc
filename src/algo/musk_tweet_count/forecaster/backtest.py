@@ -21,7 +21,7 @@ import numpy as np
 from .config import ForecasterConfig
 from .data import ContractDayUtils, TweetEvent, XTrackerClient, EventStore
 from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast
-from .interday import InterdayForecaster
+from .interday import InterdayForecaster, GASInterdayForecaster
 from .monte_carlo import (
     MonteCarloForecaster,
     ForecastResult,
@@ -189,6 +189,7 @@ class Backtester:
         forecaster_config: Optional[ForecasterConfig] = None,
         backtest_config: Optional[BacktestConfig] = None,
         use_ensemble: bool = False,
+        use_gas: bool = False,
     ):
         """
         Initialize backtester.
@@ -197,10 +198,12 @@ class Backtester:
             forecaster_config: Configuration for forecaster
             backtest_config: Configuration for backtesting
             use_ensemble: Whether to use ensemble forecasting (fast+slow EWMA)
+            use_gas: Whether to use NB-GAS regime model instead of EWMA
         """
         self.forecaster_config = forecaster_config or ForecasterConfig()
         self.backtest_config = backtest_config or BacktestConfig()
         self.use_ensemble = use_ensemble
+        self.use_gas = use_gas
 
         # Contract utils
         self.contract_utils = ContractDayUtils(
@@ -286,6 +289,7 @@ class Backtester:
                             training_dates,
                             actual_sums_by_horizon[horizon][forecast_date],
                             use_ensemble=self.use_ensemble,
+                            use_gas=self.use_gas,
                         )
                         forecasts.append(result)
 
@@ -336,6 +340,7 @@ class Backtester:
         training_dates: List[date],
         actual_horizon: int,
         use_ensemble: bool = False,
+        use_gas: bool = False,
     ) -> SingleForecastResult:
         """Run a single forecast and compute metrics."""
         # Prepare training data
@@ -363,7 +368,27 @@ class Backtester:
         start_dt, _ = self.contract_utils.get_contract_day_bounds(forecast_date)
         now = start_dt + timedelta(minutes=tau)
 
-        if use_ensemble:
+        if use_gas:
+            # GAS mode: use NB-GAS regime model
+            gas_interday = GASInterdayForecaster(
+                self.forecaster_config.gas,
+                self.forecaster_config.dispersion,
+                self.forecaster_config.weekend,
+                self.contract_utils,
+            )
+            gas_interday.fit(training_counts)
+
+            monte_carlo = MonteCarloForecaster(
+                self.forecaster_config,
+                forecaster.nowcast,
+                gas_interday,
+                self.contract_utils,
+            )
+
+            forecast = monte_carlo.simulate_horizon(
+                today_events, forecast_date, now, horizon=horizon
+            )
+        elif use_ensemble:
             # Ensemble mode: combine fast and slow EWMA forecasters
             from .ensemble import EnsembleMonteCarloForecaster
 
