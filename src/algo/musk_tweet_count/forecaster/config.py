@@ -144,6 +144,11 @@ class MonteCarloConfig:
     # Minimum F(τ) before applying adjustment
     regime_adj_f_gate: float = 0.20
 
+    # Decay factor for regime adjustment across future days
+    # Day h gets adjustment: 1 + (base_adj - 1) * decay^(h-1)
+    # decay=0.5 means day 1 gets full adjustment, day 2 gets 50%, day 3 gets 25%, etc.
+    regime_adj_decay: float = 0.5
+
     # Dispersion inflation factor for Negative Binomial sampling
     # k' = k / dispersion_inflation_factor
     # Higher values -> wider distribution -> better coverage
@@ -158,6 +163,16 @@ class MonteCarloConfig:
     # today_std' = today_std * sqrt(today_std_inflation_factor)
     # Set to same as dispersion_inflation_factor for consistency
     today_std_inflation_factor: float = 2.5
+
+    # Hard cap for individual future day samples (not applied to today's nowcast)
+    # Based on historical analysis: only 1% of days exceeded 200
+    max_daily_forecast: int = 200
+
+    # Hard caps for multi-day sum forecasts, indexed by horizon (0=unused, 1-7=caps)
+    # Based on ~p99 of historical data to clip ~1% of extreme forecasts
+    # Set to 0 to disable cap for that horizon
+    # Horizon 1 = 0 (disabled) because intraday nowcast should not be capped
+    max_horizon_caps: Tuple[int, ...] = (0, 0, 350, 500, 650, 800, 950, 1100)
 
 
 @dataclass

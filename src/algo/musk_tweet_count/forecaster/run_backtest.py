@@ -198,8 +198,8 @@ def run_full_backtest(
 
     # Calibration analysis
     print("\nCalibration analysis:")
-    print(f"  50% interval coverage: {results.overall_metrics['coverage_50']:.1%} (target: 50%)")
-    print(f"  90% interval coverage: {results.overall_metrics['coverage_90']:.1%} (target: 90%)")
+    print(f"  50% interval coverage: {results.overall_metrics.get('coverage_50', 0):.1%} (target: 50%)")
+    print(f"  90% interval coverage: {results.overall_metrics.get('coverage_90', 0):.1%} (target: 90%)")
 
     # Side-by-side predictions vs actuals table
     print("\n" + "=" * 100)
@@ -278,7 +278,7 @@ def run_quick_backtest(
         tau_values=[720],  # Only at noon (12h into contract day)
         n_simulations=n_simulations,
         include_naive_baseline=True,
-        include_interday_baseline=False,
+        include_interday_baseline=True,
         verbose=True,
     )
 
@@ -314,11 +314,11 @@ def run_ablation_study(
     print("\nKEY FINDINGS:")
     print("-" * 60)
 
-    full_mae = results["full_model"].overall_metrics["mae_7day"]
+    full_mae = results["full_model"].overall_metrics.get("mae_7day", 0)
     for name, result in results.items():
         if name == "full_model":
             continue
-        mae = result.overall_metrics["mae_7day"]
+        mae = result.overall_metrics.get("mae_7day", 0)
         diff = mae - full_mae
         pct = diff / full_mae * 100
         impact = "worse" if diff > 0 else "better"

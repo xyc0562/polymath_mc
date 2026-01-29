@@ -637,6 +637,11 @@ class Backtester:
         """Compute baseline metrics for comparison."""
         baselines = {}
 
+        # Filter to only 7-day horizon forecasts
+        forecasts_7d = [f for f in forecasts if f.horizon == 7]
+        if not forecasts_7d:
+            return baselines
+
         if self.backtest_config.include_naive_baseline:
             # Naive baseline: historical mean
             all_daily_counts = [len(events) for events in events_by_date.values()]
@@ -644,7 +649,7 @@ class Backtester:
             naive_7day = historical_mean_daily * 7
 
             naive_errors = []
-            for f in forecasts:
+            for f in forecasts_7d:
                 naive_errors.append(abs(naive_7day - f.actual_7day))
 
             baselines["naive"] = {
@@ -653,31 +658,26 @@ class Backtester:
             }
 
         if self.backtest_config.include_interday_baseline:
-            # Interday-only baseline: pure regime forecast without intraday adjustments
-            # Uses regime intensity for all 7 days (no nowcast, no regime_adjustment)
+            # Interday-only baseline: pure regime forecast without intraday nowcast
+            # Uses regime intensity for all 7 days (today from interday, not nowcast)
 
             interday_errors = []
-            for f in forecasts:
-                # future_days_estimate = sum(regime forecasts for days 1-6) * regime_adjustment
-                # We need to un-adjust to get pure regime forecast
-                regime_adj = f.forecast.regime_adjustment
-                if regime_adj > 0:
-                    pure_future_estimate = f.forecast.future_days_estimate / regime_adj
-                else:
-                    pure_future_estimate = f.forecast.future_days_estimate
+            full_vs_interday_diffs = []  # Diagnostic: how much does full model differ from interday?
+            for f in forecasts_7d:
+                # Interday-only: regime forecast for today + pure regime forecasts for days 1-6
+                today_interday = f.forecast.today_interday_estimate
+                future_pure = f.forecast.future_days_pure
 
-                # Average daily intensity from regime (6 future days)
-                avg_daily_intensity = pure_future_estimate / 6
-
-                # Interday-only estimate: 7 days of pure regime forecast
-                interday_only_estimate = avg_daily_intensity * 7
-
+                interday_only_estimate = today_interday + future_pure
                 interday_errors.append(abs(interday_only_estimate - f.actual_7day))
+                full_vs_interday_diffs.append(f.forecast.mean - interday_only_estimate)
 
             if interday_errors:
                 baselines["interday_only"] = {
                     "mae_7day": np.mean(interday_errors),
                     "rmse_7day": np.sqrt(np.mean([e**2 for e in interday_errors])),
+                    "mean_diff_from_full": np.mean(full_vs_interday_diffs),  # +ve = full predicts higher
+                    "std_diff_from_full": np.std(full_vs_interday_diffs),
                 }
 
         return baselines

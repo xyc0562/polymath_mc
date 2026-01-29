@@ -65,6 +65,12 @@ class ForecastResult:
     # Regime adjustment (how much we boosted/reduced future based on today)
     regime_adjustment: float = 1.0
 
+    # Interday-only forecast for today (regime, not nowcast) — for baseline comparison
+    today_interday_estimate: float = 0.0
+
+    # Pure regime forecast for days 1-6 (no adjustment) — for baseline comparison
+    future_days_pure: float = 0.0
+
     def get_bin_probability(self, count: int) -> float:
         """Get probability that final count falls in the bin containing 'count'."""
         for bp in self.bin_probabilities:
@@ -178,7 +184,7 @@ class MonteCarloForecaster:
             base_date: Today's contract date
             horizons: List of horizons (typically [1, 2, 3, 4, 5, 6])
             rng: Random number generator
-            regime_adjustment: Multiplier based on today's observed activity vs expected
+            regime_adjustment: Base multiplier from today's observation (decays over horizons)
 
         Returns:
             List of sampled counts
@@ -189,11 +195,19 @@ class MonteCarloForecaster:
         # k' = k / s, where s >= 1 increases variance
         dispersion_inflation = self.mc_config.dispersion_inflation_factor
 
+        # Hard cap for individual day forecasts (not applied to today's nowcast)
+        daily_cap = self.mc_config.max_daily_forecast
+
+        # Decay factor for regime adjustment
+        decay = self.mc_config.regime_adj_decay
+
         for h in horizons:
             mean, k = self.interday.forecast_day(h, base_date)
 
-            # Apply regime adjustment from today's observation
-            adjusted_mean = mean * regime_adjustment
+            # Apply decaying regime adjustment: day h gets 1 + (base_adj - 1) * decay^(h-1)
+            # Day 1: full adjustment, Day 2: partial, Day 3: smaller, etc.
+            decayed_adj = 1.0 + (regime_adjustment - 1.0) * (decay ** (h - 1))
+            adjusted_mean = mean * decayed_adj
 
             # Apply dispersion inflation: k' = k / s
             # This increases variance without changing mean
@@ -206,10 +220,15 @@ class MonteCarloForecaster:
 
             # Handle edge cases
             if p <= 0 or p >= 1 or k_inflated <= 0:
-                samples.append(int(round(adjusted_mean)))
+                sample = int(round(adjusted_mean))
             else:
-                sample = rng.negative_binomial(k_inflated, p)
-                samples.append(int(sample))
+                sample = int(rng.negative_binomial(k_inflated, p))
+
+            # Apply daily cap to prevent unrealistic forecasts
+            if daily_cap > 0:
+                sample = min(sample, daily_cap)
+
+            samples.append(sample)
 
         return samples
 
@@ -348,6 +367,9 @@ class MonteCarloForecaster:
             bin_probs = self._compute_bin_probabilities(sums)
             elapsed_ms = (time.time() - start_time) * 1000
 
+            # Get interday forecast for today (for baseline comparison)
+            today_interday_mean, _ = self.interday.forecast_day(0, contract_date)
+
             result = ForecastResult(
                 mean=mean,
                 median=median,
@@ -362,6 +384,8 @@ class MonteCarloForecaster:
                 regime_adjustment=1.0,
                 n_simulations=n_simulations,
                 simulation_time_ms=elapsed_ms,
+                today_interday_estimate=today_interday_mean,
+                future_days_pure=0.0,
             )
 
             logger.debug(
@@ -373,7 +397,9 @@ class MonteCarloForecaster:
         # Future horizons: days 1 through (horizon-1)
         future_horizons = list(range(1, horizon))
 
-        # Compute regime adjustment
+        # Compute regime adjustment from today's partial observation
+        # This adjusts future day forecasts based on how today is tracking vs expected
+        # The adjustment decays over horizons (day 1 gets full, day 2 gets less, etc.)
         tau = self.contract_utils.get_tau(now, contract_date)
         regime_adjustment = self._compute_regime_adjustment(cum_so_far, tau, contract_date)
 
@@ -387,9 +413,18 @@ class MonteCarloForecaster:
             )
             sums[i] = today_sample + sum(future_samples)
 
+        # Apply horizon cap to prevent unrealistic multi-day forecasts
+        horizon_caps = self.mc_config.max_horizon_caps
+        if horizon < len(horizon_caps) and horizon_caps[horizon] > 0:
+            cap = horizon_caps[horizon]
+            sums = np.minimum(sums, cap)
+
         # Get expected future mean from interday model
         future_params = self.interday.get_forecast_params(future_horizons, contract_date)
         future_means = [m for m, _ in future_params]
+
+        # Get interday forecast for today (for baseline comparison)
+        today_interday_mean, _ = self.interday.forecast_day(0, contract_date)
 
         # Compute statistics
         mean = float(np.mean(sums))
@@ -405,6 +440,13 @@ class MonteCarloForecaster:
 
         elapsed_ms = (time.time() - start_time) * 1000
 
+        # Compute future_days_estimate with decaying adjustment (matches sampling)
+        decay = self.mc_config.regime_adj_decay
+        future_days_adjusted = sum(
+            m * (1.0 + (regime_adjustment - 1.0) * (decay ** (h - 1)))
+            for h, m in zip(future_horizons, future_means)
+        )
+
         result = ForecastResult(
             mean=mean,
             median=median,
@@ -415,10 +457,12 @@ class MonteCarloForecaster:
             p95=p95,
             bin_probabilities=bin_probs,
             today_estimate=today_mean,
-            future_days_estimate=sum(future_means) * regime_adjustment,
+            future_days_estimate=future_days_adjusted,
+            today_interday_estimate=today_interday_mean,
             regime_adjustment=regime_adjustment,
             n_simulations=n_simulations,
             simulation_time_ms=elapsed_ms,
+            future_days_pure=sum(future_means),
         )
 
         logger.debug(
