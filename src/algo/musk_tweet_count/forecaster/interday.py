@@ -743,3 +743,127 @@ class GASInterdayForecaster:
             log_intensity=self.regime.f,
             intensity=self.regime.intensity,
         )
+
+
+class PIGInterdayForecaster:
+    """
+    Interday forecaster using PIG-GAS regime model.
+
+    Uses Poisson-Inverse Gaussian observation distribution instead of
+    Negative Binomial. PIG has heavier tails, better for occasional extreme days.
+
+    Same interface as InterdayForecaster/GASInterdayForecaster.
+    """
+
+    def __init__(
+        self,
+        gas_config: GASConfig,
+        dispersion_config: DispersionConfig,
+        weekend_config: WeekendConfig,
+        contract_utils: ContractDayUtils,
+    ):
+        self.gas_config = gas_config
+        self.dispersion_config = dispersion_config
+        self.contract_utils = contract_utils
+
+        # Weekend effect (shared with NegBin models)
+        self.weekend = WeekendEffect(weekend_config, contract_utils)
+
+        # PIG-GAS regime model (created on fit)
+        self.regime = None
+        self._fitted = False
+
+    def fit(self, historical_counts: Dict[date, int]) -> None:
+        """Fit the PIG-GAS model on historical daily counts.
+
+        1. Estimate sigma (dispersion) from data
+        2. Estimate weekend effect
+        3. Fit GAS parameters (ω, α, β) via MLE with PIG likelihood
+        """
+        from .pig import PIGGASRegimeModel
+
+        # Estimate weekend effect
+        self.weekend.estimate(historical_counts)
+
+        # Fit PIG-GAS model (sigma estimated internally from data)
+        self.regime = PIGGASRegimeModel(self.gas_config)
+        sorted_dates = sorted(historical_counts.keys())
+        daily_counts = [historical_counts[d] for d in sorted_dates]
+        self.regime.fit(daily_counts)
+
+        self._fitted = True
+        logger.debug("PIG interday forecaster fitted successfully")
+
+    def update(self, contract_date: date, count: int) -> None:
+        """Update model with new observation."""
+        if not self._fitted:
+            raise RuntimeError("PIG interday forecaster not fitted")
+        self.regime.update(count)
+
+    def forecast_day(
+        self,
+        horizon: int,
+        base_date: Optional[date] = None,
+    ) -> Tuple[float, float]:
+        """Forecast count distribution for a single future day.
+
+        Returns:
+            Tuple of (mean, sigma) for PIG distribution.
+            Note: sigma is the dispersion param where Var = μ + σ²μ²
+        """
+        if not self._fitted:
+            raise RuntimeError("PIG interday forecaster not fitted")
+
+        if base_date is None:
+            base_date = self.contract_utils.get_current_contract_date()
+
+        mean = self.regime.forecast(horizon)
+
+        # Apply weekend effect
+        target_date = base_date + timedelta(days=horizon)
+        weekend_effect = self.weekend.get_effect(target_date)
+        mean *= weekend_effect
+
+        return mean, self.regime.sigma
+
+    def sample_day(
+        self,
+        horizon: int,
+        base_date: Optional[date] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        """Sample from PIG for a future day."""
+        if rng is None:
+            rng = np.random.default_rng()
+
+        mean, sigma = self.forecast_day(horizon, base_date)
+        return self.regime.sample(mean, rng)
+
+    def sample_trajectory(
+        self,
+        horizons: List[int],
+        base_date: Optional[date] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> List[int]:
+        """Sample counts for multiple future days."""
+        if rng is None:
+            rng = np.random.default_rng()
+        return [self.sample_day(h, base_date, rng) for h in horizons]
+
+    def get_forecast_params(
+        self,
+        horizons: List[int],
+        base_date: Optional[date] = None,
+    ) -> List[Tuple[float, float]]:
+        """Get forecast parameters for multiple horizons."""
+        return [self.forecast_day(h, base_date) for h in horizons]
+
+    @property
+    def current_regime_state(self) -> RegimeState:
+        """Get current regime state (compatible interface)."""
+        if self.regime is None:
+            return RegimeState(log_intensity=0.0, intensity=1.0)
+        return RegimeState(
+            log_intensity=self.regime.f,
+            intensity=np.exp(self.regime.f) if self.regime.f else 1.0,
+        )

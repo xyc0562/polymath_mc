@@ -191,7 +191,11 @@ class UpdateConfig:
 
 @dataclass
 class GASConfig:
-    """Configuration for NB-GAS (Negative Binomial GAS) regime model."""
+    """Configuration for NB-GAS (Negative Binomial GAS) regime model.
+
+    Uses Pearson score s_t = (y_t - μ_t) / μ_t for stable regime tracking.
+    Includes change point detection for faster adaptation to regime shifts.
+    """
 
     # Initial parameter guesses for MLE
     omega_init: float = 0.1
@@ -199,13 +203,20 @@ class GASConfig:
     beta_init: float = 0.95
 
     # Parameter bounds for optimization
-    beta_max: float = 0.999      # Stationarity constraint
-    alpha_min: float = 0.001
-    alpha_max: float = 0.5
+    beta_min: float = 0.5       # Minimum persistence
+    beta_max: float = 0.999     # Maximum persistence
+    alpha_min: float = 0.001    # Minimum score impact
+    alpha_max: float = 0.5      # Maximum score impact
 
     # Max log-intensity (safety cap)
     # ln(300) ≈ 5.70 for max 300 tweets/day
     max_log_intensity: float = 5.70
+
+    # Change point detection (symmetric for drops and surges)
+    # If |2-day avg - 7-day avg| / 7-day avg > threshold, boost α
+    cpd_threshold: float = 0.4      # 40% deviation triggers boost
+    cpd_alpha_multiplier: float = 3.0  # Multiply α by this factor
+    cpd_alpha_cap: float = 0.3      # Cap boosted α at this value
 
 
 @dataclass

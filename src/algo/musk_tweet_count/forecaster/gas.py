@@ -6,13 +6,18 @@ parameters (ω, α, β) are estimated via MLE.
 
 Model:
     f_t = log(μ_t)                              # log-intensity (state)
-    f_{t+1} = ω + β·f_t + α·s_t                # GAS recursion
-    s_t = (y_t - μ_t) / μ_t                     # scaled score
+    f_{t+1} = ω + β·f_t + α_t·s_t              # GAS recursion with adaptive α
+    s_t = (y_t - μ_t) / μ_t                     # scaled Pearson score
     Y_t ~ NegBin(μ_t = exp(f_t), k)             # observation density
+
+Change Point Detection:
+    When |2-day avg - 7-day avg| / 7-day avg > threshold, we boost α temporarily
+    to allow faster adaptation. This is symmetric for both drops and surges.
 """
 
 import logging
-from typing import List, Tuple
+from collections import deque
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy import optimize, stats
@@ -23,7 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 class GASRegimeModel:
-    """NB-GAS regime model for time-varying tweet intensity."""
+    """NB-GAS regime model for time-varying tweet intensity.
+
+    Includes change point detection for faster adaptation to regime shifts.
+    """
 
     def __init__(self, config: GASConfig):
         self.config = config
@@ -32,6 +40,9 @@ class GASRegimeModel:
         self.beta = config.beta_init
         self.k = 2.0  # Set externally from DispersionEstimator
         self.f = None  # Current log-intensity state
+
+        # Change point detection: track recent observations
+        self._recent_counts: deque = deque(maxlen=7)
 
     def fit(self, daily_counts: List[int], k: float) -> None:
         """Estimate (ω, α, β) via MLE on historical daily counts.
@@ -53,11 +64,11 @@ class GASRegimeModel:
         # Initial guesses
         x0 = np.array([self.config.omega_init, self.config.alpha_init, self.config.beta_init])
 
-        # Bounds: ω ∈ (-2, 2), α ∈ (0.001, 0.5), β ∈ (0.5, 0.999)
+        # Bounds: ω ∈ (-2, 2), α ∈ (alpha_min, alpha_max), β ∈ (beta_min, beta_max)
         bounds = [
             (-2.0, 2.0),
             (self.config.alpha_min, self.config.alpha_max),
-            (0.5, self.config.beta_max),
+            (self.config.beta_min, self.config.beta_max),
         ]
 
         counts = np.array(daily_counts, dtype=np.float64)
@@ -84,6 +95,11 @@ class GASRegimeModel:
 
         # Apply cap
         self.f = min(self.f, self.config.max_log_intensity)
+
+        # Initialize recent counts buffer with last 7 observations
+        self._recent_counts.clear()
+        for c in daily_counts[-7:]:
+            self._recent_counts.append(c)
 
         f_bar = self._unconditional_mean()
         logger.info(
@@ -133,7 +149,8 @@ class GASRegimeModel:
             mu = np.exp(f[t])
             mu = max(mu, 1e-6)
 
-            # Scaled score: s_t = (y_t - μ_t) / μ_t
+            # Scaled Pearson score: s_t = (y_t - μ_t) / μ_t
+            # Bounded at -1 from below, provides stability
             score = (counts[t] - mu) / mu
 
             # GAS recursion
@@ -146,6 +163,41 @@ class GASRegimeModel:
 
         return f
 
+    def _detect_regime_shift(self) -> Optional[float]:
+        """Detect regime shift by comparing 2-day avg to 7-day avg.
+
+        Returns:
+            Relative deviation if shift detected, None otherwise.
+            Positive = surge, Negative = collapse.
+        """
+        if len(self._recent_counts) < 7:
+            return None
+
+        recent_list = list(self._recent_counts)
+        avg_2d = np.mean(recent_list[-2:])  # Last 2 days
+        avg_7d = np.mean(recent_list)        # Last 7 days
+
+        if avg_7d < 1:
+            return None
+
+        deviation = (avg_2d - avg_7d) / avg_7d
+        if abs(deviation) > self.config.cpd_threshold:
+            return deviation
+        return None
+
+    def _get_adaptive_alpha(self) -> float:
+        """Get α, boosted if regime shift detected."""
+        shift = self._detect_regime_shift()
+        if shift is not None:
+            boosted = self.alpha * self.config.cpd_alpha_multiplier
+            capped = min(boosted, self.config.cpd_alpha_cap)
+            logger.debug(
+                f"Regime shift detected ({shift:+.1%}), "
+                f"boosting α: {self.alpha:.4f} → {capped:.4f}"
+            )
+            return capped
+        return self.alpha
+
     def update(self, count: int) -> None:
         """Update state with new observation (online, after fitting).
 
@@ -155,10 +207,19 @@ class GASRegimeModel:
         if self.f is None:
             raise RuntimeError("GAS model not fitted")
 
+        # Add to recent counts buffer for change point detection
+        self._recent_counts.append(count)
+
         mu = np.exp(self.f)
         mu = max(mu, 1e-6)
+
+        # Scaled Pearson score: (y - μ) / μ, bounded at -1 from below
         score = (count - mu) / mu
-        self.f = self.omega + self.beta * self.f + self.alpha * score
+
+        # Use adaptive α (boosted during regime shifts)
+        alpha = self._get_adaptive_alpha()
+
+        self.f = self.omega + self.beta * self.f + alpha * score
         self.f = min(self.f, self.config.max_log_intensity)
 
     def forecast_intensity(self, horizon: int = 0) -> float:

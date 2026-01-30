@@ -201,28 +201,37 @@ class MonteCarloForecaster:
         # Decay factor for regime adjustment
         decay = self.mc_config.regime_adj_decay
 
+        # Check if using PIG model (heavier tails)
+        from .interday import PIGInterdayForecaster
+        use_pig = isinstance(self.interday, PIGInterdayForecaster)
+
         for h in horizons:
-            mean, k = self.interday.forecast_day(h, base_date)
+            mean, dispersion_param = self.interday.forecast_day(h, base_date)
 
             # Apply decaying regime adjustment: day h gets 1 + (base_adj - 1) * decay^(h-1)
             # Day 1: full adjustment, Day 2: partial, Day 3: smaller, etc.
             decayed_adj = 1.0 + (regime_adjustment - 1.0) * (decay ** (h - 1))
             adjusted_mean = mean * decayed_adj
 
-            # Apply dispersion inflation: k' = k / s
-            # This increases variance without changing mean
-            # NB variance = μ + μ²/k, so smaller k -> larger variance
-            k_inflated = k / dispersion_inflation
-
-            # Negative Binomial sampling
-            # numpy uses (n, p) where n = k, p = k / (k + μ)
-            p = k_inflated / (k_inflated + adjusted_mean)
-
-            # Handle edge cases
-            if p <= 0 or p >= 1 or k_inflated <= 0:
-                sample = int(round(adjusted_mean))
+            if use_pig:
+                # PIG sampling: dispersion_param is sigma where Var = μ + σ²μ²
+                # Apply dispersion inflation by scaling sigma
+                sigma_inflated = dispersion_param * np.sqrt(dispersion_inflation)
+                sample = self.interday.regime.sample(adjusted_mean, rng)
             else:
-                sample = int(rng.negative_binomial(k_inflated, p))
+                # NegBin sampling: dispersion_param is k where Var = μ + μ²/k
+                # Apply dispersion inflation: k' = k / s
+                # This increases variance without changing mean
+                k_inflated = dispersion_param / dispersion_inflation
+
+                # numpy uses (n, p) where n = k, p = k / (k + μ)
+                p = k_inflated / (k_inflated + adjusted_mean)
+
+                # Handle edge cases
+                if p <= 0 or p >= 1 or k_inflated <= 0:
+                    sample = int(round(adjusted_mean))
+                else:
+                    sample = int(rng.negative_binomial(k_inflated, p))
 
             # Apply daily cap to prevent unrealistic forecasts
             if daily_cap > 0:

@@ -21,7 +21,7 @@ import numpy as np
 from .config import ForecasterConfig
 from .data import ContractDayUtils, TweetEvent, XTrackerClient, EventStore
 from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast
-from .interday import InterdayForecaster, GASInterdayForecaster
+from .interday import InterdayForecaster, GASInterdayForecaster, PIGInterdayForecaster
 from .monte_carlo import (
     MonteCarloForecaster,
     ForecastResult,
@@ -190,6 +190,7 @@ class Backtester:
         backtest_config: Optional[BacktestConfig] = None,
         use_ensemble: bool = False,
         use_gas: bool = False,
+        use_pig: bool = False,
     ):
         """
         Initialize backtester.
@@ -199,11 +200,13 @@ class Backtester:
             backtest_config: Configuration for backtesting
             use_ensemble: Whether to use ensemble forecasting (fast+slow EWMA)
             use_gas: Whether to use NB-GAS regime model instead of EWMA
+            use_pig: Whether to use PIG-GAS regime model (heavier tails than NB-GAS)
         """
         self.forecaster_config = forecaster_config or ForecasterConfig()
         self.backtest_config = backtest_config or BacktestConfig()
         self.use_ensemble = use_ensemble
         self.use_gas = use_gas
+        self.use_pig = use_pig
 
         # Contract utils
         self.contract_utils = ContractDayUtils(
@@ -290,6 +293,7 @@ class Backtester:
                             actual_sums_by_horizon[horizon][forecast_date],
                             use_ensemble=self.use_ensemble,
                             use_gas=self.use_gas,
+                            use_pig=self.use_pig,
                         )
                         forecasts.append(result)
 
@@ -341,6 +345,7 @@ class Backtester:
         actual_horizon: int,
         use_ensemble: bool = False,
         use_gas: bool = False,
+        use_pig: bool = False,
     ) -> SingleForecastResult:
         """Run a single forecast and compute metrics."""
         # Prepare training data
@@ -368,7 +373,27 @@ class Backtester:
         start_dt, _ = self.contract_utils.get_contract_day_bounds(forecast_date)
         now = start_dt + timedelta(minutes=tau)
 
-        if use_gas:
+        if use_pig:
+            # PIG-GAS mode: use Poisson-Inverse Gaussian (heavier tails)
+            pig_interday = PIGInterdayForecaster(
+                self.forecaster_config.gas,
+                self.forecaster_config.dispersion,
+                self.forecaster_config.weekend,
+                self.contract_utils,
+            )
+            pig_interday.fit(training_counts)
+
+            monte_carlo = MonteCarloForecaster(
+                self.forecaster_config,
+                forecaster.nowcast,
+                pig_interday,
+                self.contract_utils,
+            )
+
+            forecast = monte_carlo.simulate_horizon(
+                today_events, forecast_date, now, horizon=horizon
+            )
+        elif use_gas:
             # GAS mode: use NB-GAS regime model
             gas_interday = GASInterdayForecaster(
                 self.forecaster_config.gas,

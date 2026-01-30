@@ -152,9 +152,10 @@ def run_full_backtest(
     n_simulations: int = 5000,
     use_ensemble: bool = False,
     use_gas: bool = False,
+    use_pig: bool = False,
 ) -> None:
     """Run full backtest with multiple τ values."""
-    logger.info(f"Running full backtest (ensemble={use_ensemble}, gas={use_gas})...")
+    logger.info(f"Running full backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig})...")
 
     # Configure for available data
     # With ~85 days, use 45-day training to maximize test window
@@ -168,7 +169,7 @@ def run_full_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas)
+    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
     results = backtester.run(events_by_date)
 
     # Print results
@@ -268,13 +269,14 @@ def run_quick_backtest(
     n_simulations: int = 2000,
     use_ensemble: bool = False,
     use_gas: bool = False,
+    use_pig: bool = False,
 ) -> None:
     """Run quick backtest with single τ value."""
-    logger.info(f"Running quick backtest (ensemble={use_ensemble}, gas={use_gas})...")
+    logger.info(f"Running quick backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig})...")
 
     config = BacktestConfig(
-        training_window_days=45,
-        min_training_days=30,
+        training_window_days=60,
+        min_training_days=45,
         tau_values=[720],  # Only at noon (12h into contract day)
         n_simulations=n_simulations,
         include_naive_baseline=True,
@@ -282,7 +284,7 @@ def run_quick_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas)
+    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
     results = backtester.run(events_by_date)
 
     print(results.summary())
@@ -332,6 +334,7 @@ def run_dispersion_grid_search(
     n_simulations: int = 2000,
     inflation_values: List[float] = None,
     use_gas: bool = False,
+    use_pig: bool = False,
 ) -> None:
     """
     Grid search for optimal dispersion inflation factor.
@@ -376,6 +379,7 @@ def run_dispersion_grid_search(
             forecaster_config=forecaster_config,
             backtest_config=backtest_config,
             use_gas=use_gas,
+            use_pig=use_pig,
         )
 
         try:
@@ -494,6 +498,11 @@ def main():
         action="store_true",
         help="Use NB-GAS regime model instead of EWMA (MLE-optimized reactivity)",
     )
+    parser.add_argument(
+        "--pig",
+        action="store_true",
+        help="Use PIG-GAS regime model (Poisson-Inverse Gaussian, heavier tails than NB)",
+    )
 
     args = parser.parse_args()
 
@@ -526,13 +535,13 @@ def main():
 
     # Run appropriate backtest
     if args.grid_search:
-        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations, use_gas=args.gas)
+        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations, use_gas=args.gas, use_pig=args.pig)
     elif args.ablation:
         run_ablation_study(events_by_date, n_simulations=args.n_simulations)
     elif args.quick:
-        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas)
+        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig)
     else:
-        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas)
+        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig)
 
 
 if __name__ == "__main__":
