@@ -153,6 +153,10 @@ class Portfolio:
     total_realized_pnl: float = 0.0
     last_update_time: float = field(default_factory=time.time)
 
+    # External capital constraint (from shared pool manager)
+    # When set, available_capital is min(internal_available, external_limit)
+    external_capital_limit: Optional[float] = None
+
     @property
     def total_collateral_used(self) -> float:
         """Total collateral across all positions."""
@@ -160,8 +164,28 @@ class Portfolio:
 
     @property
     def available_capital(self) -> float:
-        """Capital available for new trades."""
-        return self.capital - self.total_collateral_used
+        """
+        Capital available for new trades.
+
+        If external_capital_limit is set (from shared pool manager),
+        returns the minimum of internal available and external limit.
+        """
+        internal_available = self.capital - self.total_collateral_used
+
+        if self.external_capital_limit is not None:
+            return min(internal_available, self.external_capital_limit)
+
+        return internal_available
+
+    def set_external_capital_limit(self, limit: Optional[float]) -> None:
+        """
+        Set external capital constraint from shared pool.
+
+        Args:
+            limit: Maximum additional capital this portfolio can use,
+                   or None to remove constraint.
+        """
+        self.external_capital_limit = limit
 
     @property
     def yes_positions(self) -> Dict[int, float]:

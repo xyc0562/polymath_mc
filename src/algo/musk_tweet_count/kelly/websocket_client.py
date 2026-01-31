@@ -378,6 +378,7 @@ class OrderbookManager:
         self,
         config: WebSocketConfig,
         clob_client=None,  # ClobClient for fallback
+        on_significant_update: Optional[Callable[[str, int, UnifiedOrderbook], None]] = None,
     ):
         """
         Initialize orderbook manager.
@@ -385,13 +386,20 @@ class OrderbookManager:
         Args:
             config: WebSocket configuration
             clob_client: Optional ClobClient for REST API fallback
+            on_significant_update: Optional callback for significant orderbook changes.
+                                   Called with (token_id, bin_index, orderbook).
+                                   Use this to trigger trading logic on WS updates.
         """
         self.config = config
         self.clob_client = clob_client
+        self.on_significant_update = on_significant_update
 
         self._ws_client: Optional[OrderbookWebSocket] = None
         self._orderbooks: Dict[str, UnifiedOrderbook] = {}
         self._token_to_bin: Dict[str, int] = {}
+
+        # Tracking for significant change detection
+        self._last_best_prices: Dict[str, tuple] = {}  # token_id -> (best_bid, best_ask)
 
     async def start(self) -> None:
         """Start the orderbook manager."""
@@ -411,7 +419,26 @@ class OrderbookManager:
 
     def _on_ws_update(self, token_id: str, orderbook: UnifiedOrderbook) -> None:
         """Handle orderbook update from WebSocket."""
+        old_orderbook = self._orderbooks.get(token_id)
         self._orderbooks[token_id] = orderbook
+
+        # Check for significant change (best price changed)
+        if self.on_significant_update:
+            old_prices = self._last_best_prices.get(token_id)
+            new_prices = (orderbook.best_yes_bid, orderbook.best_yes_ask)
+
+            is_significant = (
+                old_prices is None or
+                old_prices != new_prices
+            )
+
+            if is_significant:
+                self._last_best_prices[token_id] = new_prices
+                bin_index = self._token_to_bin.get(token_id, 0)
+                try:
+                    self.on_significant_update(token_id, bin_index, orderbook)
+                except Exception as e:
+                    logger.error(f"Error in on_significant_update callback: {e}")
 
     async def subscribe_bins(
         self,
@@ -458,11 +485,19 @@ class OrderbookManager:
         try:
             response = self.clob_client.get_order_book(token_id)
 
+            # Handle both dict and object responses (OrderBookSummary)
+            if hasattr(response, 'bids'):
+                bids = response.bids or []
+                asks = response.asks or []
+            else:
+                bids = response.get("bids", [])
+                asks = response.get("asks", [])
+
             orderbook = UnifiedOrderbook.from_api_response(
                 bin_index=bin_index,
                 yes_token_id=token_id,
-                bids=response.get("bids", []),
-                asks=response.get("asks", []),
+                bids=bids,
+                asks=asks,
                 timestamp=time.time(),
             )
 

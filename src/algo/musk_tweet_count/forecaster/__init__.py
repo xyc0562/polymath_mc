@@ -99,6 +99,11 @@ from .run_backtest import (
     XTRACKER_START_DATE,
 )
 
+from .trading_bot import (
+    GASKellyTradingBot,
+    TradingBotConfig,
+)
+
 __all__ = [
     # Main forecaster
     "Musk7DayForecaster",
@@ -163,6 +168,10 @@ __all__ = [
     "run_full_backtest",
     "run_ablation_study",
     "XTRACKER_START_DATE",
+
+    # Trading bot
+    "GASKellyTradingBot",
+    "TradingBotConfig",
 ]
 
 __version__ = "1.0.0"

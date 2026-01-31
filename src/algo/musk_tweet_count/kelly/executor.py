@@ -247,6 +247,8 @@ class KellyExecutor:
     2. Execute best candidate
     3. Update portfolio
     4. Repeat
+
+    Includes rate limiting to prevent runaway execution and respect API limits.
     """
 
     def __init__(
@@ -280,6 +282,37 @@ class KellyExecutor:
         self._running = False
         self._last_tick_time = 0.0
 
+        # Rate limiting state: track recent order timestamps
+        self._order_timestamps: List[float] = []
+
+    def _check_rate_limit(self) -> bool:
+        """
+        Check if we're within rate limits.
+
+        Returns:
+            True if we can place another order, False if rate limited
+        """
+        now = time.time()
+        rate_config = self.config.rate_limit
+
+        # Clean up old timestamps (older than 1 minute)
+        cutoff = now - 60.0
+        self._order_timestamps = [ts for ts in self._order_timestamps if ts > cutoff]
+
+        # Check orders per minute
+        if len(self._order_timestamps) >= rate_config.max_orders_per_minute:
+            logger.warning(
+                f"Rate limit hit: {len(self._order_timestamps)} orders in last minute "
+                f"(max: {rate_config.max_orders_per_minute})"
+            )
+            return False
+
+        return True
+
+    def _record_order(self) -> None:
+        """Record an order timestamp for rate limiting."""
+        self._order_timestamps.append(time.time())
+
     async def run_tick(
         self,
         hours_to_settlement: float,
@@ -289,6 +322,11 @@ class KellyExecutor:
 
         Generates candidates and executes trades until no more
         profitable trades or max iterations reached.
+
+        Respects rate limits:
+        - max_orders_per_tick: Stop after this many orders
+        - min_order_delay_seconds: Wait between orders
+        - max_orders_per_minute: Hard cap across ticks
 
         Args:
             hours_to_settlement: Hours until market settlement
@@ -314,7 +352,22 @@ class KellyExecutor:
         # Get current orderbooks
         orderbooks = self._get_orderbooks()
 
+        rate_config = self.config.rate_limit
+        orders_this_tick = 0
+
         for iteration in range(self.config.max_iters_per_tick):
+            # Check per-tick order limit
+            if orders_this_tick >= rate_config.max_orders_per_tick:
+                logger.info(
+                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
+                )
+                break
+
+            # Check global rate limit
+            if not self._check_rate_limit():
+                logger.info("Rate limit reached, stopping tick early")
+                break
+
             # Generate candidates
             candidates = generate_candidates(
                 portfolio=self.portfolio,
@@ -352,6 +405,10 @@ class KellyExecutor:
             if result.success:
                 tick_result.num_executed += 1
                 tick_result.total_utility_gain += best.utility_gain
+                orders_this_tick += 1
+
+                # Record for rate limiting
+                self._record_order()
 
                 # Update portfolio
                 self._update_portfolio(best, token_id)
@@ -365,6 +422,10 @@ class KellyExecutor:
                     f"size={best.size:.2f} @ {best.price:.4f} "
                     f"utility_gain={best.utility_gain:.6f} edge={best.edge:.2%}"
                 )
+
+                # Delay between orders (if more iterations expected)
+                if iteration < self.config.max_iters_per_tick - 1:
+                    await asyncio.sleep(rate_config.min_order_delay_seconds)
             else:
                 logger.warning(f"Execution failed: {result.error}")
                 break

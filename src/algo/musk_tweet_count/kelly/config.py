@@ -9,19 +9,59 @@ from typing import Optional
 @dataclass
 class EdgeBufferConfig:
     """
-    Configuration for edge buffer to protect against model uncertainty.
+    Configuration for edge buffer using stake-based ROI model.
 
-    The edge buffer requires a minimum edge before trading, with dynamic
-    scaling at extreme prices where model errors have larger relative impact.
+    This model requires edge proportional to what you're RISKING, not buying:
+    - Buy YES: risk p_m to win (1 - p_m)
+    - Buy NO: risk (1 - p_m) to win p_m
+
+    Formulas:
+    - Buy YES if: p_f - p_m >= c + r * p_m
+      → YES max price: p_m <= (p_f - c) / (1 + r)
+    - Buy NO if: p_m - p_f >= c + r * (1 - p_m)
+      → YES min price: p_m >= (p_f + c + r) / (1 + r)
+
+    Where:
+    - c = friction (fees + slippage + spread) in probability points
+    - r = required ROI on stake for model risk
+
+    This naturally creates asymmetry:
+    - At p_f=4%: Buy YES needs ~2pp edge, Buy NO needs ~6.5pp edge
+    - At p_f=96%: Buy YES needs ~6.5pp edge, Buy NO needs ~2pp edge
     """
 
-    # Base edge percentage required (e.g., 0.05 = 5%)
-    base_edge_pct: float = 0.05
+    # Required ROI on stake (e.g., 0.05 = 5%)
+    required_roi: float = 0.05
 
-    # Multiplier at extreme prices (0 or 1)
-    # At p=0.5: require base_edge
-    # At p=0 or p=1: require base_edge * extreme_multiplier
-    extreme_multiplier: float = 2.0
+    # Friction in probability points for middle range (10% < p < 90%)
+    friction_mid: float = 0.01  # 1%
+
+    # Friction in probability points for tails (p <= 10% or p >= 90%)
+    friction_tail: float = 0.02  # 2%
+
+    # Threshold for tail zone
+    tail_threshold: float = 0.10  # 10%
+
+
+@dataclass
+class RateLimitConfig:
+    """
+    Configuration for order rate limiting.
+
+    Prevents runaway execution and respects API rate limits.
+    """
+
+    # Maximum orders per optimization tick
+    max_orders_per_tick: int = 10
+
+    # Minimum delay between orders in seconds
+    min_order_delay_seconds: float = 1.0
+
+    # Maximum orders per minute (hard cap)
+    max_orders_per_minute: int = 30
+
+    # Cooldown after hitting rate limit (seconds)
+    rate_limit_cooldown_seconds: float = 60.0
 
 
 @dataclass
@@ -114,6 +154,9 @@ class KellyConfig:
     # Collateral limits
     collateral: CollateralConfig = field(default_factory=CollateralConfig)
 
+    # Rate limiting
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+
     @classmethod
     def from_dict(cls, data: dict) -> "KellyConfig":
         """Create config from dictionary (e.g., from YAML)."""
@@ -122,11 +165,13 @@ class KellyConfig:
         adaptive_delta_data = data.pop("adaptive_delta", {})
         websocket_data = data.pop("websocket", {})
         collateral_data = data.pop("collateral", {})
+        rate_limit_data = data.pop("rate_limit", {})
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),
             adaptive_delta=AdaptiveDeltaConfig(**adaptive_delta_data),
             websocket=WebSocketConfig(**websocket_data),
             collateral=CollateralConfig(**collateral_data),
+            rate_limit=RateLimitConfig(**rate_limit_data),
             **data,
         )

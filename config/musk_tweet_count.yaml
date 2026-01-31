@@ -1,39 +1,110 @@
 # Polymarket Musk Tweet Count Trading Bot Configuration
 
-# Trading configuration
+# ========== GAS-Kelly Trading Bot Configuration ==========
+# This is the primary configuration for the GAS forecaster + Kelly optimizer
+
 trading:
-  # Edge thresholds (as decimal, e.g., 0.05 = 5%)
-  min_edge_to_buy: 0.05        # Minimum edge required to enter a position
-  min_edge_to_sell: 0.03       # Minimum edge required to exit a position
+  enabled: true
+  dry_run: true  # Start with paper trading, set to false for live
 
-  # Position limits (in USD)
-  max_position_size_usd: 100.0  # Maximum USD per single position
-  max_total_exposure_usd: 500.0 # Maximum total portfolio exposure
+  # Tick interval: time between optimization ticks
+  tick_interval_seconds: 300  # 5 minutes (legacy, not used in two-loop mode)
 
-  # Safety margins
-  error_margin: 0.02           # Safety margin for calculations
+  # Two-loop architecture timing
+  slow_loop_interval_seconds: 150   # Probability updates (2.5 min)
+  fast_loop_interval_seconds: 15    # Orderbook checks (15 sec)
+  forecast_cache_seconds: 165       # Cache timeout (slow + 15s buffer)
 
-  # Timing
-  check_interval_seconds: 300  # Seconds between market checks (5 min)
+# Forecaster configuration (GAS model)
+forecaster:
+  timezone: "America/New_York"
+  contract_boundary_hour: 12  # Noon ET
 
-  # Order execution
-  use_limit_orders: true       # Use limit orders (true) or market orders (false)
-  limit_order_offset: 0.01     # Offset from best price for limit orders
+  # Nowcast model
+  nowcast:
+    training_window_days: 45
+    weight_half_life_days: 14.0
 
-  # Risk management
-  stop_loss_pct: 0.50          # Stop loss threshold (50% loss)
-  take_profit_pct: 0.30        # Take profit threshold (30% gain)
+  # GAS regime model
+  gas:
+    beta_min: 0.5
+    beta_max: 0.999
+    alpha_min: 0.001
+    alpha_max: 0.5
+    cpd_threshold: 0.4
+    cpd_alpha_multiplier: 3.0
 
-  # Liquidity requirements
-  min_liquidity_usd: 100.0     # Minimum orderbook depth required
-  max_spread_pct: 0.10         # Maximum bid-ask spread (10%)
+  # Monte Carlo simulation
+  monte_carlo:
+    n_simulations: 10000
+    dispersion_inflation_factor: 2.5
+    today_std_inflation_factor: 2.5
 
-  # Dry run mode - set to true to simulate without executing trades
+# Kelly optimizer configuration
+kelly:
+  enabled: true
+  kappa: 0.25          # Quarter Kelly for safety
+  tau: 0.0001          # Min utility gain threshold (lowered to allow smaller trades)
+  w_floor: 1.0         # Minimum terminal wealth
+  max_iters_per_tick: 10  # Reduced from 100 for rate limiting
+  t_stop_hours: 3.0    # Stop trading 3h before settlement
+  renormalize_probabilities: true
+
+  # Edge buffer: stake-based ROI model
+  # Buy YES: market <= (fair - c) / (1 + r)
+  # Buy NO: market >= (fair + c + r) / (1 + r)
+  # This creates natural asymmetry based on what you're risking
+  edge_buffer:
+    required_roi: 0.05            # 5% required ROI on stake
+    friction_mid: 0.01            # 1% friction for 10% < p < 90%
+    friction_tail: 0.02           # 2% friction for p <= 10% or p >= 90%
+    tail_threshold: 0.10          # Threshold for tail zone
+
+  # Adaptive chunk sizing
+  adaptive_delta:
+    base_delta: 10.0
+    max_depth_fraction: 0.10
+    time_ramp_hours: 6.0
+    min_delta: 1.0
+
+  # Rate limiting to prevent runaway execution
+  rate_limit:
+    max_orders_per_tick: 10
+    min_order_delay_seconds: 1.0
+    max_orders_per_minute: 30
+    rate_limit_cooldown_seconds: 60.0
+
+  # Collateral limits (start conservative)
+  collateral:
+    c_event_max: 100.0   # $100 max per event
+    c_bin_max: 25.0      # $25 max per bin
+
+  # WebSocket for real-time orderbook
+  websocket:
+    enabled: true
+    reconnect_delay_seconds: 5.0
+    heartbeat_interval_seconds: 30.0
+
+# ========== Legacy Configuration (for backward compatibility) ==========
+
+# Legacy trading configuration
+legacy_trading:
+  min_edge_to_buy: 0.05
+  min_edge_to_sell: 0.03
+  max_position_size_usd: 100.0
+  max_total_exposure_usd: 500.0
+  error_margin: 0.02
+  check_interval_seconds: 300
+  use_limit_orders: true
+  limit_order_offset: 0.01
+  stop_loss_pct: 0.50
+  take_profit_pct: 0.30
+  min_liquidity_usd: 100.0
+  max_spread_pct: 0.10
   dry_run: false
 
-# Fair value calculator configuration
+# Fair value calculator configuration (legacy)
 fair_value:
-  # Historical parameters for Gaussian model (placeholder)
-  historical_mean: 350.0       # Average tweets per 7-day period
-  historical_std: 100.0        # Standard deviation of tweet count
-  time_decay_factor: 0.8       # How uncertainty decreases over time (0-1)
+  historical_mean: 350.0
+  historical_std: 100.0
+  time_decay_factor: 0.8

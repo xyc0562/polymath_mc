@@ -57,27 +57,109 @@ class TradeCandidate:
             return -self.size * self.price  # Negative = proceeds
 
 
+def get_friction(fair_value: float, config: EdgeBufferConfig) -> float:
+    """
+    Get friction (c) based on probability zone.
+
+    Tails (p <= 10% or p >= 90%) have higher friction due to worse liquidity.
+    """
+    if fair_value <= config.tail_threshold or fair_value >= (1 - config.tail_threshold):
+        return config.friction_tail
+    return config.friction_mid
+
+
+def compute_buy_yes_threshold(
+    fair_value: float,
+    config: EdgeBufferConfig,
+) -> float:
+    """
+    Compute max YES price to buy (BUY_YES threshold).
+
+    Formula: p_m <= (p_f - c) / (1 + r)
+
+    Where:
+    - p_f = fair value
+    - c = friction
+    - r = required ROI on stake
+
+    If p_f <= c, returns 0 (don't buy - friction dominates).
+    """
+    c = get_friction(fair_value, config)
+    r = config.required_roi
+
+    if fair_value <= c:
+        return 0.0  # Friction dominates, don't buy YES
+
+    return (fair_value - c) / (1 + r)
+
+
+def compute_buy_no_threshold(
+    fair_value: float,
+    config: EdgeBufferConfig,
+) -> float:
+    """
+    Compute min YES price to buy NO (BUY_NO threshold).
+
+    When YES price is above this threshold, buy NO.
+
+    Formula: p_m >= (p_f + c + r) / (1 + r)
+
+    Where:
+    - p_f = YES fair value
+    - c = friction (based on NO probability = 1 - p_f)
+    - r = required ROI on stake
+
+    If p_f >= 1 - c - r, returns 1.0 (don't buy NO).
+    """
+    no_fair_value = 1.0 - fair_value
+    c = get_friction(no_fair_value, config)  # Use NO's probability for friction
+    r = config.required_roi
+
+    if fair_value >= 1 - c - r:
+        return 1.0  # Don't buy NO
+
+    return (fair_value + c + r) / (1 + r)
+
+
 def compute_required_edge(
     reservation_price: float,
     config: EdgeBufferConfig,
 ) -> float:
     """
-    Compute required edge based on reservation price.
+    Compute required edge for display/logging purposes.
 
-    Requires larger edge at extreme prices where model errors
-    have larger relative impact.
-
-    At p=0.50: require base_edge (5%)
-    At p=0.10: require ~8% (1.6x)
-    At p=0.05: require ~9% (1.8x)
+    This returns the edge required for BUY_YES at this reservation price.
     """
-    # Distance from center (0 at p=0.5, 1 at p=0 or p=1)
-    extremity = abs(reservation_price - 0.5) * 2
+    threshold = compute_buy_yes_threshold(reservation_price, config)
+    return reservation_price - threshold
 
-    # Linear scaling: 1x at center, extreme_multiplier at edges
-    multiplier = 1.0 + extremity * (config.extreme_multiplier - 1.0)
 
-    return config.base_edge_pct * multiplier
+def compute_buy_threshold(
+    reservation_price: float,
+    config: EdgeBufferConfig,
+) -> float:
+    """
+    Compute the buy threshold (max price to pay) for buying this asset.
+
+    This is used for BUY_YES when reservation_price is YES fair value,
+    and for BUY_NO when reservation_price is NO fair value.
+    """
+    return compute_buy_yes_threshold(reservation_price, config)
+
+
+def compute_sell_threshold(
+    reservation_price: float,
+    config: EdgeBufferConfig,
+) -> float:
+    """
+    Compute the sell threshold (min price to receive).
+
+    SELL_YES is equivalent to counterparty buying YES from us.
+    We want YES to be overpriced, which is the BUY_NO condition.
+
+    sell_threshold_yes = buy_no_threshold (min YES price for buying NO)
+    """
+    return compute_buy_no_threshold(reservation_price, config)
 
 
 def should_trade(
@@ -87,33 +169,59 @@ def should_trade(
     config: EdgeBufferConfig,
 ) -> tuple[bool, float]:
     """
-    Determine if trade meets edge requirement.
+    Determine if trade meets edge requirement using stake-based ROI model.
+
+    For BUY_YES/BUY_NO: reservation_price is the fair value of the asset being bought.
+    For SELL_YES/SELL_NO: reservation_price is the fair value of the asset being sold.
 
     Args:
-        market_price: Current market price (VWAP)
-        reservation_price: Kelly reservation price
+        market_price: Current market price (VWAP) of the asset being traded
+        reservation_price: Fair value of the asset being traded
         action: Trade action
         config: Edge buffer configuration
 
     Returns:
-        Tuple of (should_trade, actual_edge)
+        Tuple of (should_trade, actual_edge_pct)
+        actual_edge_pct is the ROI on stake if price reverts to fair value
     """
     if reservation_price <= 0 or reservation_price >= 1:
         return False, 0.0
 
-    required_edge = compute_required_edge(reservation_price, config)
+    if action == TradeAction.BUY_YES:
+        # Buy YES if market price <= (fair - c) / (1 + r)
+        threshold = compute_buy_yes_threshold(reservation_price, config)
+        # ROI = (fair - paid) / paid
+        actual_edge = (reservation_price - market_price) / market_price if market_price > 0 else 0.0
+        return market_price <= threshold and threshold > 0, actual_edge
 
-    if action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
-        # Buy if market_price < reservation * (1 - edge)
-        threshold = reservation_price * (1 - required_edge)
-        actual_edge = (reservation_price - market_price) / reservation_price
-        return market_price < threshold, actual_edge
+    elif action == TradeAction.BUY_NO:
+        # BUY_NO: reservation_price = NO fair value
+        # Convert to YES fair value for the formula
+        yes_fair_value = 1.0 - reservation_price
+        # YES price must be >= (p_f + c + r) / (1 + r) for us to buy NO
+        yes_threshold = compute_buy_no_threshold(yes_fair_value, config)
+        # Convert market price from NO to YES: yes_market = 1 - no_market
+        yes_market_price = 1.0 - market_price
+        # ROI on stake: we risk (1 - p_m) = no_price to win p_m = yes_price
+        actual_edge = (reservation_price - market_price) / market_price if market_price > 0 else 0.0
+        return yes_market_price >= yes_threshold and yes_threshold < 1.0, actual_edge
 
-    else:  # SELL
-        # Sell if market_price > reservation * (1 + edge)
-        threshold = reservation_price * (1 + required_edge)
-        actual_edge = (market_price - reservation_price) / reservation_price
-        return market_price > threshold, actual_edge
+    elif action == TradeAction.SELL_YES:
+        # SELL_YES: we want YES to be overpriced (same condition as BUY_NO)
+        yes_threshold = compute_buy_no_threshold(reservation_price, config)
+        actual_edge = (market_price - reservation_price) / reservation_price if reservation_price > 0 else 0.0
+        return market_price >= yes_threshold and yes_threshold < 1.0, actual_edge
+
+    else:  # SELL_NO
+        # SELL_NO: we want NO to be overpriced
+        # reservation_price = NO fair value
+        # Convert to YES fair value, use BUY_YES threshold logic inverted
+        yes_fair_value = 1.0 - reservation_price
+        yes_threshold = compute_buy_yes_threshold(yes_fair_value, config)
+        # NO market price must be > 1 - yes_threshold
+        no_threshold = 1.0 - yes_threshold if yes_threshold > 0 else 1.0
+        actual_edge = (market_price - reservation_price) / reservation_price if reservation_price > 0 else 0.0
+        return market_price >= no_threshold, actual_edge
 
 
 def compute_adaptive_delta(
@@ -258,6 +366,7 @@ def _generate_buy_yes_candidate(
     # Get available depth
     depth = get_available_depth(orderbook, "BUY_YES")
     if depth <= 0:
+        logger.debug(f"BUY_YES bin {bin_index}: no depth")
         return None
 
     # Compute adaptive chunk size
@@ -273,11 +382,13 @@ def _generate_buy_yes_candidate(
 
     # Check we have capital
     if portfolio.available_capital < delta * 0.01:  # Rough check
+        logger.debug(f"BUY_YES bin {bin_index}: insufficient capital")
         return None
 
     # Get VWAP for this chunk
     vwap, filled = compute_vwap_buy_yes(orderbook, delta)
     if filled <= 0:
+        logger.debug(f"BUY_YES bin {bin_index}: no fill at delta={delta:.2f}")
         return None
 
     # Check edge requirement
@@ -285,6 +396,8 @@ def _generate_buy_yes_candidate(
         vwap, reservation_price, TradeAction.BUY_YES, config.edge_buffer
     )
     if not trade_ok:
+        threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
+        logger.debug(f"BUY_YES bin {bin_index}: edge check failed (vwap={vwap:.4f}, res={reservation_price:.4f}, thresh={threshold:.4f})")
         return None
 
     # Simulate trade and compute utility gain
@@ -292,6 +405,7 @@ def _generate_buy_yes_candidate(
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
     if utility_gain < config.tau:
+        logger.debug(f"BUY_YES bin {bin_index}: utility too low ({utility_gain:.6f} < {config.tau:.6f})")
         return None
 
     return TradeCandidate(
@@ -374,6 +488,7 @@ def _generate_buy_no_candidate(
     """Generate a BUY NO candidate if profitable."""
     depth = get_available_depth(orderbook, "BUY_NO")
     if depth <= 0:
+        logger.debug(f"BUY_NO bin {bin_index}: no depth")
         return None
 
     delta = compute_adaptive_delta(
@@ -385,22 +500,28 @@ def _generate_buy_no_candidate(
     delta *= config.kappa
 
     if portfolio.available_capital < delta * 0.01:
+        logger.debug(f"BUY_NO bin {bin_index}: insufficient capital (need {delta * 0.01:.2f}, have {portfolio.available_capital:.2f})")
         return None
 
     vwap, filled = compute_vwap_buy_no(orderbook, delta)
     if filled <= 0:
+        logger.debug(f"BUY_NO bin {bin_index}: no fill at delta={delta:.2f}")
         return None
 
     trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
     if not trade_ok:
+        req_edge = compute_required_edge(reservation_price, config.edge_buffer)
+        threshold = reservation_price * (1 - req_edge)
+        logger.debug(f"BUY_NO bin {bin_index}: edge check failed (vwap={vwap:.4f}, res={reservation_price:.4f}, req_edge={req_edge:.2%}, thresh={threshold:.4f})")
         return None
 
     new_portfolio = portfolio.simulate_buy_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
     if utility_gain < config.tau:
+        logger.debug(f"BUY_NO bin {bin_index}: utility too low ({utility_gain:.6f} < {config.tau:.6f})")
         return None
 
     return TradeCandidate(

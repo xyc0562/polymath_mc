@@ -68,6 +68,9 @@ class KellyTradingBot:
         self._running = False
         self._setup_complete = False
 
+        # Lock for thread-safe tick execution
+        self._tick_lock = asyncio.Lock()
+
     async def setup(
         self,
         initial_capital: float,
@@ -202,6 +205,8 @@ class KellyTradingBot:
         """
         Run a single optimization tick.
 
+        Thread-safe: uses lock to prevent concurrent tick execution.
+
         Args:
             current_count: Current tweet count
             hours_elapsed: Hours since counting started
@@ -213,18 +218,33 @@ class KellyTradingBot:
         if not self._setup_complete:
             raise RuntimeError("Bot not setup. Call setup() first.")
 
-        # Update probabilities
-        self.update_probabilities(current_count, hours_elapsed, hours_to_settlement)
+        # Try to acquire lock without blocking - skip if already running
+        if self._tick_lock.locked():
+            logger.debug("Kelly tick already in progress, skipping")
+            return TickResult(
+                num_candidates=0,
+                num_executed=0,
+                total_utility_gain=0.0,
+                executions=[],
+                elapsed_seconds=0.0,
+            )
 
-        # Fetch fresh orderbooks for any stale data
-        for bin_idx, token_id in self.bin_token_ids.items():
-            if not self.orderbook_manager.get_orderbook(token_id):
-                await self.orderbook_manager.fetch_orderbook(token_id, bin_idx)
+        async with self._tick_lock:
+            # Update probabilities (this also identifies dead bins)
+            self.update_probabilities(current_count, hours_elapsed, hours_to_settlement)
 
-        # Run Kelly optimization tick
-        result = await self.kelly_executor.run_tick(hours_to_settlement)
+            # Fetch fresh orderbooks only for LIVE bins (skip dead bins)
+            dead_bins = set(self.portfolio.dead_bins)
+            for bin_idx, token_id in self.bin_token_ids.items():
+                if bin_idx in dead_bins:
+                    continue  # Skip dead bins - no need to fetch orderbooks
+                if not self.orderbook_manager.get_orderbook(token_id):
+                    await self.orderbook_manager.fetch_orderbook(token_id, bin_idx)
 
-        return result
+            # Run Kelly optimization tick
+            result = await self.kelly_executor.run_tick(hours_to_settlement)
+
+            return result
 
     async def run_continuous(
         self,

@@ -116,23 +116,26 @@ class UnifiedOrderbook:
         cls,
         bin_index: int,
         yes_token_id: str,
-        bids: List[Dict],
-        asks: List[Dict],
+        bids: List,
+        asks: List,
         timestamp: Optional[float] = None,
     ) -> "UnifiedOrderbook":
         """
         Create from Polymarket API response.
 
-        API format: [{"price": "0.45", "size": "100"}, ...]
+        API format: [{"price": "0.45", "size": "100"}, ...] or [OrderSummary, ...]
         """
-        yes_bids = [
-            OrderbookLevel(price=float(b["price"]), size=float(b["size"]))
-            for b in bids
-        ]
-        yes_asks = [
-            OrderbookLevel(price=float(a["price"]), size=float(a["size"]))
-            for a in asks
-        ]
+        def parse_level(item) -> OrderbookLevel:
+            """Parse a bid/ask item (dict or OrderSummary object)."""
+            if hasattr(item, 'price'):
+                # OrderSummary object
+                return OrderbookLevel(price=float(item.price), size=float(item.size))
+            else:
+                # Dict
+                return OrderbookLevel(price=float(item["price"]), size=float(item["size"]))
+
+        yes_bids = [parse_level(b) for b in bids]
+        yes_asks = [parse_level(a) for a in asks]
 
         # Sort bids high to low, asks low to high
         yes_bids.sort(key=lambda x: x.price, reverse=True)

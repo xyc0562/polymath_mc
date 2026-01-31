@@ -34,12 +34,17 @@ class Musk7DayForecaster:
     - Generating bin probabilities for trading
     """
 
-    def __init__(self, config: Optional[ForecasterConfig] = None):
+    def __init__(
+        self,
+        config: Optional[ForecasterConfig] = None,
+        event_store: Optional[EventStore] = None,
+    ):
         """
         Initialize forecaster.
 
         Args:
             config: Forecaster configuration (uses defaults if None)
+            event_store: Optional shared EventStore (creates own if None)
         """
         self.config = config or ForecasterConfig()
 
@@ -49,9 +54,15 @@ class Musk7DayForecaster:
             boundary_hour=self.config.contract_boundary_hour,
         )
 
-        # Data layer
-        self.xtracker = XTrackerClient()
-        self.event_store = EventStore(self.contract_utils, self.xtracker)
+        # Data layer - use shared or create own
+        if event_store is not None:
+            self.event_store = event_store
+            self.xtracker = event_store.xtracker_client
+            self._uses_shared_store = True
+        else:
+            self.xtracker = XTrackerClient()
+            self.event_store = EventStore(self.contract_utils, self.xtracker)
+            self._uses_shared_store = False
 
         # Intraday components
         self.progress_curve = IntradayProgressCurve(
@@ -86,7 +97,7 @@ class Musk7DayForecaster:
         self._cached_forecast: Optional[ForecastResult] = None
         self._cache_time: Optional[datetime] = None
 
-    def fit(self, n_days: int = 90) -> None:
+    def fit(self, n_days: int = 90, skip_fetch: bool = False) -> None:
         """
         Fit all model components from historical data.
 
@@ -94,11 +105,13 @@ class Musk7DayForecaster:
 
         Args:
             n_days: Number of historical days to use
+            skip_fetch: If True, skip API fetch (use when sharing EventStore)
         """
         logger.info(f"Fitting forecaster with {n_days} days of history")
 
-        # Fetch historical data
-        self.event_store.refresh_from_api(n_days)
+        # Fetch historical data (skip if using shared store that's already populated)
+        if not skip_fetch:
+            self.event_store.refresh_from_api(n_days)
 
         # Get historical data in required formats
         historical_timestamps = self.event_store.get_historical_timestamps(n_days)
@@ -402,6 +415,256 @@ class Musk7DayForecaster:
         elapsed = (now - self._last_update).total_seconds()
 
         return elapsed >= self.config.update.periodic_update_seconds
+
+    # ========== Methods for live trading integration ==========
+
+    def get_current_count(self, contract_date: Optional[date] = None) -> int:
+        """
+        Get current tweet count for today's contract day.
+
+        Args:
+            contract_date: Contract date (default: today)
+
+        Returns:
+            Number of tweets so far today
+        """
+        if contract_date is None:
+            contract_date = self.contract_utils.get_current_contract_date()
+
+        events = self.event_store.get_contract_day_events(contract_date)
+        return len(events)
+
+    def get_7day_cumulative_count(
+        self,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """
+        Get cumulative 7-day tweet count from previous 6 days + today so far.
+
+        This is the "running total" for the current 7-day contract window.
+
+        Args:
+            now: Current timestamp (default: now)
+
+        Returns:
+            Total tweets in the 7-day window so far
+        """
+        if now is None:
+            now = datetime.now(self.contract_utils.tz)
+
+        contract_date = self.contract_utils.get_contract_date(now)
+        total = 0
+
+        # Add previous 6 completed days
+        for days_ago in range(1, 7):
+            past_date = contract_date - timedelta(days=days_ago)
+            total += self.event_store.get_contract_day_count(past_date)
+
+        # Add today's count so far
+        total += self.get_current_count(contract_date)
+
+        return total
+
+    def get_dead_bins(
+        self,
+        cumulative_count: Optional[int] = None,
+    ) -> List[int]:
+        """
+        Get indices of bins that are impossible (count already exceeded upper bound).
+
+        Args:
+            cumulative_count: Current 7-day sum (default: computed from data)
+
+        Returns:
+            List of dead bin indices
+        """
+        if cumulative_count is None:
+            cumulative_count = self.get_7day_cumulative_count()
+
+        dead = []
+        for i, (lower, upper) in enumerate(self.config.bins):
+            if upper < cumulative_count:
+                dead.append(i)
+
+        return dead
+
+    def get_settlement_timing(
+        self,
+        settlement_date: date,
+        now: Optional[datetime] = None,
+    ) -> Tuple[float, float]:
+        """
+        Get timing information for a 7-day contract.
+
+        Args:
+            settlement_date: The settlement date (last day of 7-day window)
+            now: Current timestamp (default: now)
+
+        Returns:
+            Tuple of (hours_elapsed, hours_remaining) since contract start
+        """
+        if now is None:
+            now = datetime.now(self.contract_utils.tz)
+
+        # Contract starts 7 days before settlement at noon
+        # E.g., for Jan 27 - Feb 3 market, settlement_date = Feb 3
+        # contract_start_date = Feb 3 - 7 = Jan 27
+        contract_start_date = settlement_date - timedelta(days=7)
+        start_dt, _ = self.contract_utils.get_contract_day_bounds(contract_start_date)
+
+        # Settlement is at noon on settlement date (start of that contract day)
+        # E.g., for Feb 3, settlement is at noon Feb 3 (not noon Feb 4)
+        settlement_dt, _ = self.contract_utils.get_contract_day_bounds(settlement_date)
+
+        # Calculate elapsed and remaining
+        hours_elapsed = (now - start_dt).total_seconds() / 3600
+        hours_remaining = (settlement_dt - now).total_seconds() / 3600
+
+        return max(0, hours_elapsed), max(0, hours_remaining)
+
+    def forecast_for_event_window(
+        self,
+        market_start_date: date,
+        settlement_date: date,
+        now: Optional[datetime] = None,
+        n_simulations: Optional[int] = None,
+    ) -> ForecastResult:
+        """
+        Generate forecast for a specific event's 7-day window.
+
+        Unlike forecast_7day_distribution() which always forecasts today + 6 days,
+        this method accounts for the actual event window by:
+        1. Using actual counts from completed days in the window
+        2. Forecasting only the remaining days until settlement
+
+        Args:
+            market_start_date: First day of the 7-day counting window
+            settlement_date: Settlement date (day after the 7th counting day)
+            now: Current timestamp (default: now)
+            n_simulations: Number of simulations (default from config)
+
+        Returns:
+            ForecastResult with proper distribution for the event window
+        """
+        if not self._fitted:
+            raise RuntimeError("Forecaster not fitted")
+
+        if now is None:
+            now = datetime.now(self.contract_utils.tz)
+
+        today = self.contract_utils.get_contract_date(now)
+        today_events = self.event_store.get_contract_day_events(today)
+
+        # Calculate days remaining until settlement
+        # The 7 counting days are: market_start_date through (settlement_date - 1 day)
+        # Example: Jan 27-Feb 3 market has counting days Jan 27, 28, 29, 30, 31, Feb 1, 2
+        # Settlement at noon Feb 3
+        last_counting_day = settlement_date - timedelta(days=1)
+
+        # Count actual tweets from completed days in the window
+        past_count = 0
+        past_dates = []
+        current_date = market_start_date
+        while current_date < today and current_date <= last_counting_day:
+            day_count = self.event_store.get_contract_day_count(current_date)
+            past_count += day_count
+            past_dates.append(current_date)
+            current_date += timedelta(days=1)
+
+        # Calculate remaining forecast horizon (in days)
+        # If today is Jan 31 and settlement is Feb 3:
+        # - Remaining counting days: Jan 31, Feb 1, Feb 2 = 3 days
+        # But we need to account for partial day completion
+        if today > last_counting_day:
+            # We're past the counting window
+            remaining_days = 0
+        else:
+            # Full days remaining after today
+            days_after_today = (last_counting_day - today).days
+            # Plus today (partial or full depending on time)
+            remaining_days = days_after_today + 1
+
+        logger.info(
+            f"[forecast_for_event_window] {market_start_date} - {settlement_date}: "
+            f"past_count={past_count} from {len(past_dates)} days ({past_dates}), "
+            f"today={today}, remaining_days={remaining_days}"
+        )
+
+        if remaining_days <= 0:
+            # Past settlement, return actual count as the forecast
+            total = past_count + len(today_events)
+            return ForecastResult(
+                mean=float(total),
+                median=float(total),
+                std=0.0,
+                p5=float(total),
+                p25=float(total),
+                p75=float(total),
+                p95=float(total),
+                bin_probabilities=self.monte_carlo._compute_bin_probabilities(
+                    np.array([total])
+                ),
+                today_estimate=float(len(today_events)),
+                future_days_estimate=0.0,
+                n_simulations=1,
+                simulation_time_ms=0.0,
+            )
+
+        # Run Monte Carlo simulation for remaining days
+        forecast = self.monte_carlo.simulate_horizon(
+            events=today_events,
+            contract_date=today,
+            now=now,
+            horizon=remaining_days,
+            n_simulations=n_simulations,
+        )
+
+        logger.info(
+            f"[forecast_for_event_window] horizon={remaining_days}, "
+            f"forecast.mean={forecast.mean:.1f}, past_count={past_count}, "
+            f"total={forecast.mean + past_count:.1f}"
+        )
+
+        # Add past_count to the forecast distribution
+        # This shifts the entire distribution up by past_count
+        return ForecastResult(
+            mean=forecast.mean + past_count,
+            median=forecast.median + past_count,
+            std=forecast.std,  # Uncertainty doesn't change
+            p5=forecast.p5 + past_count,
+            p25=forecast.p25 + past_count,
+            p75=forecast.p75 + past_count,
+            p95=forecast.p95 + past_count,
+            bin_probabilities=self._shift_bin_probabilities(
+                forecast, past_count, n_simulations or self.config.monte_carlo.n_simulations
+            ),
+            today_estimate=forecast.today_estimate,
+            future_days_estimate=forecast.future_days_estimate,
+            regime_adjustment=forecast.regime_adjustment,
+            n_simulations=forecast.n_simulations,
+            simulation_time_ms=forecast.simulation_time_ms,
+            today_interday_estimate=forecast.today_interday_estimate,
+            future_days_pure=forecast.future_days_pure,
+        )
+
+    def _shift_bin_probabilities(
+        self,
+        forecast: ForecastResult,
+        shift: int,
+        n_simulations: int,
+    ) -> List:
+        """
+        Recompute bin probabilities after shifting the distribution.
+
+        Instead of just shifting probabilities (which doesn't work for bins),
+        we regenerate samples from the shifted distribution.
+        """
+        # Regenerate samples from the forecast distribution (approximated as normal)
+        rng = np.random.default_rng(42)
+        samples = rng.normal(forecast.mean + shift, forecast.std, n_simulations)
+
+        # Compute bin probabilities
+        return self.monte_carlo._compute_bin_probabilities(samples)
 
     # Methods for backtesting compatibility
 

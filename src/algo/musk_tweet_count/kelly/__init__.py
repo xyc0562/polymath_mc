@@ -10,7 +10,14 @@ exclusive bin outcomes, with support for:
 - Greedy execution with utility maximization
 """
 
-from .config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, WebSocketConfig
+from .config import (
+    KellyConfig,
+    EdgeBufferConfig,
+    AdaptiveDeltaConfig,
+    WebSocketConfig,
+    RateLimitConfig,
+    CollateralConfig,
+)
 from .kelly_math import (
     compute_terminal_wealth,
     compute_normalizer_S,
@@ -30,6 +37,8 @@ __all__ = [
     "EdgeBufferConfig",
     "AdaptiveDeltaConfig",
     "WebSocketConfig",
+    "RateLimitConfig",
+    "CollateralConfig",
     # Math
     "compute_terminal_wealth",
     "compute_normalizer_S",

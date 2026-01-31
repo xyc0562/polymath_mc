@@ -221,7 +221,7 @@ class FileHandlers:
         if fh is None:
             nfh = handlers.RotatingFileHandler(self._log_file_path(file_name), maxBytes=2000000, backupCount= 5, encoding='utf-8') # 2MB
             nfh.setLevel(lvl)
-            formatter = logging.Formatter("%(asctime)s:%(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+            formatter = logging.Formatter("%(asctime)s[%(levelname).1s]: %(message)s", "%y-%m-%d %H:%M:%S")
             nfh.setFormatter(formatter)
             self.handler_dict[key] = nfh
             return nfh
@@ -255,7 +255,7 @@ class LoggerManager:
         logger.setLevel(lvl)
         lsh = logging.StreamHandler()
         lsh.setLevel(logging.NOTSET)
-        formatter = logging.Formatter("%(asctime)s:%(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+        formatter = logging.Formatter("%(asctime)s[%(levelname).1s]: %(message)s", "%y-%m-%d %H:%M:%S")
         lsh.setFormatter(formatter)
         logger.addHandler(lsh)
 
