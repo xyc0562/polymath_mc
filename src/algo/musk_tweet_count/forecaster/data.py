@@ -573,17 +573,26 @@ class EventStore:
         self._counts_cache[contract_date] = count
         return count
 
-    def get_contract_day_counts(self, n_days: int) -> Dict[date, int]:
+    def get_contract_day_counts(
+        self,
+        n_days: int,
+        as_of_date: Optional[date] = None,
+    ) -> Dict[date, int]:
         """
         Get counts for the last n completed contract-days.
 
         Args:
             n_days: Number of days
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
 
         Returns:
             Dict mapping contract_date -> count
         """
-        today = self.contract_utils.get_current_contract_date()
+        if as_of_date is None:
+            today = self.contract_utils.get_current_contract_date()
+        else:
+            today = as_of_date
+
         counts = {}
 
         for days_ago in range(1, n_days + 1):
@@ -630,6 +639,7 @@ class EventStore:
     def get_historical_timestamps(
         self,
         n_days: int,
+        as_of_date: Optional[date] = None,
     ) -> Dict[date, List[datetime]]:
         """
         Get timestamps for historical contract-days.
@@ -638,11 +648,16 @@ class EventStore:
 
         Args:
             n_days: Number of days
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
 
         Returns:
             Dict mapping contract_date -> List[timestamp]
         """
-        today = self.contract_utils.get_current_contract_date()
+        if as_of_date is None:
+            today = self.contract_utils.get_current_contract_date()
+        else:
+            today = as_of_date
+
         result = {}
 
         for days_ago in range(1, n_days + 1):

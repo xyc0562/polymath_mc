@@ -97,7 +97,12 @@ class Musk7DayForecaster:
         self._cached_forecast: Optional[ForecastResult] = None
         self._cache_time: Optional[datetime] = None
 
-    def fit(self, n_days: int = 90, skip_fetch: bool = False) -> None:
+    def fit(
+        self,
+        n_days: int = 90,
+        skip_fetch: bool = False,
+        as_of_date: Optional[date] = None,
+    ) -> None:
         """
         Fit all model components from historical data.
 
@@ -106,6 +111,7 @@ class Musk7DayForecaster:
         Args:
             n_days: Number of historical days to use
             skip_fetch: If True, skip API fetch (use when sharing EventStore)
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
         """
         logger.info(f"Fitting forecaster with {n_days} days of history")
 
@@ -114,8 +120,12 @@ class Musk7DayForecaster:
             self.event_store.refresh_from_api(n_days)
 
         # Get historical data in required formats
-        historical_timestamps = self.event_store.get_historical_timestamps(n_days)
-        historical_counts = self.event_store.get_contract_day_counts(n_days)
+        historical_timestamps = self.event_store.get_historical_timestamps(
+            n_days, as_of_date=as_of_date
+        )
+        historical_counts = self.event_store.get_contract_day_counts(
+            n_days, as_of_date=as_of_date
+        )
 
         # Fit progress curve
         self.progress_curve.fit(historical_timestamps)
@@ -574,17 +584,19 @@ class Musk7DayForecaster:
         # Calculate remaining forecast horizon (in days)
         # If today is Jan 31 and settlement is Feb 3:
         # - Remaining counting days: Jan 31, Feb 1, Feb 2 = 3 days
-        # But we need to account for partial day completion
-        if today > last_counting_day:
+        if today < market_start_date:
+            # Before the counting window starts - forecast entire window
+            remaining_days = (last_counting_day - market_start_date).days + 1
+        elif today > last_counting_day:
             # We're past the counting window
             remaining_days = 0
         else:
-            # Full days remaining after today
+            # Within the counting window
+            # Full days remaining after today + today
             days_after_today = (last_counting_day - today).days
-            # Plus today (partial or full depending on time)
             remaining_days = days_after_today + 1
 
-        logger.info(
+        logger.debug(
             f"[forecast_for_event_window] {market_start_date} - {settlement_date}: "
             f"past_count={past_count} from {len(past_dates)} days ({past_dates}), "
             f"today={today}, remaining_days={remaining_days}"
@@ -619,7 +631,7 @@ class Musk7DayForecaster:
             n_simulations=n_simulations,
         )
 
-        logger.info(
+        logger.debug(
             f"[forecast_for_event_window] horizon={remaining_days}, "
             f"forecast.mean={forecast.mean:.1f}, past_count={past_count}, "
             f"total={forecast.mean + past_count:.1f}"

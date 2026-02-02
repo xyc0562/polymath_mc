@@ -152,14 +152,37 @@ def compute_sell_threshold(
     config: EdgeBufferConfig,
 ) -> float:
     """
-    Compute the sell threshold (min price to receive).
+    Compute the sell threshold (min price to receive) for NEW sell candidates.
 
     SELL_YES is equivalent to counterparty buying YES from us.
     We want YES to be overpriced, which is the BUY_NO condition.
 
     sell_threshold_yes = buy_no_threshold (min YES price for buying NO)
+
+    Note: This is for generating new sell opportunities with edge.
+    For exiting existing positions, use compute_exit_threshold instead.
     """
     return compute_buy_no_threshold(reservation_price, config)
+
+
+def compute_exit_threshold(
+    reservation_price: float,
+    config: EdgeBufferConfig,
+) -> float:
+    """
+    Compute the exit threshold for closing existing positions.
+
+    When exiting an existing position, we don't need additional edge -
+    we already captured edge on entry. Just exit at fair value or better.
+
+    Args:
+        reservation_price: Fair value of the position we hold
+        config: Edge buffer config (unused, but kept for API consistency)
+
+    Returns:
+        Minimum price to accept for exiting (= fair value)
+    """
+    return reservation_price
 
 
 def should_trade(
@@ -297,21 +320,27 @@ def generate_candidates(
         reservation_yes = yes_prices[bin_index]
         reservation_no = no_prices[bin_index]
 
-        # Generate BUY YES candidate
-        candidate = _generate_buy_yes_candidate(
-            bin_index=bin_index,
-            orderbook=orderbook,
-            portfolio=portfolio,
-            reservation_price=reservation_yes,
-            config=config,
-            hours_to_settlement=hours_to_settlement,
-        )
-        if candidate:
-            candidates.append(candidate)
+        # Get current position for this bin
+        position = portfolio.get_position(bin_index)
+        has_yes = position and position.has_yes_position
+        has_no = position and position.has_no_position
+
+        # Generate BUY YES candidate (only if we don't have NO position)
+        # If we have NO, we should SELL_NO first rather than buying YES
+        if not has_no:
+            candidate = _generate_buy_yes_candidate(
+                bin_index=bin_index,
+                orderbook=orderbook,
+                portfolio=portfolio,
+                reservation_price=reservation_yes,
+                config=config,
+                hours_to_settlement=hours_to_settlement,
+            )
+            if candidate:
+                candidates.append(candidate)
 
         # Generate SELL YES candidate (if we have position)
-        position = portfolio.get_position(bin_index)
-        if position and position.has_yes_position:
+        if has_yes:
             candidate = _generate_sell_yes_candidate(
                 bin_index=bin_index,
                 orderbook=orderbook,
@@ -323,20 +352,22 @@ def generate_candidates(
             if candidate:
                 candidates.append(candidate)
 
-        # Generate BUY NO candidate
-        candidate = _generate_buy_no_candidate(
-            bin_index=bin_index,
-            orderbook=orderbook,
-            portfolio=portfolio,
-            reservation_price=reservation_no,
-            config=config,
-            hours_to_settlement=hours_to_settlement,
-        )
-        if candidate:
-            candidates.append(candidate)
+        # Generate BUY NO candidate (only if we don't have YES position)
+        # If we have YES, we should SELL_YES first rather than buying NO
+        if not has_yes:
+            candidate = _generate_buy_no_candidate(
+                bin_index=bin_index,
+                orderbook=orderbook,
+                portfolio=portfolio,
+                reservation_price=reservation_no,
+                config=config,
+                hours_to_settlement=hours_to_settlement,
+            )
+            if candidate:
+                candidates.append(candidate)
 
         # Generate SELL NO candidate (if we have position)
-        if position and position.has_no_position:
+        if has_no:
             candidate = _generate_sell_no_candidate(
                 bin_index=bin_index,
                 orderbook=orderbook,
@@ -391,6 +422,16 @@ def _generate_buy_yes_candidate(
         logger.debug(f"BUY_YES bin {bin_index}: no fill at delta={delta:.2f}")
         return None
 
+    # Check minimum perceived probability (from our model)
+    if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
+        logger.debug(f"BUY_YES bin {bin_index}: model prob too low ({reservation_price:.4f} < {config.edge_buffer.min_perceived_prob:.4f})")
+        return None
+
+    # Check minimum market price
+    if config.edge_buffer.min_market_price > 0 and vwap < config.edge_buffer.min_market_price:
+        logger.debug(f"BUY_YES bin {bin_index}: market price too low ({vwap:.4f} < {config.edge_buffer.min_market_price:.4f})")
+        return None
+
     # Check edge requirement
     trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_YES, config.edge_buffer
@@ -427,7 +468,16 @@ def _generate_sell_yes_candidate(
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
-    """Generate a SELL YES candidate if profitable."""
+    """
+    Generate a SELL YES candidate if profitable.
+
+    Since we only generate SELL_YES when we have a YES position, this is
+    always an EXIT (closing existing long), not a new short.
+
+    For exits, we use the exit threshold (fair value) rather than requiring
+    additional edge. This allows us to close positions that have reverted
+    to fair value, capturing the edge we had on entry.
+    """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_yes_position:
         return None
@@ -454,11 +504,20 @@ def _generate_sell_yes_candidate(
     if filled <= 0:
         return None
 
-    trade_ok, actual_edge = should_trade(
-        vwap, reservation_price, TradeAction.SELL_YES, config.edge_buffer
-    )
-    if not trade_ok:
+    # For EXITS (selling existing position), use exit threshold (fair value)
+    # We don't need additional edge - we already captured edge on entry
+    exit_threshold = compute_exit_threshold(reservation_price, config.edge_buffer)
+
+    # Only exit if we can get fair value or better
+    if vwap < exit_threshold:
+        logger.debug(
+            f"SELL_YES bin {bin_index}: below exit threshold "
+            f"(vwap={vwap:.4f}, fair={exit_threshold:.4f})"
+        )
         return None
+
+    # Calculate edge relative to fair value
+    actual_edge = (vwap - reservation_price) / reservation_price if reservation_price > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
@@ -508,6 +567,16 @@ def _generate_buy_no_candidate(
         logger.debug(f"BUY_NO bin {bin_index}: no fill at delta={delta:.2f}")
         return None
 
+    # Check minimum perceived probability (from our model)
+    if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
+        logger.debug(f"BUY_NO bin {bin_index}: model prob too low ({reservation_price:.4f} < {config.edge_buffer.min_perceived_prob:.4f})")
+        return None
+
+    # Check minimum market price
+    if config.edge_buffer.min_market_price > 0 and vwap < config.edge_buffer.min_market_price:
+        logger.debug(f"BUY_NO bin {bin_index}: market price too low ({vwap:.4f} < {config.edge_buffer.min_market_price:.4f})")
+        return None
+
     trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
@@ -543,7 +612,16 @@ def _generate_sell_no_candidate(
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
-    """Generate a SELL NO candidate if profitable."""
+    """
+    Generate a SELL NO candidate if profitable.
+
+    Since we only generate SELL_NO when we have a NO position, this is
+    always an EXIT (closing existing long), not a new short.
+
+    For exits, we use the exit threshold (fair value) rather than requiring
+    additional edge. This allows us to close positions that have reverted
+    to fair value, capturing the edge we had on entry.
+    """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_no_position:
         return None
@@ -569,11 +647,20 @@ def _generate_sell_no_candidate(
     if filled <= 0:
         return None
 
-    trade_ok, actual_edge = should_trade(
-        vwap, reservation_price, TradeAction.SELL_NO, config.edge_buffer
-    )
-    if not trade_ok:
+    # For EXITS (selling existing position), use exit threshold (fair value)
+    # We don't need additional edge - we already captured edge on entry
+    exit_threshold = compute_exit_threshold(reservation_price, config.edge_buffer)
+
+    # Only exit if we can get fair value or better
+    if vwap < exit_threshold:
+        logger.debug(
+            f"SELL_NO bin {bin_index}: below exit threshold "
+            f"(vwap={vwap:.4f}, fair={exit_threshold:.4f})"
+        )
         return None
+
+    # Calculate edge relative to fair value
+    actual_edge = (vwap - reservation_price) / reservation_price if reservation_price > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)

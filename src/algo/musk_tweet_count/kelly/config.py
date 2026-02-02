@@ -42,6 +42,16 @@ class EdgeBufferConfig:
     # Threshold for tail zone
     tail_threshold: float = 0.10  # 10%
 
+    # Minimum perceived probability to trade (from our model)
+    # Don't trade if our model assigns probability < this threshold
+    # Set to 0 to disable.
+    min_perceived_prob: float = 0.0
+
+    # Minimum market price to trade (avoids illiquid tail bets)
+    # Don't buy YES if market price < this, don't buy NO if market price < this
+    # Set to 0 to disable. Recommended: 0.15-0.20 based on backtest analysis.
+    min_market_price: float = 0.0
+
 
 @dataclass
 class RateLimitConfig:

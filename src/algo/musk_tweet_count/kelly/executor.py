@@ -519,3 +519,292 @@ class KellyExecutor:
     def get_portfolio_summary(self) -> dict:
         """Get current portfolio summary."""
         return self.portfolio.to_summary()
+
+
+class UnifiedKellyExecutor:
+    """
+    Backend-agnostic Kelly executor that works with abstract interfaces.
+
+    This executor can be used for both live trading and backtesting by
+    swapping out the backend implementations:
+    - Live: Use LiveOrderbookProvider, LiveTradeExecutor
+    - Backtest: Use BacktestOrderbookProvider, BacktestTradeExecutor
+
+    The trading logic (candidate generation, utility calculation) is
+    identical regardless of backend.
+    """
+
+    def __init__(
+        self,
+        config: KellyConfig,
+        portfolio: Portfolio,
+        orderbook_provider,  # OrderbookProvider (from backend.py)
+        trade_executor,  # TradeExecutor (from backend.py)
+        token_ids: Dict[int, str],
+        on_trade: Optional[Callable[["ExecutionResult"], None]] = None,
+    ):
+        """
+        Initialize unified Kelly executor.
+
+        Args:
+            config: Kelly configuration
+            portfolio: Portfolio state
+            orderbook_provider: Abstract orderbook provider
+            trade_executor: Abstract trade executor
+            token_ids: Map of bin_index -> YES token_id
+            on_trade: Optional callback for trade notifications
+        """
+        self.config = config
+        self.portfolio = portfolio
+        self.orderbook_provider = orderbook_provider
+        self.trade_executor = trade_executor
+        self.token_ids = token_ids
+        self.on_trade = on_trade
+
+        # Rate limiting state (used for live trading, no-op for backtest)
+        self._order_timestamps: List[float] = []
+
+    def run_tick_sync(
+        self,
+        hours_to_settlement: float,
+    ) -> TickResult:
+        """
+        Run a single optimization tick (synchronous version).
+
+        This is the main entry point for backtesting where we don't need
+        async delays between orders.
+
+        Args:
+            hours_to_settlement: Hours until market settlement
+
+        Returns:
+            TickResult with execution summary
+        """
+        start_time = time.time()
+        tick_result = TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+        )
+
+        # Check T_stop
+        if hours_to_settlement <= self.config.t_stop_hours:
+            logger.debug(
+                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
+                "Holding positions to settlement."
+            )
+            return tick_result
+
+        # Get current orderbooks from provider
+        orderbooks = self.orderbook_provider.get_all_orderbooks()
+
+        if not orderbooks:
+            logger.debug("No orderbooks available")
+            return tick_result
+
+        rate_config = self.config.rate_limit
+        orders_this_tick = 0
+
+        for iteration in range(self.config.max_iters_per_tick):
+            # Check per-tick order limit
+            if orders_this_tick >= rate_config.max_orders_per_tick:
+                logger.debug(
+                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
+                )
+                break
+
+            # Generate candidates using production Kelly logic
+            candidates = generate_candidates(
+                portfolio=self.portfolio,
+                orderbooks=orderbooks,
+                config=self.config,
+                hours_to_settlement=hours_to_settlement,
+            )
+
+            if iteration == 0:
+                tick_result.num_candidates = len(candidates)
+
+            if not candidates:
+                logger.debug(f"No candidates at iteration {iteration}")
+                break
+
+            # Get best candidate
+            best = candidates[0]
+
+            if best.utility_gain < self.config.tau:
+                logger.debug(
+                    f"Best candidate utility {best.utility_gain:.6f} "
+                    f"< tau {self.config.tau}"
+                )
+                break
+
+            # Execute trade through abstract executor
+            token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")
+
+            # Import here to avoid circular imports
+            from .backend import ExecutionResult as BackendExecutionResult
+
+            backend_result = self.trade_executor.execute(best, token_id)
+
+            # Convert to TickResult format
+            result = ExecutionResult(
+                success=backend_result.success,
+                candidate=best,
+                order_id=backend_result.order_id,
+                filled_size=backend_result.filled_size,
+                filled_price=backend_result.filled_price,
+                error=backend_result.error,
+            )
+
+            tick_result.executions.append(result)
+
+            if result.success:
+                tick_result.num_executed += 1
+                tick_result.total_utility_gain += best.utility_gain
+                orders_this_tick += 1
+
+                # Record for rate limiting (live trading)
+                self._order_timestamps.append(time.time())
+
+                # Callback
+                if self.on_trade:
+                    self.on_trade(result)
+
+                logger.debug(
+                    f"Executed: {best.action.value} bin={best.bin_index} "
+                    f"size={best.size:.2f} @ {best.price:.4f} "
+                    f"utility_gain={best.utility_gain:.6f} edge={best.edge:.2%}"
+                )
+            else:
+                logger.warning(f"Execution failed: {result.error}")
+                break
+
+            # Refresh orderbooks for next iteration
+            self.orderbook_provider.refresh()
+            orderbooks = self.orderbook_provider.get_all_orderbooks()
+
+        tick_result.elapsed_seconds = time.time() - start_time
+        return tick_result
+
+    async def run_tick(
+        self,
+        hours_to_settlement: float,
+    ) -> TickResult:
+        """
+        Run a single optimization tick (async version for live trading).
+
+        Includes rate limiting delays between orders.
+        """
+        start_time = time.time()
+        tick_result = TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+        )
+
+        # Check T_stop
+        if hours_to_settlement <= self.config.t_stop_hours:
+            logger.info(
+                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
+                "Holding positions to settlement."
+            )
+            return tick_result
+
+        orderbooks = self.orderbook_provider.get_all_orderbooks()
+
+        if not orderbooks:
+            return tick_result
+
+        rate_config = self.config.rate_limit
+        orders_this_tick = 0
+
+        for iteration in range(self.config.max_iters_per_tick):
+            if orders_this_tick >= rate_config.max_orders_per_tick:
+                logger.info(
+                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
+                )
+                break
+
+            # Check rate limit
+            if not self._check_rate_limit(rate_config):
+                logger.info("Rate limit reached, stopping tick early")
+                break
+
+            candidates = generate_candidates(
+                portfolio=self.portfolio,
+                orderbooks=orderbooks,
+                config=self.config,
+                hours_to_settlement=hours_to_settlement,
+            )
+
+            if iteration == 0:
+                tick_result.num_candidates = len(candidates)
+
+            if not candidates:
+                break
+
+            best = candidates[0]
+
+            if best.utility_gain < self.config.tau:
+                break
+
+            token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")
+
+            from .backend import ExecutionResult as BackendExecutionResult
+
+            backend_result = self.trade_executor.execute(best, token_id)
+
+            result = ExecutionResult(
+                success=backend_result.success,
+                candidate=best,
+                order_id=backend_result.order_id,
+                filled_size=backend_result.filled_size,
+                filled_price=backend_result.filled_price,
+                error=backend_result.error,
+            )
+
+            tick_result.executions.append(result)
+
+            if result.success:
+                tick_result.num_executed += 1
+                tick_result.total_utility_gain += best.utility_gain
+                orders_this_tick += 1
+
+                self._order_timestamps.append(time.time())
+
+                if self.on_trade:
+                    self.on_trade(result)
+
+                logger.info(
+                    f"Executed: {best.action.value} bin={best.bin_index} "
+                    f"size={best.size:.2f} @ {best.price:.4f} "
+                    f"utility_gain={best.utility_gain:.6f} edge={best.edge:.2%}"
+                )
+
+                # Delay between orders for live trading
+                if iteration < self.config.max_iters_per_tick - 1:
+                    await asyncio.sleep(rate_config.min_order_delay_seconds)
+            else:
+                logger.warning(f"Execution failed: {result.error}")
+                break
+
+            self.orderbook_provider.refresh()
+            orderbooks = self.orderbook_provider.get_all_orderbooks()
+
+        tick_result.elapsed_seconds = time.time() - start_time
+        return tick_result
+
+    def _check_rate_limit(self, rate_config) -> bool:
+        """Check if we're within rate limits."""
+        now = time.time()
+        cutoff = now - 60.0
+        self._order_timestamps = [ts for ts in self._order_timestamps if ts > cutoff]
+
+        if len(self._order_timestamps) >= rate_config.max_orders_per_minute:
+            return False
+
+        return True
+
+    def get_portfolio_summary(self) -> dict:
+        """Get current portfolio summary."""
+        return self.portfolio.to_summary()
