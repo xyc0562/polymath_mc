@@ -7,6 +7,7 @@ on the Musk tweet count market.
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -18,6 +19,7 @@ from .forecaster import Musk7DayForecaster
 from ..kelly.config import KellyConfig
 from ..kelly.integration import KellyTradingBot
 from ..kelly.executor import TickResult
+from ..kelly.user_stream import UserStreamClient
 
 if TYPE_CHECKING:
     from .data import EventStore
@@ -30,8 +32,13 @@ logger = logging.getLogger(__name__)
 class TradingBotConfig:
     """Configuration for the GAS-Kelly trading bot."""
 
-    # Tick interval in seconds (5 minutes default)
-    tick_interval_seconds: int = 300
+    # Slow loop interval in seconds (5 minutes default)
+    # This is when we recompute Monte Carlo forecasts (if fresh data available)
+    slow_tick_interval_seconds: int = 300
+
+    # Fast loop interval in seconds (30 seconds default)
+    # This checks for trade opportunities using cached probabilities
+    fast_tick_interval_seconds: int = 30
 
     # Whether to run in dry-run mode (no real orders)
     dry_run: bool = True
@@ -54,6 +61,11 @@ class TradingBotConfig:
     # Forecast cache timeout in seconds (should be > slow_interval to avoid recomputing mid-cycle)
     forecast_cache_timeout: int = 165
 
+    # Legacy alias for slow_tick_interval_seconds
+    @property
+    def tick_interval_seconds(self) -> int:
+        return self.slow_tick_interval_seconds
+
 
 class GASKellyTradingBot:
     """
@@ -74,7 +86,8 @@ class GASKellyTradingBot:
         kelly_config: KellyConfig,
         forecaster_config: ForecasterConfig,
         bot_config: TradingBotConfig,
-        event_store: Optional["EventStore"] = None,
+        event_store: "EventStore",
+        user_stream: Optional[UserStreamClient] = None,
     ):
         """
         Initialize the trading bot.
@@ -84,16 +97,19 @@ class GASKellyTradingBot:
             kelly_config: Configuration for Kelly optimizer
             forecaster_config: Configuration for forecaster
             bot_config: Bot-level configuration
-            event_store: Optional shared EventStore (for multi-event optimization)
+            event_store: Shared EventStore from MultiEventManager (required)
+            user_stream: Optional global UserStreamClient for fill confirmations
+                        (if None, bot will create its own if API credentials available)
         """
+        self._external_user_stream = user_stream
         self.clob_client = clob_client
         self.kelly_config = kelly_config
         self.forecaster_config = forecaster_config
         self.bot_config = bot_config
 
-        # Initialize forecaster (with optional shared EventStore)
+        # Initialize forecaster with shared EventStore
+        # Bot relies on upstream MultiEventManager for data (no standalone mode)
         self.forecaster = Musk7DayForecaster(forecaster_config, event_store=event_store)
-        self._uses_shared_store = event_store is not None
 
         # Kelly bot (initialized during setup)
         self.kelly_bot: Optional[KellyTradingBot] = None
@@ -141,6 +157,22 @@ class GASKellyTradingBot:
         self._cached_forecast_std: Optional[float] = None
         self._cached_forecast_breakdown: Optional[Dict] = None
         self._cached_forecast_time: Optional[datetime] = None
+
+        # Fresh data notification (set by upstream MultiEventManager)
+        # When True, next slow tick will recompute Monte Carlo
+        # Start True so first tick computes Monte Carlo forecast
+        self._fresh_data_available: bool = True
+        self._last_monte_carlo_time: Optional[datetime] = None
+
+    def notify_data_refreshed(self) -> None:
+        """
+        Notify the bot that fresh data is available from the upstream manager.
+
+        Called by MultiEventManager after it refreshes the shared EventStore.
+        This signals that the next slow tick should recompute Monte Carlo.
+        """
+        self._fresh_data_available = True
+        logger.debug("Bot notified of fresh data from upstream manager")
 
     def _get_probabilities(
         self,
@@ -248,9 +280,11 @@ class GASKellyTradingBot:
         )
         if should_log:
             self._last_ws_log_time = now
+            bid_str = f"{orderbook.best_yes_bid:.2f}" if orderbook.best_yes_bid is not None else "None"
+            ask_str = f"{orderbook.best_yes_ask:.2f}" if orderbook.best_yes_ask is not None else "None"
             logger.info(
                 f"[WS] Callback #{self._ws_callback_count} for bin {bin_index} "
-                f"(best_bid={orderbook.best_yes_bid:.2f}, best_ask={orderbook.best_yes_ask:.2f})"
+                f"(best_bid={bid_str}, best_ask={ask_str})"
             )
 
         if self._tick_in_progress:
@@ -279,8 +313,8 @@ class GASKellyTradingBot:
         # Small delay to batch rapid updates
         await asyncio.sleep(0.1)
 
-        # Run the tick
-        await self.run_tick()
+        # Run the tick (uses cached probabilities, minimal logging)
+        await self.run_tick(log_header=False)
 
     async def setup(self, bins: List[Dict]) -> None:
         """
@@ -318,11 +352,11 @@ class GASKellyTradingBot:
         logger.info(f"Market bins: {len(self._market_bins)} bins from {first_bin} to ({last_bin[0]}, {last_upper_str})")
 
         # Fit forecaster on historical data
-        # Skip fetch if using shared EventStore (data already loaded)
+        # Always skip fetch - data is managed by upstream MultiEventManager
         logger.info(f"Fitting forecaster with {self.bot_config.training_days} days of history")
         self.forecaster.fit(
             n_days=self.bot_config.training_days,
-            skip_fetch=self._uses_shared_store,
+            skip_fetch=True,
         )
 
         # Optionally disable WebSocket (use --no-ws flag)
@@ -338,12 +372,19 @@ class GASKellyTradingBot:
         else:
             logger.info("WebSocket enabled for real-time orderbook updates")
 
-        # Create Kelly bot
+        # Create Kelly bot with wallet address and optional external user stream
+        # If external user stream is provided (from MultiEventManager), use it
+        # Otherwise, KellyTradingBot will create its own if API credentials available
         self.kelly_bot = KellyTradingBot(
             clob_client=self.clob_client,
             config=kelly_config,
             probability_model=self._get_probabilities,
             dry_run=self.bot_config.dry_run,
+            wallet_address=os.getenv("WALLET_ADDRESS"),
+            api_key=os.getenv("CLOB_API_KEY"),
+            api_secret=os.getenv("CLOB_API_SECRET"),
+            api_passphrase=os.getenv("CLOB_API_PASSPHRASE"),
+            external_user_stream=self._external_user_stream,
         )
 
         # Setup Kelly bot
@@ -464,11 +505,15 @@ class GASKellyTradingBot:
             "remaining_days": remaining_days,
         }
 
-    async def run_tick(self) -> Optional[TickResult]:
+    async def run_tick(self, log_header: bool = True) -> Optional[TickResult]:
         """
         Run a single optimization tick.
 
         Thread-safe: uses lock to prevent concurrent tick execution.
+
+        Args:
+            log_header: If True, log tick header and detailed comparison table.
+                       Set to False for fast ticks to reduce log noise.
 
         Returns:
             TickResult from Kelly optimizer, or None if not ready or skipped
@@ -485,95 +530,78 @@ class GASKellyTradingBot:
         async with self._tick_lock:
             self._tick_in_progress = True
             try:
-                return await self._run_tick_impl()
+                return await self._run_tick_impl(log_header=log_header)
             finally:
                 self._tick_in_progress = False
 
-    async def _run_tick_impl(self) -> Optional[TickResult]:
-        """Internal tick implementation (called with lock held)."""
-        tick_start = datetime.now(self.forecaster.contract_utils.tz)
-        self._tick_count += 1
+    async def _run_tick_impl(self, log_header: bool = True) -> Optional[TickResult]:
+        """
+        Internal tick implementation (called with lock held).
 
-        logger.info(f"=== Tick {self._tick_count} at {tick_start.isoformat()} ===")
+        Uses cached probabilities - does NOT recompute Monte Carlo.
+        Monte Carlo is recomputed in _run_slow_tick() when fresh data arrives.
+        """
+        tick_start = datetime.now(self.forecaster.contract_utils.tz)
 
         try:
-            # 1. Update from API
-            new_events = self.forecaster.update_from_api()
-            logger.info(f"Fetched {new_events} new events from XTracker")
-
-            # 2. Get timing info
+            # 1. Get timing info
             hours_elapsed, hours_remaining = self._get_timing()
-            logger.info(f"Timing: {hours_elapsed:.1f}h elapsed, {hours_remaining:.1f}h remaining")
 
-            # 3. Get current cumulative count for the market's date range
+            # 2. Get current cumulative count for the market's date range
             current_count = self._get_market_cumulative_count()
-            logger.info(f"Current 7-day cumulative count: {current_count}")
 
-            # 4. Log dead bins (using market bins, not forecaster bins)
-            dead_bins = [i for i, (lower, upper) in enumerate(self._market_bins) if upper < current_count]
-            if dead_bins:
-                logger.info(f"Dead bins: {dead_bins}")
+            # 3. Log header info (only for slow ticks / explicit requests)
+            if log_header:
+                logger.info(f"Timing: {hours_elapsed:.1f}h elapsed, {hours_remaining:.1f}h remaining")
+                logger.info(f"Current 7-day cumulative count: {current_count}")
 
-            # 5. Get forecast - use cached if available and fresh
-            # This avoids expensive Monte Carlo recomputation on every tick
-            now_local = datetime.now()  # Local time for cache check
-            cache_age = float('inf')
-            if self._cached_forecast_time:
-                cache_age = (now_local - self._cached_forecast_time).total_seconds()
+                # Log dead bins
+                dead_bins = [i for i, (lower, upper) in enumerate(self._market_bins) if upper < current_count]
+                if dead_bins:
+                    logger.info(f"Dead bins: {dead_bins}")
 
-            cache_timeout = self.bot_config.forecast_cache_timeout
-            if cache_age > cache_timeout:  # Recompute if cache is stale
-                forecast_breakdown = None
-                if self.market_start_date and self.settlement_date:
-                    forecast = self.forecaster.forecast_for_event_window(
-                        market_start_date=self.market_start_date,
-                        settlement_date=self.settlement_date,
-                    )
-                    forecast_breakdown = self._compute_forecast_breakdown()
-                else:
-                    forecast = self.forecaster.forecast_7day_distribution(use_cache=False)
-
-                # Update cache
-                self._cached_forecast_mean = forecast.mean
-                self._cached_forecast_std = forecast.std
-                self._cached_forecast_breakdown = forecast_breakdown
-                self._cached_forecast_time = now_local
-
-                logger.info(
-                    f"Forecast (refreshed): mean={forecast.mean:.1f}, "
-                    f"std={forecast.std:.1f}, "
-                    f"90% CI=[{forecast.p5:.0f}, {forecast.p95:.0f}]"
+            # 4. Check if forecast is available - skip trading if not
+            if self._cached_forecast_mean is None:
+                logger.warning("Forecast not available, skipping trading tick")
+                return TickResult(
+                    tick_start_time=tick_start,
+                    num_candidates=0,
+                    num_executed=0,
+                    total_utility_gain=0.0,
+                    executions=[],
+                    elapsed_seconds=0.0,
                 )
-            else:
-                # Use cached values
-                logger.debug(f"Using cached forecast ({cache_age:.0f}s old)")
 
-            # 6. Run Kelly optimization tick
+            # 5. Run Kelly optimization tick
             result = await self.kelly_bot.run_tick(
                 current_count=current_count,
                 hours_elapsed=hours_elapsed,
                 hours_to_settlement=hours_remaining,
-            )
-
-            # 7. Get probabilities and log comparison with market prices
-            probabilities = self._get_probabilities(
-                current_count=current_count,
-                hours_elapsed=hours_elapsed,
-                hours_remaining=hours_remaining,
-            )
-            self._log_probability_comparison(
-                probabilities=probabilities,
-                current_count=current_count,
-                hours_elapsed=hours_elapsed,
-                hours_remaining=hours_remaining,
                 forecast_mean=self._cached_forecast_mean,
-                forecast_std=self._cached_forecast_std,
-                forecast_breakdown=self._cached_forecast_breakdown,
-                forecast_time=self._cached_forecast_time,
+                forecast_std=self._cached_forecast_std or 0,
             )
 
-            # 8. Log results
-            self._log_tick_result(result)
+            # 6. Get probabilities and log comparison with market prices (slow ticks only)
+            if log_header:
+                probabilities = self._get_probabilities(
+                    current_count=current_count,
+                    hours_elapsed=hours_elapsed,
+                    hours_remaining=hours_remaining,
+                )
+                self._log_probability_comparison(
+                    probabilities=probabilities,
+                    current_count=current_count,
+                    hours_elapsed=hours_elapsed,
+                    hours_remaining=hours_remaining,
+                    forecast_mean=self._cached_forecast_mean,
+                    forecast_std=self._cached_forecast_std,
+                    forecast_breakdown=self._cached_forecast_breakdown,
+                    forecast_time=self._cached_forecast_time,
+                )
+
+            # 7. Log results
+            if log_header or result.num_executed > 0:
+                self._log_tick_result(result)
 
             self._last_tick_time = tick_start
             return result
@@ -593,13 +621,15 @@ class GASKellyTradingBot:
 
         for execution in result.executions:
             if execution.success:
+                # Note: size/price are from candidate, not fill (fill comes via WebSocket)
                 logger.info(
-                    f"  Trade: {execution.candidate.action.value} "
+                    f"  Order placed: {execution.candidate.action.value} "
                     f"bin={execution.candidate.bin_index} "
-                    f"size={execution.filled_size:.2f} @ {execution.filled_price:.4f}"
+                    f"size={execution.candidate.size:.2f} @ {execution.candidate.price:.4f} "
+                    f"(pending fill)"
                 )
             else:
-                logger.warning(f"  Trade failed: {execution.error}")
+                logger.warning(f"  Order failed: {execution.error}")
 
     def _log_probability_comparison(
         self,
@@ -738,21 +768,44 @@ class GASKellyTradingBot:
 
     async def run(self) -> None:
         """
-        Main trading loop.
+        Main trading loop with two-pronged approach:
 
-        Runs continuously until stopped, executing ticks at regular intervals.
+        1. Slow loop (every slow_tick_interval_seconds, default 5 min):
+           - Recomputes Monte Carlo forecast IF fresh data is available
+           - Updates cached probabilities
+           - Runs Kelly optimization tick
+
+        2. Fast loop (every fast_tick_interval_seconds, default 30 sec):
+           - Uses cached probabilities (no Monte Carlo recomputation)
+           - Runs Kelly optimization tick
+           - Catches opportunities between slow ticks
+
+        3. WebSocket callback (on orderbook changes):
+           - Uses cached probabilities
+           - Runs Kelly optimization tick immediately
+
+        When using shared EventStore (from MultiEventManager):
+        - Does NOT fetch data from API (manager handles that)
+        - Waits for notify_data_refreshed() signal before recomputing Monte Carlo
         """
         if not self._setup_complete:
             raise RuntimeError("Bot not setup. Call setup() first.")
 
         self._running = True
         self._stop_event = asyncio.Event()
-        tick_interval = self.bot_config.tick_interval_seconds
+        slow_interval = self.bot_config.slow_tick_interval_seconds
+        fast_interval = self.bot_config.fast_tick_interval_seconds
 
         logger.info(
-            f"Starting trading loop: tick_interval={tick_interval}s, "
-            f"dry_run={self.bot_config.dry_run}"
+            f"Starting trading loop: slow_interval={slow_interval}s, "
+            f"fast_interval={fast_interval}s, dry_run={self.bot_config.dry_run}"
         )
+
+        # Track last slow tick time
+        last_slow_tick = datetime.now(self.forecaster.contract_utils.tz)
+
+        # Run initial slow tick to establish baseline probabilities
+        await self._run_slow_tick()
 
         while self._running:
             try:
@@ -762,14 +815,22 @@ class GASKellyTradingBot:
                     logger.info("Past settlement time, stopping trading loop")
                     break
 
-                # Run tick
-                await self.run_tick()
+                now = datetime.now(self.forecaster.contract_utils.tz)
 
-                # Sleep until next tick (interruptible by stop_event)
+                # Check if it's time for a slow tick
+                time_since_slow = (now - last_slow_tick).total_seconds()
+                if time_since_slow >= slow_interval:
+                    await self._run_slow_tick()
+                    last_slow_tick = now
+                else:
+                    # Run fast tick (uses cached probabilities)
+                    await self._run_fast_tick()
+
+                # Sleep until next fast tick (interruptible by stop_event)
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=tick_interval
+                        timeout=fast_interval
                     )
                     # If we get here, stop was requested
                     logger.info("Stop event received")
@@ -783,11 +844,11 @@ class GASKellyTradingBot:
                 break
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
-                # Continue after error, with exponential backoff
+                # Continue after error, with short backoff
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=min(tick_interval, 60)
+                        timeout=min(fast_interval, 30)
                     )
                     break
                 except asyncio.TimeoutError:
@@ -795,6 +856,83 @@ class GASKellyTradingBot:
 
         self._running = False
         logger.info("Trading loop stopped")
+
+    async def _run_slow_tick(self) -> Optional[TickResult]:
+        """
+        Run a slow tick that may recompute Monte Carlo forecasts.
+
+        Called every slow_tick_interval_seconds (default 5 min).
+        Only recomputes Monte Carlo if fresh data is available
+        (signaled by notify_data_refreshed() from upstream MultiEventManager).
+        """
+        tick_start = datetime.now(self.forecaster.contract_utils.tz)
+        self._tick_count += 1
+
+        logger.info(f"=== Slow Tick {self._tick_count} at {tick_start.isoformat()} ===")
+
+        # Recompute Monte Carlo only if upstream manager signaled fresh data
+        if self._fresh_data_available:
+            logger.info("Fresh data available from upstream manager")
+            self._fresh_data_available = False  # Reset flag
+            self._recompute_monte_carlo()
+        else:
+            logger.debug("No fresh data, using cached probabilities")
+
+        # Run the tick (will use cached probabilities)
+        return await self.run_tick()
+
+    async def _run_fast_tick(self) -> Optional[TickResult]:
+        """
+        Run a fast tick using cached probabilities.
+
+        Called every fast_tick_interval_seconds (default 30 sec).
+        Does NOT recompute Monte Carlo - uses cached probabilities.
+        """
+        if not self._cached_probabilities:
+            logger.debug("No cached probabilities, skipping fast tick")
+            return None
+
+        # Run tick with cached probabilities (no logging of tick number)
+        return await self.run_tick(log_header=False)
+
+    def _recompute_monte_carlo(self) -> None:
+        """
+        Recompute Monte Carlo forecast and update cached probabilities.
+        """
+        try:
+            # Get current count for dead bin detection
+            current_count = self._get_market_cumulative_count()
+
+            # Recompute forecast
+            if self.market_start_date and self.settlement_date:
+                forecast = self.forecaster.forecast_for_event_window(
+                    market_start_date=self.market_start_date,
+                    settlement_date=self.settlement_date,
+                )
+                forecast_breakdown = self._compute_forecast_breakdown()
+            else:
+                forecast = self.forecaster.forecast_7day_distribution(use_cache=False)
+                forecast_breakdown = None
+
+            # Update forecast cache
+            self._cached_forecast_mean = forecast.mean
+            self._cached_forecast_std = forecast.std
+            self._cached_forecast_breakdown = forecast_breakdown
+            self._cached_forecast_time = datetime.now()
+
+            # Recompute bin probabilities
+            self._cached_probabilities = self._compute_probabilities(current_count)
+
+            self._last_monte_carlo_time = datetime.now(self.forecaster.contract_utils.tz)
+
+            logger.info(
+                f"Monte Carlo recomputed: mean={forecast.mean:.1f}, "
+                f"std={forecast.std:.1f}, "
+                f"90% CI=[{forecast.p5:.0f}, {forecast.p95:.0f}]"
+            )
+
+        except Exception as e:
+            logger.error(f"Error recomputing Monte Carlo: {e}", exc_info=True)
 
     def stop(self) -> None:
         """Signal the trading loop to stop."""
@@ -825,5 +963,10 @@ class GASKellyTradingBot:
         if self._setup_complete:
             summary["forecaster"] = self.forecaster.get_state_summary()
             summary["portfolio"] = self.kelly_bot.get_portfolio_summary()
+
+            # Add bot status including pending orders
+            kelly_status = self.kelly_bot.get_status()
+            summary["pending_orders"] = kelly_status.get("pending_orders", {})
+            summary["user_stream"] = kelly_status.get("user_stream", {})
 
         return summary

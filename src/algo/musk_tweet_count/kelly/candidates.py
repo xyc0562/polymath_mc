@@ -383,10 +383,17 @@ def generate_candidates(
             if candidate:
                 candidates.append(candidate)
 
-    # Sort by utility gain (descending)
-    candidates.sort(key=lambda c: c.utility_gain, reverse=True)
+    # Separate sells from buys
+    # Sells are processed first (exit at fair value or better, not utility-based)
+    # Then buys are sorted by utility gain
+    sells = [c for c in candidates if c.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)]
+    buys = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
 
-    return candidates
+    # Sort buys by utility gain (descending)
+    buys.sort(key=lambda c: c.utility_gain, reverse=True)
+
+    # Sells come first, then buys
+    return sells + buys
 
 
 def _generate_buy_yes_candidate(

@@ -54,6 +54,10 @@ class OrderbookWebSocket:
         self._running = False
         self._connected = False
 
+        # Reconnect state with exponential backoff
+        self._reconnect_delay = 1.0
+        self._max_reconnect_delay = 60.0
+
         # Subscriptions
         self._subscribed_tokens: Set[str] = set()
         self._pending_subscriptions: Set[str] = set()
@@ -86,6 +90,7 @@ class OrderbookWebSocket:
                 ping_timeout=10,
             )
             self._connected = True
+            self._reconnect_delay = 1.0  # Reset on successful connect
             logger.info("WebSocket connected successfully")
 
             # Resubscribe to any pending tokens
@@ -199,7 +204,7 @@ class OrderbookWebSocket:
 
                 message = await self._ws.recv()
                 data = json.loads(message)
-                self._handle_message(data)
+                self._process_data(data)
 
             except ConnectionClosed:
                 logger.warning("WebSocket connection closed")
@@ -232,7 +237,7 @@ class OrderbookWebSocket:
                 logger.error(f"Heartbeat error: {e}")
 
     async def _reconnect(self) -> None:
-        """Attempt to reconnect after disconnect."""
+        """Attempt to reconnect after disconnect with exponential backoff."""
         logger.info("Attempting to reconnect...")
 
         # Store current subscriptions for resubscription
@@ -242,7 +247,8 @@ class OrderbookWebSocket:
 
         while self._running:
             try:
-                await asyncio.sleep(self.config.reconnect_delay_seconds)
+                logger.info(f"Reconnecting in {self._reconnect_delay:.1f}s...")
+                await asyncio.sleep(self._reconnect_delay)
 
                 self._ws = await websockets.connect(
                     self.config.ws_url,
@@ -250,6 +256,7 @@ class OrderbookWebSocket:
                     ping_timeout=10,
                 )
                 self._connected = True
+                self._reconnect_delay = 1.0  # Reset on successful connect
                 logger.info("WebSocket reconnected")
 
                 # Resubscribe
@@ -261,6 +268,20 @@ class OrderbookWebSocket:
 
             except Exception as e:
                 logger.error(f"Reconnection failed: {e}")
+                # Exponential backoff
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2,
+                    self._max_reconnect_delay
+                )
+
+    def _process_data(self, data) -> None:
+        """Recursively process data, handling nested lists."""
+        if isinstance(data, list):
+            for item in data:
+                self._process_data(item)
+        elif isinstance(data, dict):
+            self._handle_message(data)
+        # Skip primitives (strings, numbers, None)
 
     def _handle_message(self, data: dict) -> None:
         """Process incoming WebSocket message."""

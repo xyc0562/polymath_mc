@@ -1622,8 +1622,12 @@ class PolymarketTradingBot:
     def check_balance(self) -> float:
         """Check USDC balance."""
         try:
-            balance_info = self.clob_client.get_balance_allowance()
-            balance = float(balance_info.get("balance", 0))
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            balance_info = self.clob_client.get_balance_allowance(params)
+            # USDC has 6 decimals, so divide by 1e6
+            balance = float(balance_info.get("balance", 0)) / 1e6
             logger.info(f"USDC balance: ${balance:.2f}")
             return balance
         except Exception as e:

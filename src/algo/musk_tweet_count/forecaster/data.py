@@ -368,20 +368,26 @@ class XTrackerClient:
         handle: str = "elonmusk",
     ) -> Dict[date, List[TweetEvent]]:
         """
-        Legacy method: Fetch historical posts for training.
+        Fetch historical posts for training.
 
-        Now fetches all data in a single API call.
+        Fetches all data in a single API call, then groups by contract day.
+
+        Note: Uses calendar date (not contract date) as end_date to ensure
+        we capture all posts even if before noon ET boundary.
         """
-        today = contract_utils.get_current_contract_date()
-        start_date = today - timedelta(days=n_days)
+        contract_today = contract_utils.get_current_contract_date()
+        calendar_today = datetime.now(contract_utils.tz).date()
+        start_date = contract_today - timedelta(days=n_days)
 
         # Ensure we don't go before data availability
         if start_date < self.DATA_START_DATE:
             start_date = self.DATA_START_DATE
 
+        # Use calendar_today to fetch all posts including those from
+        # the current calendar day (which may be before noon ET boundary)
         return self.fetch_events_by_contract_day(
             start_date=start_date,
-            end_date=today,
+            end_date=calendar_today,
             contract_utils=contract_utils,
             handle=handle,
         )
@@ -488,7 +494,11 @@ def load_events_from_csv(
 
 
 class EventStore:
-    """Storage for tweet events with contract-day aggregation."""
+    """
+    Storage for tweet events with contract-day aggregation.
+
+    Thread-safe: uses a lock to protect concurrent access to event data.
+    """
 
     def __init__(
         self,
@@ -511,23 +521,60 @@ class EventStore:
         # Cache for contract-day counts
         self._counts_cache: Dict[date, int] = {}
 
+        # Lock for thread-safe access
+        import threading
+        self._lock = threading.RLock()
+
     def add_event(self, event: TweetEvent) -> None:
-        """Add a single event."""
+        """
+        Add a single event (with deduplication by event_id).
+
+        If an event with the same event_id already exists, it won't be added again.
+        Thread-safe.
+        """
         contract_date = self.contract_utils.get_contract_date(event.timestamp)
 
-        if contract_date not in self._events:
-            self._events[contract_date] = []
+        with self._lock:
+            if contract_date not in self._events:
+                self._events[contract_date] = []
 
-        self._events[contract_date].append(event)
-        self._events[contract_date].sort(key=lambda e: e.timestamp)
+            # Check for duplicate by event_id
+            if event.event_id:
+                existing_ids = {e.event_id for e in self._events[contract_date] if e.event_id}
+                if event.event_id in existing_ids:
+                    return  # Already exists, skip
 
-        # Invalidate cache
-        self._counts_cache.pop(contract_date, None)
+            self._events[contract_date].append(event)
+            self._events[contract_date].sort(key=lambda e: e.timestamp)
+
+            # Invalidate cache
+            self._counts_cache.pop(contract_date, None)
 
     def add_events(self, events: List[TweetEvent]) -> None:
-        """Add multiple events."""
+        """Add multiple events (with deduplication). Thread-safe."""
         for event in events:
             self.add_event(event)
+
+    def set_contract_day_events(self, contract_date: date, events: List[TweetEvent]) -> None:
+        """
+        Replace all events for a contract day.
+
+        Use this for refreshing a specific day's data.
+        Thread-safe.
+
+        Args:
+            contract_date: The contract date to replace
+            events: New list of events for that day
+        """
+        # Filter events to only those belonging to this contract day
+        filtered = [
+            e for e in events
+            if self.contract_utils.get_contract_date(e.timestamp) == contract_date
+        ]
+
+        with self._lock:
+            self._events[contract_date] = sorted(filtered, key=lambda e: e.timestamp)
+            self._counts_cache.pop(contract_date, None)
 
     def get_events(
         self,
@@ -535,7 +582,7 @@ class EventStore:
         end: datetime,
     ) -> List[TweetEvent]:
         """
-        Get events in a time range.
+        Get events in a time range. Thread-safe.
 
         Args:
             start: Start datetime (inclusive)
@@ -550,27 +597,31 @@ class EventStore:
         start_date = self.contract_utils.get_contract_date(start)
         end_date = self.contract_utils.get_contract_date(end)
 
-        current = start_date
-        while current <= end_date:
-            if current in self._events:
-                for event in self._events[current]:
-                    if start <= event.timestamp < end:
-                        result.append(event)
-            current += timedelta(days=1)
+        with self._lock:
+            current = start_date
+            while current <= end_date:
+                if current in self._events:
+                    for event in self._events[current]:
+                        if start <= event.timestamp < end:
+                            result.append(event)
+                current += timedelta(days=1)
 
         return sorted(result, key=lambda e: e.timestamp)
 
     def get_contract_day_events(self, contract_date: date) -> List[TweetEvent]:
-        """Get all events for a contract-day."""
-        return self._events.get(contract_date, [])
+        """Get all events for a contract-day. Thread-safe."""
+        with self._lock:
+            # Return a copy to prevent modification of internal state
+            return list(self._events.get(contract_date, []))
 
     def get_contract_day_count(self, contract_date: date) -> int:
-        """Get tweet count for a contract-day."""
-        if contract_date in self._counts_cache:
-            return self._counts_cache[contract_date]
+        """Get tweet count for a contract-day. Thread-safe."""
+        with self._lock:
+            if contract_date in self._counts_cache:
+                return self._counts_cache[contract_date]
 
-        count = len(self._events.get(contract_date, []))
-        self._counts_cache[contract_date] = count
+            count = len(self._events.get(contract_date, []))
+            self._counts_cache[contract_date] = count
         return count
 
     def get_contract_day_counts(
@@ -603,23 +654,28 @@ class EventStore:
 
     def refresh_from_api(self, n_days: int = 90) -> None:
         """
-        Refresh data from XTracker API.
+        Refresh data from XTracker API. Thread-safe.
 
         Args:
             n_days: Number of days to fetch
         """
         logger.info(f"Refreshing {n_days} days of data from XTracker API")
 
+        # Fetch data (blocking HTTP call, but outside lock)
         history = self.xtracker_client.fetch_historical(
             n_days,
             self.contract_utils,
         )
 
-        for contract_date, events in history.items():
-            self._events[contract_date] = events
-            self._counts_cache[contract_date] = len(events)
+        # Update storage atomically
+        with self._lock:
+            for contract_date, events in history.items():
+                self._events[contract_date] = events
+                self._counts_cache[contract_date] = len(events)
 
-        logger.info(f"Loaded {sum(len(e) for e in self._events.values())} total events")
+            total = sum(len(e) for e in self._events.values())
+
+        logger.info(f"Loaded {total} total events")
 
     def get_events_since_noon(self, contract_date: Optional[date] = None) -> List[TweetEvent]:
         """
@@ -668,12 +724,38 @@ class EventStore:
         return result
 
     def has_data_for_date(self, contract_date: date) -> bool:
-        """Check if we have data for a contract-day."""
-        return contract_date in self._events
+        """Check if we have data for a contract-day. Thread-safe."""
+        with self._lock:
+            return contract_date in self._events
 
     def get_date_range(self) -> Tuple[Optional[date], Optional[date]]:
-        """Get the range of dates with data."""
-        if not self._events:
-            return None, None
-        dates = sorted(self._events.keys())
-        return dates[0], dates[-1]
+        """Get the range of dates with data. Thread-safe."""
+        with self._lock:
+            if not self._events:
+                return None, None
+            dates = sorted(self._events.keys())
+            return dates[0], dates[-1]
+
+    def cleanup_old_data(self, keep_days: int = 60) -> int:
+        """
+        Remove data older than keep_days from today.
+
+        Prevents memory growth over long-running processes.
+
+        Args:
+            keep_days: Number of days of data to keep
+
+        Returns:
+            Number of days removed
+        """
+        today = self.contract_utils.get_current_contract_date()
+        cutoff = today - timedelta(days=keep_days)
+
+        with self._lock:
+            old_dates = [d for d in self._events.keys() if d < cutoff]
+
+            for old_date in old_dates:
+                del self._events[old_date]
+                self._counts_cache.pop(old_date, None)
+
+        return len(old_dates)

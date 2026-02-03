@@ -88,7 +88,8 @@ class AdaptiveDeltaConfig:
     base_delta: float = 10.0
 
     # Maximum fraction of visible depth to take per trade
-    max_depth_fraction: float = 0.10
+    # Set to 1.0 for production (no depth impact limit)
+    max_depth_fraction: float = 1.0
 
     # Hours before T_stop to start ramping down chunk size
     time_ramp_hours: float = 6.0

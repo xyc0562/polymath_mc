@@ -67,9 +67,9 @@ def create_clob_client() -> ClobClient:
     Create authenticated CLOB client from environment variables.
 
     Required environment variables:
-    - POLY_API_KEY: Polymarket API key
-    - POLY_API_SECRET: Polymarket API secret
-    - POLY_PASSPHRASE: Polymarket API passphrase
+    - CLOB_API_KEY: Polymarket API key
+    - CLOB_API_SECRET: Polymarket API secret
+    - CLOB_API_PASSPHRASE: Polymarket API passphrase
 
     Private key can be set via (in order of priority):
     - POLYMARKET_PRIVATE_KEY: Plain private key (less secure)
@@ -87,14 +87,14 @@ def create_clob_client() -> ClobClient:
     except ImportError:
         pass
 
-    api_key = os.environ.get("POLY_API_KEY")
-    api_secret = os.environ.get("POLY_API_SECRET")
-    passphrase = os.environ.get("POLY_PASSPHRASE")
+    api_key = os.environ.get("CLOB_API_KEY")
+    api_secret = os.environ.get("CLOB_API_SECRET")
+    passphrase = os.environ.get("CLOB_API_PASSPHRASE")
 
     if not all([api_key, api_secret, passphrase]):
         raise ValueError(
             "Missing required environment variables. "
-            "Set POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE"
+            "Set CLOB_API_KEY, CLOB_API_SECRET, CLOB_API_PASSPHRASE"
         )
 
     # Load private key (supports encrypted keys)
