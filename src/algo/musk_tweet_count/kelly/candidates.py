@@ -340,12 +340,14 @@ def generate_candidates(
                 candidates.append(candidate)
 
         # Generate SELL YES candidate (if we have position)
+        # Use model probability (not reservation price) for exit threshold
         if has_yes:
+            model_prob_yes = portfolio.probabilities[bin_index]
             candidate = _generate_sell_yes_candidate(
                 bin_index=bin_index,
                 orderbook=orderbook,
                 portfolio=portfolio,
-                reservation_price=reservation_yes,
+                model_probability=model_prob_yes,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
             )
@@ -367,12 +369,14 @@ def generate_candidates(
                 candidates.append(candidate)
 
         # Generate SELL NO candidate (if we have position)
+        # Use model probability (not reservation price) for exit threshold
         if has_no:
+            model_prob_no = 1.0 - portfolio.probabilities[bin_index]
             candidate = _generate_sell_no_candidate(
                 bin_index=bin_index,
                 orderbook=orderbook,
                 portfolio=portfolio,
-                reservation_price=reservation_no,
+                model_probability=model_prob_no,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
             )
@@ -464,7 +468,7 @@ def _generate_sell_yes_candidate(
     bin_index: int,
     orderbook: UnifiedOrderbook,
     portfolio: Portfolio,
-    reservation_price: float,
+    model_probability: float,
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
@@ -474,9 +478,8 @@ def _generate_sell_yes_candidate(
     Since we only generate SELL_YES when we have a YES position, this is
     always an EXIT (closing existing long), not a new short.
 
-    For exits, we use the exit threshold (fair value) rather than requiring
-    additional edge. This allows us to close positions that have reverted
-    to fair value, capturing the edge we had on entry.
+    For exits, we use model probability as the exit threshold (not reservation
+    price). Exit when edge disappears (market >= model fair value).
     """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_yes_position:
@@ -504,9 +507,9 @@ def _generate_sell_yes_candidate(
     if filled <= 0:
         return None
 
-    # For EXITS (selling existing position), use exit threshold (fair value)
-    # We don't need additional edge - we already captured edge on entry
-    exit_threshold = compute_exit_threshold(reservation_price, config.edge_buffer)
+    # For EXITS: use model probability as threshold (exit when edge disappears)
+    # We exit when market >= model fair value, not based on Kelly reservation
+    exit_threshold = model_probability
 
     # Only exit if we can get fair value or better
     if vwap < exit_threshold:
@@ -516,14 +519,14 @@ def _generate_sell_yes_candidate(
         )
         return None
 
-    # Calculate edge relative to fair value
-    actual_edge = (vwap - reservation_price) / reservation_price if reservation_price > 0 else 0.0
+    # Calculate edge relative to model fair value
+    actual_edge = (vwap - model_probability) / model_probability if model_probability > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.tau:
-        return None
+    # For exits, skip tau check - we already passed fair value threshold
+    # Utility gain at fair value is ~0, which would block exits unnecessarily
 
     return TradeCandidate(
         bin_index=bin_index,
@@ -531,7 +534,7 @@ def _generate_sell_yes_candidate(
         size=filled,
         price=vwap,
         utility_gain=utility_gain,
-        reservation_price=reservation_price,
+        reservation_price=model_probability,  # Use model prob as "fair price" for exits
         edge=actual_edge,
     )
 
@@ -608,7 +611,7 @@ def _generate_sell_no_candidate(
     bin_index: int,
     orderbook: UnifiedOrderbook,
     portfolio: Portfolio,
-    reservation_price: float,
+    model_probability: float,
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
@@ -618,9 +621,8 @@ def _generate_sell_no_candidate(
     Since we only generate SELL_NO when we have a NO position, this is
     always an EXIT (closing existing long), not a new short.
 
-    For exits, we use the exit threshold (fair value) rather than requiring
-    additional edge. This allows us to close positions that have reverted
-    to fair value, capturing the edge we had on entry.
+    For exits, we use model probability as the exit threshold (not reservation
+    price). Exit when edge disappears (market >= model fair value).
     """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_no_position:
@@ -647,9 +649,9 @@ def _generate_sell_no_candidate(
     if filled <= 0:
         return None
 
-    # For EXITS (selling existing position), use exit threshold (fair value)
-    # We don't need additional edge - we already captured edge on entry
-    exit_threshold = compute_exit_threshold(reservation_price, config.edge_buffer)
+    # For EXITS: use model probability as threshold (exit when edge disappears)
+    # We exit when market >= model fair value, not based on Kelly reservation
+    exit_threshold = model_probability
 
     # Only exit if we can get fair value or better
     if vwap < exit_threshold:
@@ -659,14 +661,14 @@ def _generate_sell_no_candidate(
         )
         return None
 
-    # Calculate edge relative to fair value
-    actual_edge = (vwap - reservation_price) / reservation_price if reservation_price > 0 else 0.0
+    # Calculate edge relative to model fair value
+    actual_edge = (vwap - model_probability) / model_probability if model_probability > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.tau:
-        return None
+    # For exits, skip tau check - we already passed fair value threshold
+    # Utility gain at fair value is ~0, which would block exits unnecessarily
 
     return TradeCandidate(
         bin_index=bin_index,
@@ -674,7 +676,7 @@ def _generate_sell_no_candidate(
         size=filled,
         price=vwap,
         utility_gain=utility_gain,
-        reservation_price=reservation_price,
+        reservation_price=model_probability,  # Use model prob as "fair price" for exits
         edge=actual_edge,
     )
 
