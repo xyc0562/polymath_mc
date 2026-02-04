@@ -99,6 +99,13 @@ class MultiEventConfig:
     # (events closer to settlement than this won't be started)
     min_hours_before_settlement: float = 24.0
 
+    # Maximum event duration (counting window length) in days
+    # e.g., 7.0 means skip events with counting windows longer than 7 days
+    # Event duration = (settlement_date - market_start_date).days
+    # For Jan 1-8 event: duration = 7 days (counting Jan 1-7, settle Jan 8)
+    # Set to 0 to disable (consider all events regardless of duration)
+    max_event_duration_days: float = 0.0
+
     # Maximum completed events to keep in history (for memory management)
     max_completed_events: int = 100
 
@@ -346,14 +353,13 @@ class MultiEventManager:
         # Fetch USDC balance
         usdc_balance = await self.fetch_usdc_balance()
 
-        # Fetch existing positions and estimate their value
+        # Fetch existing positions with actual values from API
         all_positions = await self.fetch_all_positions()
         position_value = 0.0
 
-        # Estimate position values at 50% (conservative)
-        # Will be updated with real prices once events are started
-        for token_id, shares in all_positions.items():
-            position_value += shares * 0.5
+        # Use actual values from API (cost basis / initialValue)
+        for token_id, pos_info in all_positions.items():
+            position_value += pos_info["value"]
 
         total_capital = usdc_balance + position_value
 
@@ -509,32 +515,54 @@ class MultiEventManager:
         try:
             if active.bot.kelly_bot and active.bot.kelly_bot.kelly_executor:
                 active.bot.kelly_bot.kelly_executor.handle_fill(fill_event)
-                logger.debug(f"Routed fill to event {event_id} bin {bin_index}")
+                logger.info(
+                    f"[FILL ROUTED] event={active.info.short_name} bin={bin_index} | "
+                    f"size={fill_event.size:.1f} @ {fill_event.price:.3f}"
+                )
         except Exception as e:
-            logger.error(f"Error routing fill to event {event_id}: {e}")
+            logger.error(f"Error routing fill to event {event_id}: {e}", exc_info=True)
 
     def _register_event_tokens(self, event_info: EventInfo) -> None:
         """
         Register token_ids for an event to enable fill routing.
 
         Called when an event is started.
+        Registers both YES and NO token_ids for each bin.
         """
+        registered_count = 0
         for i, bin_def in enumerate(event_info.bins):
-            token_id = bin_def.get("token_id")
-            if token_id:
-                self._token_to_event[token_id] = (event_info.event_id, i)
-        logger.debug(f"Registered {len(event_info.bins)} tokens for event {event_info.event_id}")
+            # Register YES token
+            yes_token_id = bin_def.get("token_id")
+            if yes_token_id:
+                self._token_to_event[yes_token_id] = (event_info.event_id, i)
+                registered_count += 1
+
+            # Register NO token (for BUY_NO / SELL_NO fills)
+            no_token_id = bin_def.get("no_token_id")
+            if no_token_id:
+                self._token_to_event[no_token_id] = (event_info.event_id, i)
+                registered_count += 1
+
+        logger.debug(f"Registered {registered_count} tokens for event {event_info.event_id}")
 
     def _unregister_event_tokens(self, event_info: EventInfo) -> None:
         """
         Unregister token_ids for an event.
 
         Called when an event is cleaned up.
+        Unregisters both YES and NO token_ids.
         """
         for bin_def in event_info.bins:
-            token_id = bin_def.get("token_id")
-            if token_id:
-                self._token_to_event.pop(token_id, None)
+            # Unregister YES token
+            yes_token_id = bin_def.get("token_id")
+            if yes_token_id:
+                self._token_to_event.pop(yes_token_id, None)
+
+            # Unregister NO token
+            no_token_id = bin_def.get("no_token_id")
+            if no_token_id:
+                self._token_to_event.pop(no_token_id, None)
+
         logger.debug(f"Unregistered tokens for event {event_info.event_id}")
 
     async def _do_full_refresh(self) -> int:
@@ -848,6 +876,9 @@ class MultiEventManager:
                 )
                 return False
 
+            # Note: Long-duration events are added to pending but only started
+            # when remaining time < max_event_duration_days (checked in _try_start_pending_events)
+
             # Add to pending
             self._pending_events[event_id] = event_info
             logger.info(f"Added event {event_id} ({event_info.short_name}) to pending queue")
@@ -913,6 +944,22 @@ class MultiEventManager:
                     self._pending_events.pop(event_id, None)
                 continue
 
+            # For long-duration events, only start when remaining time < threshold
+            # Events with duration > max_event_duration_days wait until remaining time
+            # is less than max_event_duration_days * 24 hours
+            if self.config.max_event_duration_days > 0:
+                event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+                max_hours_threshold = self.config.max_event_duration_days * 24
+
+                if event_duration_days > self.config.max_event_duration_days:
+                    if hours_to_settlement > max_hours_threshold:
+                        logger.debug(
+                            f"Event {event_id} is long-duration ({event_duration_days}d), "
+                            f"waiting until T-{max_hours_threshold:.0f}h "
+                            f"(currently T-{hours_to_settlement:.1f}h)"
+                        )
+                        continue
+
             # Request capital (CapitalPool has its own lock)
             allocated = await self.capital_pool.request_capital(event_id)
 
@@ -963,6 +1010,7 @@ class MultiEventManager:
             initial_capital=allocated_capital,
             training_days=self.config.training_days,
             use_gas=self.config.use_gas,
+            event_name=event_info.short_name,
         )
 
         # Create bot with shared EventStore
@@ -977,6 +1025,17 @@ class MultiEventManager:
 
         # Setup bot (expensive, do outside lock)
         await bot.setup(event_info.bins)
+
+        # CRITICAL: Sync existing positions from API into the Kelly portfolio
+        # This ensures collateral tracking works correctly for restored positions
+        # Do this even in dry_run mode - we need accurate collateral tracking
+        if bot.kelly_bot:
+            try:
+                await bot.kelly_bot.sync_positions_from_api(self.wallet_address)
+                collateral = bot.kelly_bot.portfolio.total_collateral_used if bot.kelly_bot.portfolio else 0
+                logger.info(f"Synced existing positions into Kelly portfolio: invested=${collateral:.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to sync existing positions: {e}", exc_info=True)
 
         # Set market dates
         bot.market_start_date = event_info.market_start_date
@@ -1051,22 +1110,36 @@ class MultiEventManager:
                 self._unregister_event_tokens(self._active_events[event_id].info)
 
         try:
-            # Get final portfolio value
+            # Get the original allocation for this event
+            async with self._events_lock:
+                allocated_capital = 0.0
+                if event_id in self._active_events:
+                    allocated_capital = self._active_events[event_id].allocated_capital
+
+            # Calculate final value based on the event's collateral, NOT portfolio.capital
+            # (portfolio.capital may include USDC from other events or unallocated funds)
             if bot.kelly_bot and bot.kelly_bot.portfolio:
                 portfolio = bot.kelly_bot.portfolio
-                final_value = portfolio.capital
-
-                # Add value of any remaining positions (should be 0 at settlement)
-                # For safety, include position values at last known prices
+                # Use collateral_used as basis (what this event actually has deployed)
+                # For unsettled events, return the collateral value
+                position_value = 0.0
                 for pos in portfolio.positions.values():
-                    # Conservative: use cost basis for unsettled positions
-                    final_value += pos.yes_shares * pos.yes_avg_cost
-                    final_value += pos.no_shares * pos.no_avg_cost
+                    # Use cost basis for unsettled positions
+                    position_value += pos.yes_shares * pos.yes_avg_cost
+                    position_value += pos.no_shares * pos.no_avg_cost
+
+                # Final value = original allocation
+                # (In reality, P&L only happens at settlement when positions resolve)
+                # For early termination, just return the allocated amount
+                final_value = allocated_capital if allocated_capital > 0 else position_value
+
+                logger.debug(
+                    f"Event {event_id} cleanup: allocated=${allocated_capital:.2f}, "
+                    f"position_value=${position_value:.2f}, returning=${final_value:.2f}"
+                )
             else:
                 # Fallback: return initial allocation
-                async with self._events_lock:
-                    if event_id in self._active_events:
-                        final_value = self._active_events[event_id].allocated_capital
+                final_value = allocated_capital
 
             # Return capital to pool (CapitalPool has its own lock)
             await self.capital_pool.return_capital(event_id, final_value)
@@ -1382,18 +1455,32 @@ class MultiEventManager:
                 active.info.short_name for active in self._active_events.values()
             ],
 
-            # User stream status
-            "user_stream": {
-                "enabled": self.user_stream is not None,
-                "connected": (
-                    self.user_stream._ws is not None
-                    if self.user_stream else False
-                ),
-                "pending_orders": (
-                    self.user_stream.get_pending_orders_count()
-                    if self.user_stream else 0
-                ),
-            },
+            # User stream status - get detailed status if available
+            "user_stream": self._get_user_stream_status(),
+        }
+
+    def _get_user_stream_status(self) -> Dict[str, Any]:
+        """Get detailed user stream status for health reporting."""
+        if not self.user_stream:
+            return {
+                "enabled": False,
+                "connected": False,
+                "pending_orders": 0,
+                "fill_count": 0,
+                "message_count": 0,
+                "last_message_age_seconds": None,
+            }
+
+        # Use the new get_connection_status method
+        status = self.user_stream.get_connection_status()
+        return {
+            "enabled": True,
+            "connected": status.get("connected", False),
+            "pending_orders": status.get("pending_orders", 0),
+            "fill_count": status.get("fill_count", 0),
+            "message_count": status.get("message_count", 0),
+            "last_message_age_seconds": status.get("last_message_age_seconds"),
+            "on_fill_callback_set": status.get("on_fill_callback_set", False),
         }
 
     def _log_health(self) -> None:
@@ -1435,14 +1522,19 @@ class MultiEventManager:
         logger.info(f"    Enabled: {user_stream.get('enabled', False)}")
         logger.info(f"    Connected: {user_stream.get('connected', False)}")
         logger.info(f"    Pending orders: {user_stream.get('pending_orders', 0)}")
+        logger.info(f"    Total fills: {user_stream.get('fill_count', 0)}")
+        logger.info(f"    Total messages: {user_stream.get('message_count', 0)}")
+        last_msg = user_stream.get('last_message_age_seconds')
+        if last_msg is not None:
+            logger.info(f"    Last message: {last_msg:.0f}s ago")
         logger.info("=" * 70)
 
-    async def fetch_all_positions(self) -> Dict[str, float]:
+    async def fetch_all_positions(self) -> Dict[str, dict]:
         """
         Fetch all positions from Polymarket Data API.
 
         Returns:
-            Dict mapping token_id -> shares held
+            Dict mapping token_id -> {shares, value, avg_price}
         """
         try:
             response = requests.get(
@@ -1453,18 +1545,73 @@ class MultiEventManager:
             response.raise_for_status()
             positions_data = response.json()
 
-            positions = {}
-            for pos in positions_data:
-                token_id = pos.get("asset", {}).get("id") or pos.get("token_id")
-                size = float(pos.get("size", 0))
-                if token_id and size > 0:
-                    positions[token_id] = size
+            # Debug: log raw response structure
+            logger.info(f"Positions API raw response type: {type(positions_data).__name__}, len={len(positions_data) if hasattr(positions_data, '__len__') else 'N/A'}")
+            if positions_data:
+                if isinstance(positions_data, list) and len(positions_data) > 0:
+                    sample = positions_data[0]
+                    logger.info(f"Positions API first item type: {type(sample).__name__}")
+                    logger.info(f"Positions API first item: {str(sample)[:500]}")
+                elif isinstance(positions_data, dict):
+                    logger.info(f"Positions API dict keys: {list(positions_data.keys())[:10]}")
 
-            logger.info(f"Fetched {len(positions)} positions from Polymarket API")
+            positions = {}
+
+            def parse_position(pos: dict) -> tuple:
+                """Parse a position dict, returns (token_id, position_info) or (None, None)."""
+                # Extract token_id - 'asset' can be a string (token_id) or a dict
+                asset = pos.get("asset")
+                if isinstance(asset, str):
+                    token_id = asset
+                elif isinstance(asset, dict):
+                    token_id = asset.get("id")
+                else:
+                    token_id = pos.get("token_id") or pos.get("asset_id")
+
+                size = float(pos.get("size", 0))
+                if not token_id or size <= 0:
+                    return None, None
+
+                # Extract value - use initialValue (cost basis) or compute from avgPrice
+                avg_price = float(pos.get("avgPrice", 0))
+                initial_value = float(pos.get("initialValue", 0))
+                current_value = float(pos.get("currentValue", 0))
+
+                # Use initialValue (cost basis) as the position value for collateral tracking
+                # This represents what we actually spent, not current market value
+                value = initial_value if initial_value > 0 else (size * avg_price)
+
+                return token_id, {
+                    "shares": size,
+                    "value": value,
+                    "avg_price": avg_price,
+                    "current_value": current_value,
+                }
+
+            # Handle different response formats
+            if isinstance(positions_data, list):
+                for pos in positions_data:
+                    if isinstance(pos, dict):
+                        token_id, pos_info = parse_position(pos)
+                        if token_id:
+                            positions[token_id] = pos_info
+                            logger.debug(f"Found position: token={token_id[:20]}..., shares={pos_info['shares']:.2f}, value=${pos_info['value']:.2f}")
+                    elif isinstance(pos, str):
+                        logger.warning(f"Unexpected position format (string): {pos[:100]}")
+            elif isinstance(positions_data, dict):
+                # Alternative format: dict with positions key
+                pos_list = positions_data.get("positions", positions_data.get("data", []))
+                for pos in pos_list:
+                    if isinstance(pos, dict):
+                        token_id, pos_info = parse_position(pos)
+                        if token_id:
+                            positions[token_id] = pos_info
+
+            logger.info(f"Fetched {len(positions)} positions from Polymarket API (wallet: {self.wallet_address[:10]}...)")
             return positions
 
         except Exception as e:
-            logger.error(f"Failed to fetch positions: {e}")
+            logger.error(f"Failed to fetch positions: {e}", exc_info=True)
             return {}
 
     async def fetch_usdc_balance(self, max_retries: int = 3) -> float:
@@ -1535,19 +1682,36 @@ class MultiEventManager:
         # 3. Fetch USDC balance
         usdc_balance = await self.fetch_usdc_balance()
 
-        # 4. Build token_id -> event mapping
+        # 4. Build token_id -> event mapping (include BOTH YES and NO tokens)
         token_to_event: Dict[str, EventInfo] = {}
         for event_info in discovered_events:
+            yes_count = 0
+            no_count = 0
             for bin_def in event_info.bins:
+                # Map YES token
                 token_id = bin_def.get("token_id")
                 if token_id:
                     token_to_event[token_id] = event_info
+                    yes_count += 1
+                # Map NO token (positions can be YES or NO)
+                no_token_id = bin_def.get("no_token_id")
+                if no_token_id:
+                    token_to_event[no_token_id] = event_info
+                    no_count += 1
+            logger.debug(f"Event {event_info.short_name}: mapped {yes_count} YES tokens, {no_count} NO tokens")
+
+        # Debug: check if our position token is in the mapping
+        for pos_token, pos_info in all_positions.items():
+            if pos_token in token_to_event:
+                logger.info(f"Position token {pos_token[:20]}... matches event {token_to_event[pos_token].short_name}")
+            else:
+                logger.warning(f"Position token {pos_token[:20]}... NOT FOUND in any event!")
 
         # 5. Compute capital per event from positions
-        event_positions: Dict[str, Dict[str, float]] = {}  # event_id -> {token_id: shares}
+        event_positions: Dict[str, Dict[str, dict]] = {}  # event_id -> {token_id: pos_info}
         event_values: Dict[str, float] = {}  # event_id -> total value
 
-        for token_id, shares in all_positions.items():
+        for token_id, pos_info in all_positions.items():
             event_info = token_to_event.get(token_id)
             if event_info:
                 event_id = event_info.event_id
@@ -1555,13 +1719,13 @@ class MultiEventManager:
                     event_positions[event_id] = {}
                     event_values[event_id] = 0.0
 
-                event_positions[event_id][token_id] = shares
-                # Estimate value at 50% (conservative, will be updated with real prices)
-                event_values[event_id] += shares * 0.5
+                event_positions[event_id][token_id] = pos_info
+                # Use actual value from API (cost basis / initialValue)
+                event_values[event_id] += pos_info["value"]
 
                 logger.info(
-                    f"Position: {shares:.2f} shares of {event_info.short_name} "
-                    f"(token {token_id[:16]}...)"
+                    f"Position: {pos_info['shares']:.2f} shares @ ${pos_info['avg_price']:.4f} = ${pos_info['value']:.2f} "
+                    f"of {event_info.short_name} (token {token_id[:16]}...)"
                 )
 
         # 6. Compute total capital and restore allocations

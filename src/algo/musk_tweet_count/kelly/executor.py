@@ -114,19 +114,43 @@ class OrderExecutor:
             return {"order_id": "dry_run_order", "status": "simulated"}
 
         try:
+            # Round to Polymarket precision requirements:
+            # - Price: 2 decimals (tick_size=0.01)
+            # - Size: integer shares (avoids precision issues)
+            rounded_price = round(price, 2)
+            rounded_size = round(size)  # Round to integer shares
+
+            # Polymarket minimum order size is typically 15 shares
+            MIN_ORDER_SIZE = 15
+
+            # Ensure minimum values
+            if rounded_price <= 0 or rounded_price >= 1:
+                logger.warning(f"Invalid price after rounding: {rounded_price}")
+                return None
+            if rounded_size < MIN_ORDER_SIZE:
+                logger.warning(f"Size {rounded_size} below minimum {MIN_ORDER_SIZE}")
+                return None
+
+            logger.debug(
+                f"Order params: token={token_id[:16]}..., side={side}, "
+                f"price={rounded_price}, size={rounded_size}"
+            )
+
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
-                size=size,
+                price=rounded_price,
+                size=rounded_size,
                 side=side,
-                order_type=OrderType.FAK,  # Fill and Kill (IOC) - allows partial fills, no stale orders
             )
 
             signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order)
+            logger.debug(f"Signed order created: {type(signed_order)}")
+
+            # FAK = Fill and Kill (IOC) - allows partial fills, cancels unfilled remainder
+            response = self.client.post_order(signed_order, orderType=OrderType.FAK)
 
             logger.info(
-                f"Order placed: {side} {size:.2f} @ {price:.4f}, "
+                f"Order placed: {side} {rounded_size:.2f} @ {rounded_price:.2f}, "
                 f"order_id={response.get('orderID', 'unknown')}"
             )
             return response
@@ -192,16 +216,14 @@ class OrderExecutor:
         Execute a trade candidate.
 
         Translates Kelly action to CLOB order.
+        Now uses separate YES/NO token IDs - no conversion needed.
         """
         action = candidate.action
         price = candidate.price
         size = candidate.size
 
-        # Determine order side and token
-        # For NO trades, we use the equivalent YES trade:
-        # BUY NO @ X = SELL YES @ (1-X)
-        # SELL NO @ X = BUY YES @ (1-X)
-
+        # Determine order side
+        # token_id is already the correct token (YES for YES actions, NO for NO actions)
         if action == TradeAction.BUY_YES:
             side = "BUY"
             order_price = price
@@ -209,19 +231,27 @@ class OrderExecutor:
             side = "SELL"
             order_price = price
         elif action == TradeAction.BUY_NO:
-            # BUY NO @ X = SELL YES @ (1-X)
-            side = "SELL"
-            order_price = 1.0 - price
-        elif action == TradeAction.SELL_NO:
-            # SELL NO @ X = BUY YES @ (1-X)
+            # Buy on NO token directly
             side = "BUY"
-            order_price = 1.0 - price
+            order_price = price
+        elif action == TradeAction.SELL_NO:
+            # Sell on NO token directly
+            side = "SELL"
+            order_price = price
         else:
             return ExecutionResult(
                 success=False,
                 candidate=candidate,
                 error=f"Unknown action: {action}",
             )
+
+        # Log order details before placement
+        logger.info(
+            f"Placing order: {action.value} bin={candidate.bin_index} | "
+            f"{side} {size:.4f} @ {order_price:.4f} | "
+            f"fair={candidate.reservation_price:.4f} edge={candidate.edge:+.2%} util={candidate.utility_gain:.4f} | "
+            f"token={token_id[:16]}..."
+        )
 
         # Place order
         response = self.place_limit_order(
@@ -274,8 +304,11 @@ class KellyExecutor:
         orderbook_manager: OrderbookManager,
         order_executor: OrderExecutor,
         token_ids: Dict[int, str],  # bin_index -> YES token_id
+        no_token_ids: Optional[Dict[int, str]] = None,  # bin_index -> NO token_id
         on_trade: Optional[Callable[[ExecutionResult], None]] = None,
         user_stream: Optional["UserStreamClient"] = None,
+        sync_portfolio: Optional[Callable[[], None]] = None,
+        event_name: Optional[str] = None,
     ):
         """
         Initialize Kelly executor.
@@ -286,19 +319,29 @@ class KellyExecutor:
             orderbook_manager: Orderbook manager (WebSocket or REST)
             order_executor: Order executor
             token_ids: Map of bin_index -> YES token_id
+            no_token_ids: Map of bin_index -> NO token_id (for BUY_NO/SELL_NO)
             on_trade: Optional callback for trade notifications
             user_stream: Optional UserStreamClient for fill confirmations
+            sync_portfolio: Callback to sync portfolio from API before each decision
+            event_name: Optional event name for logging (e.g., "Feb 03 - Feb 10")
         """
         self.config = config
         self.portfolio = portfolio
         self.orderbook_manager = orderbook_manager
         self.order_executor = order_executor
-        self.token_ids = token_ids
+        self.token_ids = token_ids  # YES token IDs
+        self.no_token_ids = no_token_ids or {}  # NO token IDs
         self.on_trade = on_trade
         self.user_stream = user_stream
+        self.sync_portfolio = sync_portfolio  # Callback to sync from API before each decision
+        self.event_name = event_name or "unknown"
 
         # Reverse mapping: token_id -> bin_index (for fill callbacks)
         self.token_to_bin: Dict[str, int] = {v: k for k, v in token_ids.items()}
+        # Also add NO token mappings
+        for bin_idx, no_token_id in self.no_token_ids.items():
+            if no_token_id:
+                self.token_to_bin[no_token_id] = bin_idx
 
         # Execution state
         self._running = False
@@ -311,11 +354,19 @@ class KellyExecutor:
         # Maps order_id -> (candidate, token_id)
         self._pending_orders: Dict[str, tuple[TradeCandidate, str]] = {}
 
+        # Confirmation events for waiting on block confirmation
+        # Maps order_id -> asyncio.Event (set when MINED/CONFIRMED)
+        self._confirmation_events: Dict[str, asyncio.Event] = {}
+
         # Trade counter for logging
         self._trade_count: int = 0
 
         # Context for trade logging (set by caller before run_tick)
         self._log_context: Dict = {}
+
+        # FAK failure cooldown tracking: bin_index -> timestamp of last FAK failure
+        # Used to avoid spamming failed orders when liquidity dries up
+        self._fak_failure_times: Dict[int, float] = {}
 
     def _check_rate_limit(self) -> bool:
         """
@@ -345,9 +396,37 @@ class KellyExecutor:
         """Record an order timestamp for rate limiting."""
         self._order_timestamps.append(time.time())
 
+    def _is_bin_in_fak_cooldown(self, bin_index: int) -> bool:
+        """
+        Check if a bin is in FAK failure cooldown.
+
+        Returns True if the bin recently had a FAK failure and should not be retried yet.
+        """
+        if bin_index not in self._fak_failure_times:
+            return False
+
+        cooldown = self.config.rate_limit.fak_failure_cooldown_seconds
+        elapsed = time.time() - self._fak_failure_times[bin_index]
+
+        if elapsed < cooldown:
+            return True
+
+        # Cooldown expired, remove from tracking
+        del self._fak_failure_times[bin_index]
+        return False
+
+    def _record_fak_failure(self, bin_index: int) -> None:
+        """Record a FAK order failure for cooldown tracking."""
+        self._fak_failure_times[bin_index] = time.time()
+        cooldown = self.config.rate_limit.fak_failure_cooldown_seconds
+        logger.info(
+            f"FAK order failed for bin {bin_index}, cooldown for {cooldown:.0f}s"
+        )
+
     async def run_tick(
         self,
         hours_to_settlement: float,
+        verbose: bool = False,
     ) -> TickResult:
         """
         Run a single optimization tick.
@@ -362,6 +441,7 @@ class KellyExecutor:
 
         Args:
             hours_to_settlement: Hours until market settlement
+            verbose: If True, log detailed rejection reasons for candidates
 
         Returns:
             TickResult with execution summary
@@ -400,12 +480,34 @@ class KellyExecutor:
                 logger.info("Rate limit reached, stopping tick early")
                 break
 
-            # Generate candidates
+            # Sync portfolio from API only on first iteration of tick
+            # Subsequent iterations rely on local state (updated by WebSocket fills)
+            # This avoids issues with Data API latency during active trading
+            if iteration == 0 and self.sync_portfolio:
+                try:
+                    await self.sync_portfolio()
+                    logger.info(
+                        f"[{self.event_name}][KELLY iter={iteration}] Synced from API: "
+                        f"capital=${self.portfolio.capital:.2f}, "
+                        f"invested=${self.portfolio.total_collateral_used:.2f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[{self.event_name}] Failed to sync portfolio before iteration {iteration}: {e}")
+                    # Continue with existing state if sync fails
+            else:
+                logger.debug(
+                    f"[{self.event_name}][KELLY iter={iteration}] Using local state: "
+                    f"capital=${self.portfolio.capital:.2f}, "
+                    f"invested=${self.portfolio.total_collateral_used:.2f}"
+                )
+
+            # Generate candidates (verbose on first iteration to show rejection reasons)
             candidates = generate_candidates(
                 portfolio=self.portfolio,
                 orderbooks=orderbooks,
                 config=self.config,
                 hours_to_settlement=hours_to_settlement,
+                verbose=(verbose and iteration == 0),
             )
 
             if iteration == 0:
@@ -415,6 +517,25 @@ class KellyExecutor:
                 logger.debug(f"No candidates at iteration {iteration}")
                 break
 
+            # Log ALL candidates with utility gains for debugging (these all passed edge check)
+            if candidates:
+                # Separate sells and buys
+                sell_candidates = [c for c in candidates if c.action.value.startswith("SELL")]
+                buy_candidates = [c for c in candidates if c.action.value.startswith("BUY")]
+
+                # Sort buys by utility descending
+                buy_sorted = sorted(buy_candidates, key=lambda c: c.utility_gain, reverse=True)
+
+                # Build summary for all candidates
+                parts = []
+                for c in sell_candidates:
+                    parts.append(f"bin{c.bin_index} SELL_{c.action.value.split('_')[1]}={c.utility_gain:.4f}")
+                for c in buy_sorted:
+                    parts.append(f"bin{c.bin_index} {c.action.value.split('_')[1]}={c.utility_gain:.4f}")
+
+                summary = " | ".join(parts)
+                logger.info(f"[{self.event_name}][KELLY iter={iteration}] All {len(candidates)} candidates: {summary}")
+
             # Get best candidate
             # Candidates are ordered: [sells..., buys sorted by utility]
             best = candidates[0]
@@ -422,18 +543,43 @@ class KellyExecutor:
             # Sells execute unconditionally (they meet fair value threshold by being generated)
             # Only check utility threshold for buys
             is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.tau:
+            if not is_sell and best.utility_gain < self.config.min_utility:
                 logger.debug(
                     f"Best buy candidate utility {best.utility_gain:.6f} "
-                    f"< tau {self.config.tau}, stopping"
+                    f"< tau {self.config.min_utility}, stopping"
                 )
                 break
 
-            # Execute trade
-            token_id = self.token_ids.get(best.bin_index)
-            if not token_id:
-                logger.warning(f"No token_id for bin {best.bin_index}")
-                continue
+            # Check FAK cooldown for this bin
+            if self._is_bin_in_fak_cooldown(best.bin_index):
+                logger.debug(
+                    f"Bin {best.bin_index} in FAK cooldown, skipping candidate"
+                )
+                # Remove this candidate and try the next one
+                candidates = [c for c in candidates if c.bin_index != best.bin_index]
+                if not candidates:
+                    break
+                best = candidates[0]
+                # Re-check utility threshold for the new best
+                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                if not is_sell and best.utility_gain < self.config.min_utility:
+                    break
+                # Check cooldown for new best as well
+                if self._is_bin_in_fak_cooldown(best.bin_index):
+                    logger.debug(f"Next best (bin {best.bin_index}) also in cooldown, stopping iteration")
+                    break
+
+            # Execute trade - use YES token for YES actions, NO token for NO actions
+            if best.action in (TradeAction.BUY_NO, TradeAction.SELL_NO):
+                token_id = self.no_token_ids.get(best.bin_index)
+                if not token_id:
+                    logger.warning(f"No NO token_id for bin {best.bin_index}")
+                    continue
+            else:
+                token_id = self.token_ids.get(best.bin_index)
+                if not token_id:
+                    logger.warning(f"No YES token_id for bin {best.bin_index}")
+                    continue
 
             result = self.order_executor.execute_candidate(best, token_id)
             tick_result.executions.append(result)
@@ -446,8 +592,29 @@ class KellyExecutor:
                 # Record for rate limiting
                 self._record_order()
 
-                # Track as pending order - DO NOT update portfolio yet
-                # Portfolio update happens in handle_fill() when WebSocket confirms fill
+                # In dry-run mode, do optimistic portfolio update since no WebSocket fills
+                # This ensures collateral limits are enforced across iterations
+                if self.order_executor.dry_run:
+                    self._update_portfolio(
+                        candidate=best,
+                        token_id=token_id,
+                        filled_size=best.size,
+                        filled_price=best.price,
+                    )
+                    logger.info(
+                        f"[ORDER PLACED - DRY RUN] {best.action.value} bin={best.bin_index} | "
+                        f"size={best.size:.1f} @ {best.price:.3f} | "
+                        f"Portfolio updated optimistically"
+                    )
+                else:
+                    # In live mode, portfolio updates happen via WebSocket fill confirmations
+                    logger.info(
+                        f"[ORDER PLACED] {best.action.value} bin={best.bin_index} | "
+                        f"size={best.size:.1f} @ {best.price:.3f} | "
+                        f"Will sync from API before next decision"
+                    )
+
+                # Track as pending order for WebSocket confirmation
                 if result.order_id:
                     self._pending_orders[result.order_id] = (best, token_id)
 
@@ -457,7 +624,7 @@ class KellyExecutor:
                         pending = PendingOrder(
                             order_id=result.order_id,
                             token_id=token_id,
-                            side="BUY" if best.action in (TradeAction.BUY_YES, TradeAction.SELL_NO) else "SELL",
+                            side="BUY" if best.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
                             price=best.price,
                             size=best.size,
                             bin_index=best.bin_index,
@@ -471,11 +638,63 @@ class KellyExecutor:
                 if self.on_trade:
                     self.on_trade(result)
 
-                # Delay between orders (if more iterations expected)
+                # Wait before next order (if more iterations expected)
                 if iteration < self.config.max_iters_per_tick - 1:
-                    await asyncio.sleep(rate_config.min_order_delay_seconds)
+                    if self.order_executor.dry_run:
+                        # Dry-run: just a short delay
+                        await asyncio.sleep(rate_config.min_order_delay_seconds)
+                    else:
+                        # Live mode: wait for block confirmation before next order
+                        # This ensures API has the updated position before we decide on next trade
+                        order_id = result.order_id
+                        if order_id and order_id != "dry_run_order":
+                            # Create confirmation event
+                            confirm_event = asyncio.Event()
+                            self._confirmation_events[order_id] = confirm_event
+
+                            # Wait for confirmation with timeout
+                            confirmation_timeout = rate_config.block_confirmation_timeout_seconds
+                            logger.info(f"Waiting for block confirmation (timeout: {confirmation_timeout}s)...")
+
+                            try:
+                                await asyncio.wait_for(confirm_event.wait(), timeout=confirmation_timeout)
+                                logger.info(f"Block confirmation received for order {order_id[:16]}...")
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"Block confirmation timeout after {confirmation_timeout}s for order {order_id[:16]}... "
+                                    "Proceeding with API sync."
+                                )
+                                # Clean up the event
+                                if order_id in self._confirmation_events:
+                                    del self._confirmation_events[order_id]
+
+                            # Wait for API data propagation before syncing
+                            # Block confirmation doesn't mean the data API has updated yet
+                            logger.debug("Waiting 2s for API data propagation...")
+                            await asyncio.sleep(2.0)
+
+                            # Sync from API after confirmation (or timeout) to get updated state
+                            if self.sync_portfolio:
+                                try:
+                                    await self.sync_portfolio()
+                                    logger.info(
+                                        f"[POST-CONFIRM SYNC] capital=${self.portfolio.capital:.2f}, "
+                                        f"invested=${self.portfolio.total_collateral_used:.2f}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to sync after confirmation: {e}")
+                        else:
+                            # No order_id, just use minimum delay
+                            await asyncio.sleep(rate_config.min_order_delay_seconds)
             else:
                 logger.warning(f"Execution failed: {result.error}")
+                # Check if this is a FAK failure (no liquidity at target price)
+                if result.error and "no orders found to match" in result.error.lower():
+                    self._record_fak_failure(best.bin_index)
+                    # Continue to next iteration instead of breaking
+                    # The bin will be filtered out by cooldown
+                    continue
+                # For other errors, break the loop
                 break
 
             # Refresh orderbooks for next iteration
@@ -500,12 +719,16 @@ class KellyExecutor:
         Update portfolio after confirmed fill.
 
         Called from handle_fill() when WebSocket confirms trade execution.
+        This is the ONLY place portfolio is updated during active trading.
         """
         action = candidate.action
         bin_index = candidate.bin_index
         # Use actual filled size/price, not the original candidate values
         size = filled_size
         price = filled_price
+
+        # Get collateral before update for logging
+        collateral_before = self.portfolio.total_collateral_used
 
         if action == TradeAction.BUY_YES:
             self.portfolio.execute_buy_yes(bin_index, size, price, token_id)
@@ -516,12 +739,32 @@ class KellyExecutor:
         elif action == TradeAction.SELL_NO:
             self.portfolio.execute_sell_no(bin_index, size, price)
 
+        # Log the update
+        collateral_after = self.portfolio.total_collateral_used
+        pos = self.portfolio.get_position(bin_index)
+        shares_str = f"YES:{pos.yes_shares:.1f} NO:{pos.no_shares:.1f}" if pos else "none"
+        logger.info(
+            f"[PORTFOLIO UPDATE] {action.value} bin={bin_index} | "
+            f"{size:.1f} @ {price:.4f} = ${size * price:.2f} | "
+            f"invested: ${collateral_before:.2f} -> ${collateral_after:.2f} | "
+            f"position: {shares_str}"
+        )
+
     def handle_fill(self, fill_event: "FillEvent") -> None:
         """
         Handle fill confirmation from WebSocket.
 
         Called by UserStreamClient when a trade fill is confirmed.
-        Updates portfolio with actual fill details.
+
+        NOTE: We do NOT update portfolio here. Portfolio updates come from
+        API sync before each Kelly decision. This avoids:
+        - Double-counting from multiple callbacks (MATCHED, MINED, CONFIRMED)
+        - Race conditions with manual trades
+        - Stale local state vs authoritative API state
+
+        This handler is only for:
+        - Logging fill events for awareness
+        - Removing completed orders from pending tracking
 
         Args:
             fill_event: FillEvent from WebSocket
@@ -534,35 +777,38 @@ class KellyExecutor:
         # Look up the pending order
         pending_info = self._pending_orders.get(order_id)
         if not pending_info:
-            # This fill might be from a previous session or unknown order
-            logger.info(f"Fill for unknown order {order_id[:16]}... - may be from previous session")
+            # This fill might be from a previous session or manual order
+            logger.info(f"Fill for unknown order {order_id[:16]}... - may be from previous session or manual trade")
             return
 
         candidate, token_id = pending_info
 
-        # Update portfolio with actual fill details
-        self._update_portfolio(
-            candidate=candidate,
-            token_id=token_id,
-            filled_size=fill_event.size,
-            filled_price=fill_event.price,
-        )
-
-        # Log detailed fill info
-        self._log_fill_confirmed(
-            candidate=candidate,
-            token_id=token_id,
-            filled_size=fill_event.size,
-            filled_price=fill_event.price,
-            order_id=order_id,
-        )
-
-        # Check if order is fully filled
+        # Log the fill (but don't update portfolio - that happens via API sync)
         from .user_stream import OrderStatus
-        if fill_event.status in (OrderStatus.CONFIRMED, OrderStatus.MINED):
-            # Order complete, remove from pending
-            del self._pending_orders[order_id]
-            logger.debug(f"Order {order_id[:16]}... completed and removed from pending")
+        status_str = fill_event.status.name if hasattr(fill_event.status, 'name') else str(fill_event.status)
+        logger.info(
+            f"[FILL {status_str}] {candidate.action.value} bin={candidate.bin_index} | "
+            f"{fill_event.size:.1f} @ {fill_event.price:.4f} = ${fill_event.size * fill_event.price:.2f}"
+        )
+
+        # Signal confirmation event on MINED so waiting code can proceed
+        # (This allows the next order to be placed without waiting for full confirmation)
+        if fill_event.status == OrderStatus.MINED:
+            if order_id in self._confirmation_events:
+                self._confirmation_events[order_id].set()
+                del self._confirmation_events[order_id]
+            logger.debug(f"Order {order_id[:16]}... mined, confirmation event signaled")
+
+        # Remove from pending tracking only on CONFIRMED (not MINED)
+        # This prevents "fill for unknown order" warnings when CONFIRMED arrives after MINED
+        if fill_event.status == OrderStatus.CONFIRMED:
+            if order_id in self._pending_orders:
+                del self._pending_orders[order_id]
+                logger.debug(f"Order {order_id[:16]}... confirmed and removed from pending")
+            # Also signal confirmation event if not already done (in case MINED was missed)
+            if order_id in self._confirmation_events:
+                self._confirmation_events[order_id].set()
+                del self._confirmation_events[order_id]
 
     async def handle_stale_order(self, pending: "PendingOrder") -> None:
         """
@@ -695,7 +941,7 @@ class KellyExecutor:
             f"model={model_prob:.1%} mkt={mkt_prob:.1%} edge={candidate.edge:+.1%} odds={odds:.1f}x"
         )
         logger.info(
-            f"  → order_id={order_id[:16]}... | portfolio: ${capital:.2f} capital, ${total_collateral:.2f} collateral"
+            f"  → order_id={order_id[:16]}... | portfolio: ${capital:.2f} capital, ${total_collateral:.2f} invested"
         )
 
     def _log_fill_confirmed(
@@ -909,10 +1155,10 @@ class UnifiedKellyExecutor:
 
             # Sells execute unconditionally, only check utility for buys
             is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.tau:
+            if not is_sell and best.utility_gain < self.config.min_utility:
                 logger.debug(
                     f"Best buy candidate utility {best.utility_gain:.6f} "
-                    f"< tau {self.config.tau}, stopping"
+                    f"< tau {self.config.min_utility}, stopping"
                 )
                 break
 
@@ -967,11 +1213,16 @@ class UnifiedKellyExecutor:
     async def run_tick(
         self,
         hours_to_settlement: float,
+        verbose: bool = False,
     ) -> TickResult:
         """
         Run a single optimization tick (async version for live trading).
 
         Includes rate limiting delays between orders.
+
+        Args:
+            hours_to_settlement: Hours until market settlement
+            verbose: If True, log detailed rejection reasons for candidates
         """
         start_time = time.time()
         tick_result = TickResult(
@@ -1008,11 +1259,13 @@ class UnifiedKellyExecutor:
                 logger.info("Rate limit reached, stopping tick early")
                 break
 
+            # Generate candidates (verbose on first iteration)
             candidates = generate_candidates(
                 portfolio=self.portfolio,
                 orderbooks=orderbooks,
                 config=self.config,
                 hours_to_settlement=hours_to_settlement,
+                verbose=(verbose and iteration == 0),
             )
 
             if iteration == 0:
@@ -1026,7 +1279,7 @@ class UnifiedKellyExecutor:
 
             # Sells execute unconditionally, only check utility for buys
             is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.tau:
+            if not is_sell and best.utility_gain < self.config.min_utility:
                 break
 
             token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")

@@ -623,13 +623,28 @@ class Musk7DayForecaster:
             )
 
         # Run Monte Carlo simulation for remaining days
-        forecast = self.monte_carlo.simulate_horizon(
-            events=today_events,
-            contract_date=today,
-            now=now,
-            horizon=remaining_days,
-            n_simulations=n_simulations,
-        )
+        if today < market_start_date:
+            # Before counting window starts - use pure interday forecast
+            # No intraday nowcast since we have no data from the counting window yet
+            # base_date = market_start_date ensures correct weekend effects
+            forecast = self.monte_carlo.simulate_horizon_pure_interday(
+                base_date=market_start_date,
+                horizon=remaining_days,
+                n_simulations=n_simulations,
+            )
+            logger.debug(
+                f"[forecast_for_event_window] Pre-counting window: using pure interday "
+                f"forecast from {market_start_date} for {remaining_days} days"
+            )
+        else:
+            # Within counting window - use normal simulation with intraday nowcast
+            forecast = self.monte_carlo.simulate_horizon(
+                events=today_events,
+                contract_date=today,
+                now=now,
+                horizon=remaining_days,
+                n_simulations=n_simulations,
+            )
 
         logger.debug(
             f"[forecast_for_event_window] horizon={remaining_days}, "

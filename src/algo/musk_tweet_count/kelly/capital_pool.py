@@ -208,7 +208,7 @@ class CapitalPool:
             del self._allocations[event_id]
 
             logger.info(
-                f"Event {event_id} settled: ${final_value:.2f} returned "
+                f"Event {event_id} deallocated: ${final_value:.2f} returned to pool "
                 f"(P&L: ${pnl:+.2f}, {pnl_pct:+.1f}%) "
                 f"(pool: ${self._available:.2f} available, "
                 f"{len(self._allocations)} active events)"
@@ -222,6 +222,9 @@ class CapitalPool:
         """
         Update current value for an active event (for monitoring).
 
+        IMPORTANT: Adjusts _available to keep total_value constant.
+        This ensures the pool tracks actual capital, not phantom gains.
+
         Args:
             event_id: Event identifier
             current_value: Current portfolio value (cash + positions mark-to-market)
@@ -230,7 +233,20 @@ class CapitalPool:
             if event_id not in self._allocations:
                 return
 
+            old_value = self._allocations[event_id].current_value
             self._allocations[event_id].current_value = current_value
+
+            # Adjust _available to keep total constant
+            # If value increased, that capital came from available (reduce it)
+            # If value decreased, capital returns to available (increase it)
+            delta = current_value - old_value
+            self._available -= delta
+
+            if self._available < 0:
+                logger.warning(
+                    f"Capital pool available went negative: ${self._available:.2f} "
+                    f"(event {event_id} value changed by ${delta:+.2f})"
+                )
 
     async def get_allocation(self, event_id: str) -> Optional[EventAllocation]:
         """Get allocation info for an event."""

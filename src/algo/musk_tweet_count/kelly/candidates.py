@@ -26,6 +26,48 @@ from .kelly_math import compute_utility_gain
 
 logger = logging.getLogger(__name__)
 
+# Polymarket minimum order value (USD)
+# Orders below this will be rejected by the API
+MIN_ORDER_VALUE_USD = 1.0
+
+
+def check_orderbook_liquidity(
+    orderbook: UnifiedOrderbook,
+    config: EdgeBufferConfig,
+    side: str,  # "YES" or "NO"
+) -> tuple[bool, str]:
+    """
+    Check if orderbook has sufficient liquidity for trading.
+
+    Args:
+        orderbook: The orderbook to check
+        config: Edge buffer configuration
+        side: "YES" for YES token, "NO" for NO token
+
+    Returns:
+        Tuple of (is_valid, reason). If not valid, reason explains why.
+    """
+    if side == "YES":
+        best_bid = orderbook.best_yes_bid
+        best_ask = orderbook.best_yes_ask
+    else:
+        best_bid = orderbook.best_no_bid
+        best_ask = orderbook.best_no_ask
+
+    # Check two-sided liquidity requirement
+    if config.require_two_sided_liquidity:
+        if best_bid is None or best_ask is None:
+            return False, f"{side} has one-sided liquidity (bid={best_bid}, ask={best_ask})"
+
+    # Check spread requirement (only if both sides exist)
+    if config.max_spread_ratio > 0 and best_bid is not None and best_ask is not None:
+        if best_bid > 0:
+            spread_ratio = (best_ask - best_bid) / best_bid
+            if spread_ratio > config.max_spread_ratio:
+                return False, f"{side} spread too wide (ratio {spread_ratio:.2f} > {config.max_spread_ratio:.1f})"
+
+    return True, ""
+
 
 class TradeAction(Enum):
     """Possible trade actions."""
@@ -247,35 +289,35 @@ def should_trade(
         return market_price >= no_threshold, actual_edge
 
 
-def compute_adaptive_delta(
+def compute_adaptive_delta_usd(
     config: AdaptiveDeltaConfig,
-    available_depth: float,
+    available_depth_usd: float,
     hours_to_settlement: float,
     t_stop_hours: float,
 ) -> float:
     """
-    Compute adaptive chunk size based on market conditions.
+    Compute adaptive chunk size in USD based on market conditions.
 
     Args:
         config: Adaptive delta configuration
-        available_depth: Available depth in orderbook
+        available_depth_usd: Available depth in orderbook (in USD)
         hours_to_settlement: Hours until market settlement
         t_stop_hours: T_stop cutoff hours
 
     Returns:
-        Adaptive chunk size in shares (0 if past T_stop)
+        Adaptive chunk size in USD (0 if past T_stop)
     """
     # Stop trading if past T_stop
     hours_until_stop = hours_to_settlement - t_stop_hours
     if hours_until_stop <= 0:
         return 0.0
 
-    # Liquidity constraint: never take >X% of visible depth
-    liquidity_delta = available_depth * config.max_depth_fraction
+    # Liquidity constraint: never take >X% of visible depth (in USD)
+    liquidity_delta_usd = available_depth_usd * config.max_depth_fraction
 
     return max(
-        config.min_delta,
-        min(config.base_delta, liquidity_delta),
+        config.min_delta_usd,
+        min(config.base_delta_usd, liquidity_delta_usd),
     )
 
 
@@ -284,6 +326,7 @@ def generate_candidates(
     orderbooks: dict[int, UnifiedOrderbook],
     config: KellyConfig,
     hours_to_settlement: float,
+    verbose: bool = False,
 ) -> List[TradeCandidate]:
     """
     Generate all feasible trade candidates.
@@ -293,14 +336,56 @@ def generate_candidates(
         orderbooks: Orderbooks for each bin (keyed by bin_index)
         config: Kelly configuration
         hours_to_settlement: Hours until settlement
+        verbose: If True, log rejection reasons at INFO level
 
     Returns:
         List of trade candidates sorted by utility gain (descending)
     """
     candidates = []
+    rejection_reasons: dict[int, list[str]] = {}  # bin_index -> list of rejection reasons
 
-    # Get current reservation prices
+    # Log portfolio state that Kelly is using (should be fresh from API sync)
+    num_positions = len([p for p in portfolio.positions.values()
+                        if p.yes_shares > 0 or p.no_shares > 0])
+    logger.debug(
+        f"[KELLY INPUT] capital=${portfolio.capital:.2f}, "
+        f"invested=${portfolio.total_collateral_used:.2f}, "
+        f"positions={num_positions}, "
+        f"c_event_max=${config.collateral.c_event_max:.0f}"
+    )
+
+    # Get current reservation prices (multi-bin Kelly)
     yes_prices, no_prices = portfolio.get_reservation_prices(config.w_floor)
+
+    # Log portfolio state and top reservation prices for debugging
+    if verbose:
+        terminal_wealths = portfolio.get_terminal_wealths(config.w_floor)
+        logger.info("Multi-bin Kelly state:")
+        logger.info(
+            f"  Capital: ${portfolio.capital:.2f}, Invested: ${portfolio.total_collateral_used:.2f}"
+        )
+        # Show bins with positions
+        for bin_idx, pos in portfolio.positions.items():
+            if pos.yes_shares > 0 or pos.no_shares > 0:
+                logger.info(
+                    f"  Bin {bin_idx}: YES={pos.yes_shares:.1f} NO={pos.no_shares:.1f} "
+                    f"cost=${pos.collateral_used:.2f} | "
+                    f"W[{bin_idx}]=${terminal_wealths[bin_idx]:.2f} | "
+                    f"c*_YES={yes_prices[bin_idx]:.3f} c*_NO={no_prices[bin_idx]:.3f} | "
+                    f"model_p={portfolio.probabilities[bin_idx]:.3f}"
+                )
+        # Show a few top model probability bins (potential candidates)
+        prob_bins = sorted(
+            [(i, p) for i, p in enumerate(portfolio.probabilities) if p > 0.01],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:5]
+        logger.info("  Top model probability bins:")
+        for bin_idx, prob in prob_bins:
+            logger.info(
+                f"    Bin {bin_idx}: model_p={prob:.3f} c*_YES={yes_prices[bin_idx]:.3f} "
+                f"c*_NO={no_prices[bin_idx]:.3f} W=${terminal_wealths[bin_idx]:.2f}"
+            )
 
     for bin_index in range(portfolio.num_bins):
         # Skip dead bins
@@ -309,6 +394,8 @@ def generate_candidates(
 
         orderbook = orderbooks.get(bin_index)
         if not orderbook:
+            if verbose:
+                rejection_reasons.setdefault(bin_index, []).append("no orderbook")
             continue
 
         reservation_yes = yes_prices[bin_index]
@@ -319,22 +406,36 @@ def generate_candidates(
         has_yes = position and position.has_yes_position
         has_no = position and position.has_no_position
 
+        # Check liquidity for YES and NO tokens (only for buying, not selling)
+        yes_liquidity_ok, yes_reason = check_orderbook_liquidity(
+            orderbook, config.edge_buffer, "YES"
+        )
+        no_liquidity_ok, no_reason = check_orderbook_liquidity(
+            orderbook, config.edge_buffer, "NO"
+        )
+
         # Generate BUY YES candidate (only if we don't have NO position)
         # If we have NO, we should SELL_NO first rather than buying YES
         if not has_no:
-            candidate = _generate_buy_yes_candidate(
-                bin_index=bin_index,
-                orderbook=orderbook,
-                portfolio=portfolio,
-                reservation_price=reservation_yes,
-                config=config,
-                hours_to_settlement=hours_to_settlement,
-            )
-            if candidate:
-                candidates.append(candidate)
+            if yes_liquidity_ok:
+                candidate = _generate_buy_yes_candidate(
+                    bin_index=bin_index,
+                    orderbook=orderbook,
+                    portfolio=portfolio,
+                    reservation_price=reservation_yes,
+                    config=config,
+                    hours_to_settlement=hours_to_settlement,
+                    verbose=verbose,
+                    rejection_reasons=rejection_reasons,
+                )
+                if candidate:
+                    candidates.append(candidate)
+            elif verbose:
+                rejection_reasons.setdefault(bin_index, []).append(f"BUY_YES: {yes_reason}")
 
         # Generate SELL YES candidate (if we have position)
         # Use model probability (not reservation price) for exit threshold
+        # NOTE: Always allow selling even if liquidity is poor (need to exit positions)
         if has_yes:
             model_prob_yes = portfolio.probabilities[bin_index]
             candidate = _generate_sell_yes_candidate(
@@ -351,19 +452,25 @@ def generate_candidates(
         # Generate BUY NO candidate (only if we don't have YES position)
         # If we have YES, we should SELL_YES first rather than buying NO
         if not has_yes:
-            candidate = _generate_buy_no_candidate(
-                bin_index=bin_index,
-                orderbook=orderbook,
-                portfolio=portfolio,
-                reservation_price=reservation_no,
-                config=config,
-                hours_to_settlement=hours_to_settlement,
-            )
-            if candidate:
-                candidates.append(candidate)
+            if no_liquidity_ok:
+                candidate = _generate_buy_no_candidate(
+                    bin_index=bin_index,
+                    orderbook=orderbook,
+                    portfolio=portfolio,
+                    reservation_price=reservation_no,
+                    config=config,
+                    hours_to_settlement=hours_to_settlement,
+                    verbose=verbose,
+                    rejection_reasons=rejection_reasons,
+                )
+                if candidate:
+                    candidates.append(candidate)
+            elif verbose:
+                rejection_reasons.setdefault(bin_index, []).append(f"BUY_NO: {no_reason}")
 
         # Generate SELL NO candidate (if we have position)
         # Use model probability (not reservation price) for exit threshold
+        # NOTE: Always allow selling even if liquidity is poor (need to exit positions)
         if has_no:
             model_prob_no = 1.0 - portfolio.probabilities[bin_index]
             candidate = _generate_sell_no_candidate(
@@ -376,6 +483,28 @@ def generate_candidates(
             )
             if candidate:
                 candidates.append(candidate)
+
+    # Log rejection reasons if verbose
+    if verbose and rejection_reasons:
+        logger.info("Candidate rejection reasons:")
+        for bin_idx in sorted(rejection_reasons.keys()):
+            reasons = rejection_reasons[bin_idx]
+            logger.info(f"  Bin {bin_idx}: {'; '.join(reasons)}")
+
+    # Log ALL buy candidates with utility gains (for debugging multi-bin Kelly)
+    if verbose:
+        buy_candidates = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
+        if buy_candidates:
+            logger.info("All BUY candidates (sorted by utility gain):")
+            # Sort by utility for display
+            buy_sorted = sorted(buy_candidates, key=lambda c: c.utility_gain, reverse=True)
+            for c in buy_sorted[:10]:  # Top 10
+                logger.info(
+                    f"  Bin {c.bin_index} {c.action.value}: "
+                    f"util={c.utility_gain:.6f} edge={c.edge:+.2%} "
+                    f"fair={c.reservation_price:.3f} vwap={c.price:.3f} "
+                    f"size={c.size:.1f}"
+                )
 
     # Separate sells from buys
     # Sells are processed first (exit at fair value or better, not utility-based)
@@ -397,44 +526,98 @@ def _generate_buy_yes_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    verbose: bool = False,
+    rejection_reasons: dict = None,
 ) -> Optional[TradeCandidate]:
     """Generate a BUY YES candidate if profitable."""
-    # Get available depth
-    depth = get_available_depth(orderbook, "BUY_YES")
-    if depth <= 0:
-        logger.debug(f"BUY_YES bin {bin_index}: no depth")
+    def reject(reason: str) -> None:
+        logger.debug(f"BUY_YES bin {bin_index}: {reason}")
+        if verbose and rejection_reasons is not None:
+            rejection_reasons.setdefault(bin_index, []).append(f"BUY_YES: {reason}")
+
+    # Get available depth in shares
+    depth_shares = get_available_depth(orderbook, "BUY_YES")
+    if depth_shares <= 0:
+        reject("no depth")
         return None
 
-    # Compute adaptive chunk size
-    delta = compute_adaptive_delta(
+    # Get best ask price to convert depth to USD
+    best_ask = orderbook.yes_asks[0].price if orderbook.yes_asks else None
+    if not best_ask or best_ask <= 0:
+        reject("no ask price")
+        return None
+
+    # Convert depth to USD for adaptive delta calculation
+    depth_usd = depth_shares * best_ask
+
+    # Compute adaptive chunk size in USD
+    delta_usd = compute_adaptive_delta_usd(
         config.adaptive_delta,
-        depth,
+        depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
     )
 
-    # Apply fractional Kelly
-    delta *= config.kappa
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
+
+    # Enforce minimum order value (Polymarket API requirement: $1)
+    if delta_usd < MIN_ORDER_VALUE_USD:
+        reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
+        return None
+
+    # Convert USD to shares for VWAP calculation
+    delta = delta_usd / best_ask
 
     # Check we have capital
-    if portfolio.available_capital < delta * 0.01:  # Rough check
-        logger.debug(f"BUY_YES bin {bin_index}: insufficient capital")
+    if portfolio.available_capital < delta_usd:
+        reject(f"insufficient capital (need ${delta_usd:.2f})")
         return None
+
+    # Check collateral limits
+    position = portfolio.get_position(bin_index)
+    current_bin_collateral = position.collateral_used if position else 0.0
+    total_collateral = portfolio.total_collateral_used
+
+    # Estimate new collateral (will be refined after VWAP)
+    estimated_new_collateral = delta_usd
+
+    if config.collateral.c_bin_max > 0:
+        if current_bin_collateral + estimated_new_collateral > config.collateral.c_bin_max:
+            reject(f"bin collateral limit (${current_bin_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+            return None
+
+    if config.collateral.c_event_max > 0:
+        if total_collateral + estimated_new_collateral > config.collateral.c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+            return None
 
     # Get VWAP for this chunk
     vwap, filled = compute_vwap_buy_yes(orderbook, delta)
     if filled <= 0:
-        logger.debug(f"BUY_YES bin {bin_index}: no fill at delta={delta:.2f}")
+        reject(f"no fill at delta={delta:.2f}")
         return None
+
+    # Re-check collateral limits with actual VWAP price (more accurate than estimate)
+    actual_new_collateral = filled * vwap
+    if config.collateral.c_bin_max > 0:
+        if current_bin_collateral + actual_new_collateral > config.collateral.c_bin_max:
+            reject(f"bin collateral limit with VWAP (${current_bin_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+            return None
+
+    if config.collateral.c_event_max > 0:
+        if total_collateral + actual_new_collateral > config.collateral.c_event_max:
+            reject(f"event collateral limit with VWAP (${total_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+            return None
 
     # Check minimum perceived probability (from our model)
     if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
-        logger.debug(f"BUY_YES bin {bin_index}: model prob too low ({reservation_price:.4f} < {config.edge_buffer.min_perceived_prob:.4f})")
+        reject(f"model prob too low ({reservation_price:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
         return None
 
     # Check minimum market price
     if config.edge_buffer.min_market_price > 0 and vwap < config.edge_buffer.min_market_price:
-        logger.debug(f"BUY_YES bin {bin_index}: market price too low ({vwap:.4f} < {config.edge_buffer.min_market_price:.4f})")
+        reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
     # Check edge requirement
@@ -443,15 +626,15 @@ def _generate_buy_yes_candidate(
     )
     if not trade_ok:
         threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
-        logger.debug(f"BUY_YES bin {bin_index}: edge check failed (vwap={vwap:.4f}, res={reservation_price:.4f}, thresh={threshold:.4f})")
+        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
         return None
 
     # Simulate trade and compute utility gain
     new_portfolio = portfolio.simulate_buy_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.tau:
-        logger.debug(f"BUY_YES bin {bin_index}: utility too low ({utility_gain:.6f} < {config.tau:.6f})")
+    if utility_gain < config.min_utility:
+        reject(f"utility too low ({utility_gain:.6f} < {config.min_utility:.6f})")
         return None
 
     return TradeCandidate(
@@ -486,22 +669,36 @@ def _generate_sell_yes_candidate(
     if not position or not position.has_yes_position:
         return None
 
-    depth = get_available_depth(orderbook, "SELL_YES")
-    if depth <= 0:
+    # Get available depth in shares
+    depth_shares = get_available_depth(orderbook, "SELL_YES")
+    if depth_shares <= 0:
         return None
 
-    delta = compute_adaptive_delta(
+    # Get best bid price (selling YES at bid)
+    best_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else None
+    if not best_bid or best_bid <= 0:
+        return None
+
+    # Convert depth to USD
+    depth_usd = depth_shares * best_bid
+
+    # Compute adaptive chunk size in USD
+    delta_usd = compute_adaptive_delta_usd(
         config.adaptive_delta,
-        depth,
+        depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
     )
+
+    # Convert USD to shares
+    delta = delta_usd / best_bid
 
     # Don't sell more than we have
     delta = min(delta, position.yes_shares)
     delta *= config.kappa
 
-    if delta <= 0:
+    # For exits, enforce minimum value (Polymarket $1 minimum)
+    if delta * best_bid < MIN_ORDER_VALUE_USD:
         return None
 
     vwap, filled = compute_vwap_sell_yes(orderbook, delta)
@@ -547,38 +744,98 @@ def _generate_buy_no_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    verbose: bool = False,
+    rejection_reasons: dict = None,
 ) -> Optional[TradeCandidate]:
     """Generate a BUY NO candidate if profitable."""
-    depth = get_available_depth(orderbook, "BUY_NO")
-    if depth <= 0:
-        logger.debug(f"BUY_NO bin {bin_index}: no depth")
+    def reject(reason: str) -> None:
+        logger.debug(f"BUY_NO bin {bin_index}: {reason}")
+        if verbose and rejection_reasons is not None:
+            rejection_reasons.setdefault(bin_index, []).append(f"BUY_NO: {reason}")
+
+    # Get available depth in shares
+    depth_shares = get_available_depth(orderbook, "BUY_NO")
+    if depth_shares <= 0:
+        reject("no depth")
         return None
 
-    delta = compute_adaptive_delta(
+    # Get best bid price (buying NO = selling YES at bid)
+    # NO price = 1 - YES price, so NO cost = 1 - yes_bid
+    best_yes_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else None
+    if not best_yes_bid or best_yes_bid <= 0:
+        reject("no bid price")
+        return None
+    best_no_price = 1.0 - best_yes_bid
+
+    # Convert depth to USD for adaptive delta calculation
+    depth_usd = depth_shares * best_no_price
+
+    # Compute adaptive chunk size in USD
+    delta_usd = compute_adaptive_delta_usd(
         config.adaptive_delta,
-        depth,
+        depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
     )
-    delta *= config.kappa
 
-    if portfolio.available_capital < delta * 0.01:
-        logger.debug(f"BUY_NO bin {bin_index}: insufficient capital (need {delta * 0.01:.2f}, have {portfolio.available_capital:.2f})")
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
+
+    # Enforce minimum order value (Polymarket API requirement: $1)
+    if delta_usd < MIN_ORDER_VALUE_USD:
+        reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
         return None
+
+    # Convert USD to shares for VWAP calculation
+    delta = delta_usd / best_no_price
+
+    if portfolio.available_capital < delta_usd:
+        reject(f"insufficient capital (need ${delta_usd:.2f})")
+        return None
+
+    # Check collateral limits
+    position = portfolio.get_position(bin_index)
+    current_bin_collateral = position.collateral_used if position else 0.0
+    total_collateral = portfolio.total_collateral_used
+
+    # Estimate new collateral (will be refined after VWAP)
+    estimated_new_collateral = delta_usd
+
+    if config.collateral.c_bin_max > 0:
+        if current_bin_collateral + estimated_new_collateral > config.collateral.c_bin_max:
+            reject(f"bin collateral limit (${current_bin_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+            return None
+
+    if config.collateral.c_event_max > 0:
+        if total_collateral + estimated_new_collateral > config.collateral.c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+            return None
 
     vwap, filled = compute_vwap_buy_no(orderbook, delta)
     if filled <= 0:
-        logger.debug(f"BUY_NO bin {bin_index}: no fill at delta={delta:.2f}")
+        reject(f"no fill at delta={delta:.2f}")
         return None
+
+    # Re-check collateral limits with actual VWAP price (more accurate than estimate)
+    actual_new_collateral = filled * vwap
+    if config.collateral.c_bin_max > 0:
+        if current_bin_collateral + actual_new_collateral > config.collateral.c_bin_max:
+            reject(f"bin collateral limit with VWAP (${current_bin_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+            return None
+
+    if config.collateral.c_event_max > 0:
+        if total_collateral + actual_new_collateral > config.collateral.c_event_max:
+            reject(f"event collateral limit with VWAP (${total_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+            return None
 
     # Check minimum perceived probability (from our model)
     if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
-        logger.debug(f"BUY_NO bin {bin_index}: model prob too low ({reservation_price:.4f} < {config.edge_buffer.min_perceived_prob:.4f})")
+        reject(f"model prob too low ({reservation_price:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
         return None
 
     # Check minimum market price
     if config.edge_buffer.min_market_price > 0 and vwap < config.edge_buffer.min_market_price:
-        logger.debug(f"BUY_NO bin {bin_index}: market price too low ({vwap:.4f} < {config.edge_buffer.min_market_price:.4f})")
+        reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
     trade_ok, actual_edge = should_trade(
@@ -587,14 +844,14 @@ def _generate_buy_no_candidate(
     if not trade_ok:
         req_edge = compute_required_edge(reservation_price, config.edge_buffer)
         threshold = reservation_price * (1 - req_edge)
-        logger.debug(f"BUY_NO bin {bin_index}: edge check failed (vwap={vwap:.4f}, res={reservation_price:.4f}, req_edge={req_edge:.2%}, thresh={threshold:.4f})")
+        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
         return None
 
     new_portfolio = portfolio.simulate_buy_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.tau:
-        logger.debug(f"BUY_NO bin {bin_index}: utility too low ({utility_gain:.6f} < {config.tau:.6f})")
+    if utility_gain < config.min_utility:
+        reject(f"utility too low ({utility_gain:.6f} < {config.min_utility:.6f})")
         return None
 
     return TradeCandidate(
@@ -629,21 +886,37 @@ def _generate_sell_no_candidate(
     if not position or not position.has_no_position:
         return None
 
-    depth = get_available_depth(orderbook, "SELL_NO")
-    if depth <= 0:
+    # Get available depth in shares
+    depth_shares = get_available_depth(orderbook, "SELL_NO")
+    if depth_shares <= 0:
         return None
 
-    delta = compute_adaptive_delta(
+    # Get best ask price (selling NO = buying YES at ask)
+    # NO sell price = 1 - YES ask price
+    best_yes_ask = orderbook.yes_asks[0].price if orderbook.yes_asks else None
+    if not best_yes_ask or best_yes_ask <= 0:
+        return None
+    best_no_price = 1.0 - best_yes_ask
+
+    # Convert depth to USD
+    depth_usd = depth_shares * best_no_price
+
+    # Compute adaptive chunk size in USD
+    delta_usd = compute_adaptive_delta_usd(
         config.adaptive_delta,
-        depth,
+        depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
     )
 
+    # Convert USD to shares
+    delta = delta_usd / best_no_price
+
     delta = min(delta, position.no_shares)
     delta *= config.kappa
 
-    if delta <= 0:
+    # For exits, enforce minimum value (Polymarket $1 minimum)
+    if delta * best_no_price < MIN_ORDER_VALUE_USD:
         return None
 
     vwap, filled = compute_vwap_sell_no(orderbook, delta)

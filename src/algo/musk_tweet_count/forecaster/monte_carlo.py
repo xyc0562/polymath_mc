@@ -481,6 +481,103 @@ class MonteCarloForecaster:
 
         return result
 
+    def simulate_horizon_pure_interday(
+        self,
+        base_date: date,
+        horizon: int = 7,
+        n_simulations: Optional[int] = None,
+    ) -> ForecastResult:
+        """
+        Forecast using only interday model (no intraday nowcast).
+
+        Used when forecasting before the counting window starts, when we have
+        no partial day data to nowcast from. All days are sampled from the
+        interday model with proper weekend effects based on base_date.
+
+        Args:
+            base_date: First day of the counting window (for weekend effect calculation)
+            horizon: Number of days to forecast
+            n_simulations: Number of simulations (default from config)
+
+        Returns:
+            ForecastResult with distribution and bin probabilities
+        """
+        import time
+        start_time = time.time()
+
+        if n_simulations is None:
+            n_simulations = self.mc_config.n_simulations
+
+        # Initialize RNG
+        seed = self.mc_config.random_seed
+        rng = np.random.default_rng(seed)
+
+        # All days are "future" days from interday model perspective
+        # horizons = [0, 1, 2, ..., horizon-1] where 0 = first counting day
+        # Note: forecast_day(0, base_date) gives forecast for base_date itself
+        all_horizons = list(range(horizon))
+
+        # Get expected means for all days (for result metadata)
+        all_params = self.interday.get_forecast_params(all_horizons, base_date)
+        all_means = [m for m, _ in all_params]
+
+        # Run simulations
+        sums = np.zeros(n_simulations)
+
+        for i in range(n_simulations):
+            day_samples = self._sample_future_days(
+                base_date=base_date,
+                horizons=all_horizons,
+                rng=rng,
+                regime_adjustment=1.0,  # No adjustment - no today's observation
+            )
+            sums[i] = sum(day_samples)
+
+        # Apply horizon cap if configured
+        horizon_caps = self.mc_config.max_horizon_caps
+        if horizon < len(horizon_caps) and horizon_caps[horizon] > 0:
+            cap = horizon_caps[horizon]
+            sums = np.minimum(sums, cap)
+
+        # Compute statistics
+        mean = float(np.mean(sums))
+        median = float(np.median(sums))
+        std = float(np.std(sums))
+        p5 = float(np.percentile(sums, 5))
+        p25 = float(np.percentile(sums, 25))
+        p75 = float(np.percentile(sums, 75))
+        p95 = float(np.percentile(sums, 95))
+
+        # Compute bin probabilities
+        bin_probs = self._compute_bin_probabilities(sums)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        result = ForecastResult(
+            mean=mean,
+            median=median,
+            std=std,
+            p5=p5,
+            p25=p25,
+            p75=p75,
+            p95=p95,
+            bin_probabilities=bin_probs,
+            today_estimate=0.0,  # No "today" component - all days are future
+            future_days_estimate=sum(all_means),
+            today_interday_estimate=0.0,
+            regime_adjustment=1.0,  # No adjustment
+            n_simulations=n_simulations,
+            simulation_time_ms=elapsed_ms,
+            future_days_pure=sum(all_means),
+        )
+
+        logger.debug(
+            f"Pure interday {horizon}-day simulation from {base_date}: "
+            f"mean={mean:.1f}, std={std:.1f}, time={elapsed_ms:.1f}ms"
+        )
+
+        return result
+
     def simulate(
         self,
         events: List[TweetEvent],

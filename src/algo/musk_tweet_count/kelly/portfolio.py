@@ -167,10 +167,15 @@ class Portfolio:
         """
         Capital available for new trades.
 
+        NOTE: capital = liquid USDC (already decreased when buying).
+        Do NOT subtract collateral_used - that would double-count.
+        collateral_used is only for per-bin limit tracking (c_bin_max).
+
         If external_capital_limit is set (from shared pool manager),
-        returns the minimum of internal available and external limit.
+        returns the minimum of capital and external limit.
         """
-        internal_available = self.capital - self.total_collateral_used
+        # capital IS the available USDC - don't subtract collateral
+        internal_available = self.capital
 
         if self.external_capital_limit is not None:
             return min(internal_available, self.external_capital_limit)

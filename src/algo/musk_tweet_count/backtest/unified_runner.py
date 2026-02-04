@@ -94,31 +94,16 @@ class UnifiedBacktestConfig:
     spread: float = 0.02  # 2% bid-ask spread
     slippage: float = 0.005  # 0.5% slippage
 
-    # Kelly configuration
-    kappa: float = 0.25  # Quarter Kelly
-    tau: float = 0.001  # Min utility threshold
-    t_stop_hours: float = 3.0  # Stop trading 3h before settlement
-
-    # Edge buffer using production defaults
-    edge_buffer: EdgeBufferConfig = field(default_factory=lambda: EdgeBufferConfig(
-        required_roi=0.10,
-        friction_mid=0.015,
-        friction_tail=0.03,
-        tail_threshold=0.09,
-    ))
-
-    # Adaptive delta for position sizing
-    adaptive_delta: AdaptiveDeltaConfig = field(default_factory=lambda: AdaptiveDeltaConfig(
-        base_delta=10.0,
-        max_depth_fraction=0.10,
-        min_delta=1.0,
-    ))
-
-    # Rate limit (high for backtest since we want to execute all good trades)
-    rate_limit: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(
-        max_orders_per_tick=50,
-        min_order_delay_seconds=0.0,
-        max_orders_per_minute=1000,
+    # Trading configuration - uses KellyConfig directly to avoid duplication
+    # Override specific fields as needed for backtest (e.g., higher rate limits)
+    trading: KellyConfig = field(default_factory=lambda: KellyConfig(
+        # Backtest-specific overrides
+        rate_limit=RateLimitConfig(
+            max_orders_per_tick=50,
+            min_order_delay_seconds=0.0,
+            max_orders_per_minute=1000,
+        ),
+        max_iters_per_tick=50,
     ))
 
     # Tick frequency
@@ -514,17 +499,8 @@ class UnifiedBacktestRunner:
         return result
 
     def _create_kelly_config(self) -> KellyConfig:
-        """Create Kelly config from backtest config."""
-        return KellyConfig(
-            enabled=True,
-            kappa=self.config.kappa,
-            tau=self.config.tau,
-            t_stop_hours=self.config.t_stop_hours,
-            edge_buffer=self.config.edge_buffer,
-            adaptive_delta=self.config.adaptive_delta,
-            rate_limit=self.config.rate_limit,
-            max_iters_per_tick=50,
-        )
+        """Return the trading config (KellyConfig) from backtest config."""
+        return self.config.trading
 
     def _record_trade(self, result) -> None:
         """Record a trade from the executor callback."""

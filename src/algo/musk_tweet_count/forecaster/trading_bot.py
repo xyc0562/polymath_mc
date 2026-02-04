@@ -28,6 +28,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_wallet_for_positions() -> Optional[str]:
+    """
+    Get wallet address for position queries.
+
+    When using proxy wallet (signature_type 1 or 2), positions are held
+    by the proxy wallet (POLY_FUNDER), not the main wallet.
+    """
+    funder = os.getenv("POLY_FUNDER")
+    signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+
+    if funder and signature_type in (1, 2):
+        return funder
+
+    return os.getenv("WALLET_ADDRESS")
+
+
 @dataclass
 class TradingBotConfig:
     """Configuration for the GAS-Kelly trading bot."""
@@ -60,6 +76,9 @@ class TradingBotConfig:
 
     # Forecast cache timeout in seconds (should be > slow_interval to avoid recomputing mid-cycle)
     forecast_cache_timeout: int = 165
+
+    # Event name for logging (e.g., "Feb 03 - Feb 10")
+    event_name: Optional[str] = None
 
     # Legacy alias for slow_tick_interval_seconds
     @property
@@ -428,17 +447,19 @@ class GASKellyTradingBot:
         # Create Kelly bot with wallet address and optional external user stream
         # If external user stream is provided (from MultiEventManager), use it
         # Otherwise, KellyTradingBot will create its own if API credentials available
+        # Use proxy wallet if configured (positions are held there)
         self.kelly_bot = KellyTradingBot(
             clob_client=self.clob_client,
             config=self.kelly_config,
             probability_model=self._get_probabilities,
             dry_run=self.bot_config.dry_run,
-            wallet_address=os.getenv("WALLET_ADDRESS"),
+            wallet_address=_get_wallet_for_positions(),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_API_SECRET"),
             api_passphrase=os.getenv("CLOB_API_PASSPHRASE"),
             external_user_stream=self._external_user_stream,
             disable_websocket=self.bot_config.disable_websocket,
+            event_name=self.bot_config.event_name,
         )
 
         # Setup Kelly bot
@@ -670,23 +691,30 @@ class GASKellyTradingBot:
                     elapsed_seconds=0.0,
                 )
 
-            # 5. Run Kelly optimization tick
-            # Use effective_count for dead bin detection to avoid betting on impossible bins
-            result = await self.kelly_bot.run_tick(
-                current_count=effective_count,
-                hours_elapsed=hours_elapsed,
-                hours_to_settlement=hours_remaining,
-                forecast_mean=self._cached_forecast_mean,
-                forecast_std=self._cached_forecast_std or 0,
-            )
+            # 5. Fetch orderbooks for table display (slow ticks only)
+            if log_header and self.kelly_bot and self.kelly_bot.orderbook_manager:
+                dead_bins = set(i for i, (lower, upper) in enumerate(self._market_bins) if upper < effective_count)
+                for bin_idx, token_id in self.kelly_bot.bin_token_ids.items():
+                    if bin_idx in dead_bins:
+                        continue
+                    if not self.kelly_bot.orderbook_manager.get_orderbook(token_id):
+                        await self.kelly_bot.orderbook_manager.fetch_orderbook(token_id, bin_idx)
 
-            # 6. Get probabilities and log comparison with market prices (slow ticks only)
+            # 6. Log probability table BEFORE trading (slow ticks only)
             if log_header:
                 probabilities = self._get_probabilities(
                     current_count=current_count,
                     hours_elapsed=hours_elapsed,
                     hours_remaining=hours_remaining,
                 )
+                # Update portfolio probabilities so table shows correct Kelly c* values
+                # (otherwise get_reservation_prices() uses stale probabilities)
+                if self.kelly_bot and self.kelly_bot.portfolio:
+                    self.kelly_bot.update_probabilities(
+                        current_count=effective_count,
+                        hours_elapsed=hours_elapsed,
+                        hours_remaining=hours_remaining,
+                    )
                 self._log_probability_comparison(
                     probabilities=probabilities,
                     current_count=effective_count,  # Use effective count for dead bin display
@@ -698,7 +726,19 @@ class GASKellyTradingBot:
                     forecast_time=self._cached_forecast_time,
                 )
 
-            # 7. Log results
+            # 7. Run Kelly optimization tick
+            # Use effective_count for dead bin detection to avoid betting on impossible bins
+            # Pass verbose=True on slow ticks to show rejection reasons
+            result = await self.kelly_bot.run_tick(
+                current_count=effective_count,
+                hours_elapsed=hours_elapsed,
+                hours_to_settlement=hours_remaining,
+                forecast_mean=self._cached_forecast_mean,
+                forecast_std=self._cached_forecast_std or 0,
+                verbose=log_header,  # verbose on slow ticks only
+            )
+
+            # 8. Log results
             if log_header or result.num_executed > 0:
                 self._log_tick_result(result)
 
@@ -795,22 +835,40 @@ class GASKellyTradingBot:
         else:
             time_stamp = datetime.now().strftime("%H:%M:%S")
 
+        # Get Kelly reservation prices (c*) from portfolio
+        kelly_yes_prices = {}
+        kelly_no_prices = {}
+        if self.kelly_bot and self.kelly_bot.portfolio:
+            try:
+                yes_prices, no_prices = self.kelly_bot.portfolio.get_reservation_prices(
+                    self.kelly_config.w_floor
+                )
+                for bin_idx in range(len(yes_prices)):
+                    kelly_yes_prices[bin_idx] = yes_prices[bin_idx]
+                    kelly_no_prices[bin_idx] = no_prices[bin_idx]
+            except Exception as e:
+                logger.debug(f"Could not get Kelly c* prices: {e}")
+
         # Header with context
         logger.info("")
-        logger.info("=" * 82)
+        logger.info("=" * 120)
         logger.info(f"  Event: {event_name}  |  Count: {current_count}  |  Time Left: {time_str}  |  Forecast @{time_stamp}")
         logger.info(f"  Forecast: {forecast_str}{std_str}")
         logger.info(f"  Bins: {num_live} live, {num_dead} dead  |  Edge: r={edge_config.required_roi:.0%}, c_mid={edge_config.friction_mid:.0%}, c_tail={edge_config.friction_tail:.0%}")
-        logger.info("-" * 82)
-        logger.info(f"{'Bin':<4} {'Range':<9} {'Fair':>6} {'Y.Ask':>6} {'Y.Thr':>6} {'N.Ask':>6} {'N.Thr':>6} {'Signal':>8}")
-        logger.info("-" * 82)
+        logger.info("-" * 120)
+        logger.info(f"{'Bin':<4} {'Range':<9} {'Model':>6} {'c*_Y':>6} {'Y.Ask':>6} {'Y.Thr':>6} {'c*_N':>6} {'N.Ask':>6} {'N.Thr':>6} {'Y.Pos':>7} {'N.Pos':>7} {'Signal':>8}")
+        logger.info("-" * 120)
 
         for bin_idx, (lower, upper) in enumerate(self._market_bins):
             if bin_idx in dead_bins:
                 continue  # Skip dead bins
 
-            # Get forecast probability
-            forecast_prob = probabilities[bin_idx] if bin_idx < len(probabilities) else 0.0
+            # Get model probability
+            model_prob = probabilities[bin_idx] if bin_idx < len(probabilities) else 0.0
+
+            # Get Kelly reservation prices (c*)
+            kelly_yes = kelly_yes_prices.get(bin_idx, model_prob)
+            kelly_no = kelly_no_prices.get(bin_idx, 1.0 - model_prob)
 
             # Get orderbook for this bin
             token_id = self.kelly_bot.bin_token_ids.get(bin_idx)
@@ -829,12 +887,11 @@ class GASKellyTradingBot:
             else:
                 range_str = f"{lower}-{upper}"
 
-            # Calculate thresholds using stake-based ROI model
-            # Y.Thr: max YES price to pay for BUY_YES
-            yes_threshold = compute_buy_yes_threshold(forecast_prob, edge_config)
-            # N.Thr: max NO price to pay for BUY_NO (same formula, using NO fair value)
-            no_fair_value = 1.0 - forecast_prob
-            no_threshold = compute_buy_yes_threshold(no_fair_value, edge_config)
+            # Calculate thresholds using Kelly c* (matches actual trading logic)
+            # Y.Thr: max YES price to pay for BUY_YES (based on Kelly c*_YES)
+            yes_threshold = compute_buy_yes_threshold(kelly_yes, edge_config)
+            # N.Thr: max NO price to pay for BUY_NO (based on Kelly c*_NO)
+            no_threshold = compute_buy_yes_threshold(kelly_no, edge_config)
 
             # Determine signal: trade if market ask <= threshold
             signal = ""
@@ -843,25 +900,39 @@ class GASKellyTradingBot:
             elif yes_ask is not None and yes_ask <= yes_threshold:
                 signal = "BUY_YES"
 
+            # Get current positions for this bin
+            yes_pos = 0.0
+            no_pos = 0.0
+            if self.kelly_bot and self.kelly_bot.portfolio:
+                position = self.kelly_bot.portfolio.get_position(bin_idx)
+                if position:
+                    yes_pos = position.yes_shares
+                    no_pos = position.no_shares
+
             # Format output - all prices as percentages
+            kelly_yes_str = f"{kelly_yes * 100:5.1f}%"
+            kelly_no_str = f"{kelly_no * 100:5.1f}%"
             yes_ask_str = f"{yes_ask * 100:5.1f}%" if yes_ask is not None else "  N/A "
             yes_thr_str = f"{yes_threshold * 100:5.1f}%"
             no_ask_str = f"{no_ask * 100:5.1f}%" if no_ask is not None else "  N/A "
             no_thr_str = f"{no_threshold * 100:5.1f}%"
+            yes_pos_str = f"{yes_pos:6.0f}" if yes_pos > 0 else "     -"
+            no_pos_str = f"{no_pos:6.0f}" if no_pos > 0 else "     -"
 
             logger.info(
-                f"{bin_idx:<4} {range_str:<9} {forecast_prob:>5.1%} "
-                f"{yes_ask_str:>6} {yes_thr_str:>6} "
-                f"{no_ask_str:>6} {no_thr_str:>6} {signal:>8}"
+                f"{bin_idx:<4} {range_str:<9} {model_prob:>5.1%} "
+                f"{kelly_yes_str:>6} {yes_ask_str:>6} {yes_thr_str:>6} "
+                f"{kelly_no_str:>6} {no_ask_str:>6} {no_thr_str:>6} "
+                f"{yes_pos_str:>7} {no_pos_str:>7} {signal:>8}"
             )
 
-        logger.info("-" * 82)
+        logger.info("-" * 120)
 
         # Log portfolio summary
         summary = self.kelly_bot.get_portfolio_summary()
         logger.info(
             f"  Portfolio: capital=${summary.get('capital', 0):.2f}, "
-            f"collateral=${summary.get('total_collateral', 0):.2f}"
+            f"invested=${summary.get('total_collateral', 0):.2f}"
         )
         logger.info("")
 

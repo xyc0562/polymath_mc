@@ -231,6 +231,8 @@ class UserStreamClient:
 
     async def _connect_and_listen(self) -> None:
         """Connect to WebSocket and listen for events."""
+        logger.info(f"[UserWS] Connecting to {USER_WS_URL}...")
+
         async with websockets.connect(
             USER_WS_URL,
             open_timeout=20,  # Allow more time for initial handshake
@@ -243,7 +245,7 @@ class UserStreamClient:
             self._message_count = 0
             self._fill_count = 0
 
-            logger.info("Connected to Polymarket User WebSocket")
+            logger.info("[UserWS] Connected to Polymarket User WebSocket")
 
             if self.on_connected:
                 self.on_connected()
@@ -254,6 +256,7 @@ class UserStreamClient:
                 "type": "user",
                 "auth": self._generate_auth_object(),
             })
+            logger.info("[UserWS] Sending subscription message...")
             await ws.send(subscribe_msg)
 
             # Listen for messages
@@ -296,11 +299,11 @@ class UserStreamClient:
         elif event_type == "order":
             await self._handle_order_event(data)
         elif data.get("type") == "subscribed":
-            logger.info("Subscribed to user channel")
+            logger.info("[UserWS] Subscription CONFIRMED - ready to receive fill events")
         elif data.get("type") == "pong":
             pass  # Heartbeat response
         else:
-            logger.debug(f"Unknown event: {data}")
+            logger.debug(f"[UserWS] Unknown event: {data}")
 
     async def _handle_trade_event(self, data: Dict[str, Any]) -> None:
         """Handle trade fill event."""
@@ -318,17 +321,30 @@ class UserStreamClient:
                 timestamp=datetime.utcnow(),
             )
 
+            # Log prominently so fills are visible in logs
             logger.info(
-                f"Trade fill: order={order_id[:16] if order_id else 'N/A'}..., "
+                f"[FILL RECEIVED] order={order_id[:16] if order_id else 'N/A'}..., "
                 f"side={fill.side}, size={fill.size:.2f} @ {fill.price:.4f}, "
-                f"status={fill.status.value}"
+                f"status={fill.status.value}, token={fill.token_id[:16] if fill.token_id else 'N/A'}..."
             )
 
             # Update pending order
+            # NOTE: Same fill may arrive multiple times with different statuses (MATCHED -> MINED -> CONFIRMED)
+            # Each callback reports the SAME fill.size, not incremental, so we must not double-count
             async with self._pending_lock:
                 if order_id and order_id in self._pending_orders:
                     pending = self._pending_orders[order_id]
-                    pending.filled_size += fill.size
+
+                    # Only add to filled_size on first fill callback (MATCHED)
+                    # Subsequent callbacks (MINED, CONFIRMED) are status updates only
+                    if pending.status == OrderStatus.PENDING or pending.filled_size == 0:
+                        # First fill notification - add the size
+                        pending.filled_size = fill.size  # Use SET not ADD to be safe
+                        logger.debug(f"First fill for order {order_id[:16]}...: {fill.size:.2f} shares")
+                    else:
+                        # Status update only - already counted this fill
+                        logger.debug(f"Status update for order {order_id[:16]}...: {pending.status.value} -> {fill.status.value}")
+
                     pending.status = fill.status
 
                     # Remove if fully filled or terminal status
@@ -339,10 +355,16 @@ class UserStreamClient:
             # Callback
             if self.on_fill:
                 self._fill_count += 1
+                logger.debug(f"[FILL ROUTING] Invoking on_fill callback for order {order_id[:16] if order_id else 'N/A'}...")
                 self.on_fill(fill)
+            else:
+                logger.warning(
+                    f"[FILL DROPPED] No on_fill callback set! Fill for order {order_id[:16] if order_id else 'N/A'}... "
+                    f"will not be processed. This indicates a configuration issue."
+                )
 
         except Exception as e:
-            logger.error(f"Error handling trade event: {e}")
+            logger.error(f"Error handling trade event: {e}", exc_info=True)
 
     async def _handle_order_event(self, data: Dict[str, Any]) -> None:
         """Handle order update event."""
@@ -441,8 +463,8 @@ class UserStreamClient:
                 else:
                     last_msg_str = "none"
 
-                # Connection status
-                connected = self._ws is not None and not self._ws.closed
+                # Connection status (use getattr for compatibility with different websocket libs)
+                connected = self._ws is not None and not getattr(self._ws, 'closed', True)
 
                 # Pending orders
                 pending_count = len(self._pending_orders)
@@ -488,3 +510,54 @@ class UserStreamClient:
                 remaining = order.size - order.filled_size
                 total += order.price * remaining
         return total
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """
+        Get detailed connection status for debugging.
+
+        Returns dict with:
+        - connected: bool, whether WebSocket is connected
+        - connected_at: datetime or None
+        - uptime_seconds: float, seconds since connection
+        - last_message_at: datetime or None
+        - last_message_age_seconds: float, seconds since last message
+        - message_count: int, total messages received
+        - fill_count: int, total fills received
+        - pending_orders: int, number of pending orders
+        - on_fill_callback_set: bool, whether callback is configured
+        """
+        now = datetime.now()
+        connected = self._ws is not None and not getattr(self._ws, 'closed', True)
+
+        uptime_seconds = 0.0
+        if self._connected_at:
+            uptime_seconds = (now - self._connected_at).total_seconds()
+
+        last_message_age = float('inf')
+        if self._last_message_at:
+            last_message_age = (now - self._last_message_at).total_seconds()
+
+        return {
+            "connected": connected,
+            "connected_at": self._connected_at.isoformat() if self._connected_at else None,
+            "uptime_seconds": round(uptime_seconds, 1),
+            "last_message_at": self._last_message_at.isoformat() if self._last_message_at else None,
+            "last_message_age_seconds": round(last_message_age, 1) if last_message_age != float('inf') else None,
+            "message_count": self._message_count,
+            "fill_count": self._fill_count,
+            "pending_orders": len(self._pending_orders),
+            "on_fill_callback_set": self.on_fill is not None,
+        }
+
+    def log_connection_status(self) -> None:
+        """Log current connection status for debugging."""
+        status = self.get_connection_status()
+        logger.info(
+            f"[UserWS STATUS] connected={status['connected']}, "
+            f"uptime={status['uptime_seconds']}s, "
+            f"msgs={status['message_count']}, "
+            f"fills={status['fill_count']}, "
+            f"pending={status['pending_orders']}, "
+            f"callback_set={status['on_fill_callback_set']}, "
+            f"last_msg_age={status['last_message_age_seconds']}s"
+        )

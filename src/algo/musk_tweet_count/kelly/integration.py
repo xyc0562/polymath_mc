@@ -59,6 +59,7 @@ class KellyTradingBot:
         api_passphrase: Optional[str] = None,
         external_user_stream: Optional[UserStreamClient] = None,
         disable_websocket: bool = False,
+        event_name: Optional[str] = None,
     ):
         """
         Initialize Kelly trading bot.
@@ -77,8 +78,10 @@ class KellyTradingBot:
                                  If provided, uses this instead of creating our own.
                                  Fill events are routed to this bot via handle_fill().
             disable_websocket: If True, disable orderbook WebSocket (use REST polling)
+            event_name: Optional event name for logging (e.g., "Feb 03 - Feb 10")
         """
         self._external_user_stream = external_user_stream
+        self.event_name = event_name or "unknown"
         self._owns_user_stream = False  # Will be set in setup()
         self._disable_websocket = disable_websocket
         self.clob_client = clob_client
@@ -129,7 +132,8 @@ class KellyTradingBot:
         # Store bin metadata
         self.num_bins = len(bins)
         self.bin_upper_bounds = [b["upper_bound"] for b in bins]
-        self.bin_token_ids = {i: b["token_id"] for i, b in enumerate(bins)}
+        self.bin_token_ids = {i: b["token_id"] for i, b in enumerate(bins)}  # YES token IDs
+        self.bin_no_token_ids = {i: b.get("no_token_id") for i, b in enumerate(bins)}  # NO token IDs
 
         # Initialize portfolio
         self.portfolio = Portfolio(
@@ -184,15 +188,19 @@ class KellyTradingBot:
             if not self.dry_run:
                 logger.warning("No API credentials for user stream - fill confirmations disabled")
 
-        # Initialize Kelly executor
+        # Initialize Kelly executor with sync callback
+        # The sync callback fetches official portfolio state from API before each decision
         self.kelly_executor = KellyExecutor(
             config=self.config,
             portfolio=self.portfolio,
             orderbook_manager=self.orderbook_manager,
             order_executor=self.order_executor,
             token_ids=self.bin_token_ids,
+            no_token_ids=self.bin_no_token_ids,
             on_trade=self._on_trade,
             user_stream=self.user_stream,
+            sync_portfolio=self._create_sync_callback(),
+            event_name=self.event_name,
         )
 
         # Wire up user stream callbacks
@@ -222,6 +230,21 @@ class KellyTradingBot:
             await self.orderbook_manager.stop()
 
         self._setup_complete = False
+
+    def _create_sync_callback(self):
+        """
+        Create a callback function that syncs portfolio from API.
+
+        This callback is called by the executor BEFORE each Kelly decision
+        to ensure we have official state, not calculated estimates.
+        """
+        async def sync_callback():
+            if self.wallet_address and not self.dry_run:
+                await self.sync_positions_from_api(self.wallet_address)
+            else:
+                logger.debug("Skipping API sync (dry_run or no wallet)")
+
+        return sync_callback
 
     def _on_trade(self, result: ExecutionResult) -> None:
         """Callback for order placement (not fill)."""
@@ -303,6 +326,7 @@ class KellyTradingBot:
         sync_before_trade: bool = True,
         forecast_mean: float = 0,
         forecast_std: float = 0,
+        verbose: bool = False,
     ) -> TickResult:
         """
         Run a single optimization tick.
@@ -319,6 +343,7 @@ class KellyTradingBot:
             sync_before_trade: If True, sync from API before trading (default True)
             forecast_mean: Forecast mean for trade logging (optional)
             forecast_std: Forecast std for trade logging (optional)
+            verbose: If True, log detailed rejection reasons for candidates
 
         Returns:
             TickResult with execution summary
@@ -338,12 +363,9 @@ class KellyTradingBot:
             )
 
         async with self._tick_lock:
-            # Sync portfolio from API before trading (per user request: always sync before trade)
-            if sync_before_trade and self.wallet_address and not self.dry_run:
-                try:
-                    await self.sync_positions_from_api(self.wallet_address)
-                except Exception as e:
-                    logger.warning(f"Failed to sync from API before trade: {e}")
+            # NOTE: Portfolio sync is now handled by the executor BEFORE EACH order decision
+            # The executor calls sync_portfolio callback before each generate_candidates() call
+            # This ensures we always use official API data, not calculated estimates
 
             # Update probabilities (this also identifies dead bins)
             self.update_probabilities(current_count, hours_elapsed, hours_to_settlement)
@@ -383,7 +405,7 @@ class KellyTradingBot:
             )
 
             # Run Kelly optimization tick
-            result = await self.kelly_executor.run_tick(hours_to_settlement)
+            result = await self.kelly_executor.run_tick(hours_to_settlement, verbose=verbose)
 
             return result
 
@@ -492,7 +514,7 @@ class KellyTradingBot:
             return [], []
         return self.portfolio.get_reservation_prices(self.config.w_floor)
 
-    async def fetch_positions_from_api(self, wallet_address: str) -> Dict[str, float]:
+    async def fetch_positions_from_api(self, wallet_address: str) -> Dict[str, dict]:
         """
         Fetch current positions from Polymarket Data API.
 
@@ -500,7 +522,7 @@ class KellyTradingBot:
             wallet_address: The wallet address to fetch positions for
 
         Returns:
-            Dict mapping token_id -> shares held
+            Dict mapping token_id -> {shares, avg_price, value}
         """
         try:
             response = requests.get(
@@ -511,19 +533,53 @@ class KellyTradingBot:
             response.raise_for_status()
             positions_data = response.json()
 
-            # Parse positions: token_id -> shares
+            # Parse positions: token_id -> {shares, avg_price, value}
+            # Handle different response formats
             positions = {}
-            for pos in positions_data:
-                token_id = pos.get("asset", {}).get("id") or pos.get("token_id")
-                size = float(pos.get("size", 0))
-                if token_id and size > 0:
-                    positions[token_id] = size
 
-            logger.info(f"Fetched {len(positions)} positions from Polymarket API")
+            def parse_position(pos: dict) -> tuple:
+                """Parse position dict, returns (token_id, pos_info) or (None, None)."""
+                asset = pos.get("asset")
+                if isinstance(asset, str):
+                    token_id = asset
+                elif isinstance(asset, dict):
+                    token_id = asset.get("id")
+                else:
+                    token_id = pos.get("token_id") or pos.get("asset_id")
+
+                size = float(pos.get("size", 0))
+                if not token_id or size <= 0:
+                    return None, None
+
+                avg_price = float(pos.get("avgPrice", 0))
+                initial_value = float(pos.get("initialValue", 0))
+                value = initial_value if initial_value > 0 else (size * avg_price)
+
+                return token_id, {
+                    "shares": size,
+                    "avg_price": avg_price,
+                    "value": value,
+                }
+
+            if isinstance(positions_data, list):
+                for pos in positions_data:
+                    if isinstance(pos, dict):
+                        token_id, pos_info = parse_position(pos)
+                        if token_id:
+                            positions[token_id] = pos_info
+            elif isinstance(positions_data, dict):
+                pos_list = positions_data.get("positions", positions_data.get("data", []))
+                for pos in pos_list:
+                    if isinstance(pos, dict):
+                        token_id, pos_info = parse_position(pos)
+                        if token_id:
+                            positions[token_id] = pos_info
+
+            logger.debug(f"Fetched {len(positions)} positions from Polymarket API")
             return positions
 
         except Exception as e:
-            logger.warning(f"Failed to fetch positions from API: {e}")
+            logger.warning(f"Failed to fetch positions from API: {e}", exc_info=True)
             return {}
 
     async def fetch_usdc_balance(self) -> float:
@@ -541,7 +597,7 @@ class KellyTradingBot:
             balance_info = self.clob_client.get_balance_allowance(params)
             # USDC has 6 decimals, so divide by 1e6
             usdc_balance = float(balance_info.get("balance", 0)) / 1e6
-            logger.info(f"Fetched USDC balance: ${usdc_balance:.2f}")
+            logger.debug(f"Fetched USDC balance: ${usdc_balance:.2f}")
             return usdc_balance
         except Exception as e:
             logger.warning(f"Failed to fetch USDC balance: {e}")
@@ -551,8 +607,12 @@ class KellyTradingBot:
         """
         Sync portfolio state from Polymarket API.
 
-        Fetches current positions and USDC balance, then updates the portfolio
-        to match the on-chain state. Use this on startup to recover state after restart.
+        IMPORTANT: The Data API has significant latency (seconds to minutes).
+        WebSocket fills provide real-time updates and are the primary source
+        of truth during active trading. This API sync:
+        - Updates from API only if API shows MORE shares than local
+        - Never clears local state (would lose fill-based updates)
+        - Is used primarily for initial state loading and reconciliation
 
         Args:
             wallet_address: The wallet address to sync positions for
@@ -567,62 +627,123 @@ class KellyTradingBot:
         api_positions = await self.fetch_positions_from_api(wallet_address)
         usdc_balance = await self.fetch_usdc_balance()
 
-        # Map token_ids back to bin indices
-        token_to_bin = {token_id: bin_idx for bin_idx, token_id in self.bin_token_ids.items()}
+        # Map token_ids back to bin indices (both YES and NO tokens)
+        token_to_bin = {}
+        token_is_no = {}  # Track which tokens are NO tokens
+        for bin_idx, token_id in self.bin_token_ids.items():
+            token_to_bin[token_id] = bin_idx
+            token_is_no[token_id] = False
+        for bin_idx, token_id in self.bin_no_token_ids.items():
+            if token_id:
+                token_to_bin[token_id] = bin_idx
+                token_is_no[token_id] = True
 
-        # Identify which positions we have and need orderbooks for
-        positions_to_sync = []
-        for token_id, shares in api_positions.items():
+        # IMPORTANT: Trust the API as the source of truth for positions.
+        # This handles manual trades, position closures, and ensures consistency.
+        # The API has some latency, but it's the authoritative source.
+
+        # First, collect all bin indices we're tracking
+        tracked_bins = set(self.bin_token_ids.keys())
+
+        # Identify which positions API reports
+        api_bin_positions = {}  # bin_idx -> (pos_info, is_no)
+        for token_id, pos_info in api_positions.items():
             bin_idx = token_to_bin.get(token_id)
             if bin_idx is not None:
-                positions_to_sync.append((token_id, bin_idx, shares))
+                is_no = token_is_no.get(token_id, False)
+                api_bin_positions[(bin_idx, is_no)] = pos_info
 
-        # Fetch orderbooks for all positions before computing values
-        if self.orderbook_manager and positions_to_sync:
-            logger.info(f"Fetching orderbooks for {len(positions_to_sync)} positions...")
-            for token_id, bin_idx, _ in positions_to_sync:
-                if not self.orderbook_manager.get_orderbook(token_id):
-                    try:
-                        await self.orderbook_manager.fetch_orderbook(token_id, bin_idx)
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch orderbook for bin {bin_idx}: {e}")
-
-        # Update portfolio positions with fetched orderbook prices
+        # Update positions from API - API is the source of truth
         synced_positions = {}
-        total_position_value = 0.0
 
-        for token_id, bin_idx, shares in positions_to_sync:
-            synced_positions[bin_idx] = shares
+        # First, handle positions that API reports
+        for (bin_idx, is_no), pos_info in api_bin_positions.items():
+            api_shares = pos_info["shares"]
+            api_avg_price = pos_info["avg_price"]
 
-            # Get current price from orderbook (should be available now)
-            orderbook = self.orderbook_manager.get_orderbook(token_id) if self.orderbook_manager else None
-            if orderbook and orderbook.best_yes_bid:
-                position_value = shares * orderbook.best_yes_bid
-                price_used = orderbook.best_yes_bid
-                price_source = "orderbook"
-            else:
-                # No orderbook = value position at 0 (conservative)
-                position_value = 0.0
-                price_used = 0.0
-                price_source = "no_orderbook"
-                logger.warning(f"Bin {bin_idx}: no orderbook available, valuing at $0")
-            total_position_value += position_value
+            yes_token = self.bin_token_ids.get(bin_idx)
+            pos = self.portfolio.ensure_position(bin_idx, yes_token or "")
 
-            # Update portfolio position
-            pos = self.portfolio.ensure_position(bin_idx, token_id)
-            pos.yes_shares = shares
-            pos.yes_avg_cost = price_used
-            pos.collateral_used = shares * price_used
+            local_shares = pos.no_shares if is_no else pos.yes_shares
+            price_used = api_avg_price if api_avg_price > 0 else 0.5
 
-            logger.info(f"Synced bin {bin_idx}: {shares:.2f} shares @ {price_used:.4f} ({price_source})")
+            # Update to API value if different
+            if abs(api_shares - local_shares) > 0.01:
+                if is_no:
+                    pos.no_shares = api_shares
+                    pos.no_avg_cost = price_used
+                    # Recalculate collateral as sum of YES + NO collateral
+                    pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
+                    logger.info(f"API sync: bin {bin_idx} NO updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
+                else:
+                    pos.yes_shares = api_shares
+                    pos.yes_avg_cost = price_used
+                    # Recalculate collateral as sum of YES + NO collateral
+                    pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
+                    logger.info(f"API sync: bin {bin_idx} YES updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
 
-        # Update portfolio capital
-        self.portfolio.capital = usdc_balance + total_position_value
-        self.portfolio.initial_capital = self.portfolio.capital
+            synced_positions[bin_idx] = api_shares
 
+        # Second, clear positions that API doesn't report (they were sold/closed)
+        for bin_idx in tracked_bins:
+            pos = self.portfolio.positions.get(bin_idx)
+            if not pos:
+                continue
+
+            # Check YES position - if API doesn't have it and we do, clear it
+            if pos.yes_shares > 0.01 and (bin_idx, False) not in api_bin_positions:
+                logger.info(f"API sync: bin {bin_idx} YES cleared {pos.yes_shares:.2f} -> 0 (position closed)")
+                pos.yes_shares = 0
+                pos.yes_avg_cost = 0
+                # Recalculate collateral (only NO remains if any)
+                pos.collateral_used = pos.no_shares * pos.no_avg_cost
+
+            # Check NO position - if API doesn't have it and we do, clear it
+            if pos.no_shares > 0.01 and (bin_idx, True) not in api_bin_positions:
+                logger.info(f"API sync: bin {bin_idx} NO cleared {pos.no_shares:.2f} -> 0 (position closed)")
+                pos.no_shares = 0
+                pos.no_avg_cost = 0
+                # Recalculate collateral (only YES remains if any)
+                pos.collateral_used = pos.yes_shares * pos.yes_avg_cost
+
+        # IMPORTANT: Use event capital budget (c_event_max), NOT wallet USDC balance
+        # In multi-event scenarios, each event has its own capital allocation.
+        # The wallet USDC balance is shared across all events and is NOT this event's capital.
+        #
+        # Event capital model:
+        #   event_budget = c_event_max (maximum capital for this event)
+        #   capital = event_budget - collateral_used (available for new trades)
+        #   total_value = capital + collateral_used = event_budget (constant)
+        #
+        # This ensures Kelly utility calculations use the correct capital base.
+        event_budget = self.config.collateral.c_event_max
+        total_collateral = self.portfolio.total_collateral_used
+
+        if event_budget > 0:
+            # Compute available capital as event budget minus collateral in use
+            available_capital = max(0.0, event_budget - total_collateral)
+            old_capital = self.portfolio.capital
+            self.portfolio.capital = available_capital
+            logger.info(
+                f"[{self.event_name}] Event capital: budget=${event_budget:.2f}, invested=${total_collateral:.2f}, "
+                f"available=${available_capital:.2f} (was ${old_capital:.2f})"
+            )
+        else:
+            # Fallback if c_event_max not set: use USDC balance (legacy behavior)
+            local_capital = self.portfolio.capital
+            if abs(usdc_balance - local_capital) > 1.0:
+                logger.warning(
+                    f"Capital mismatch (no event budget): local=${local_capital:.2f}, "
+                    f"API USDC=${usdc_balance:.2f}. Using API value."
+                )
+                self.portfolio.capital = usdc_balance
+
+        # Log current state (use info level for visibility)
+        num_positions = len([p for p in self.portfolio.positions.values()
+                            if p.yes_shares > 0 or p.no_shares > 0])
         logger.info(
-            f"Portfolio synced: ${usdc_balance:.2f} USDC + ${total_position_value:.2f} positions = "
-            f"${self.portfolio.capital:.2f} total"
+            f"[{self.event_name}] Portfolio synced: {num_positions} positions, "
+            f"invested=${total_collateral:.2f}, capital=${self.portfolio.capital:.2f}"
         )
 
         return usdc_balance, synced_positions

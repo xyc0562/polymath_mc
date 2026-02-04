@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .runner import BacktestRunner, BacktestConfig, BacktestResult
-from ..kelly.config import EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
 import sys
@@ -355,10 +355,10 @@ def main():
     )
 
     parser.add_argument(
-        "--tau",
+        "--min-utility",
         type=float,
-        default=0.001,
-        help="Minimum utility gain threshold. Default: 0.001",
+        default=0.0001,
+        help="Minimum utility gain threshold. Default: 0.0001",
     )
 
     parser.add_argument(
@@ -391,12 +391,14 @@ def main():
              "Recommended: 0.15-0.20 based on backtest analysis. Default: 0 (disabled)",
     )
 
+    # Default from AdaptiveDeltaConfig
+    _adaptive_defaults = AdaptiveDeltaConfig()
     parser.add_argument(
-        "--base-delta",
+        "--base-delta-usd",
         type=float,
-        default=10.0,
-        help="Base trade size before kappa multiplier. Default: 10. "
-             "For faster backtests with fewer trades, use 100-1000.",
+        default=_adaptive_defaults.base_delta_usd,
+        help=f"Base trade size in USD before kappa multiplier. Default: ${_adaptive_defaults.base_delta_usd}. "
+             "For faster backtests with fewer trades, use $50-100.",
     )
 
     parser.add_argument(
@@ -445,49 +447,49 @@ def main():
             return
 
     # Apply --quick mode overrides
-    base_delta = args.base_delta
+    base_delta_usd = args.base_delta_usd
     max_orders = args.max_orders
     if args.quick:
-        base_delta = 200.0  # Larger trades
+        base_delta_usd = 50.0  # Larger trades ($50 per trade)
         max_orders = 5  # Fewer orders per tick
-        logger.info("Quick mode: base_delta=200, max_orders=5")
+        logger.info("Quick mode: base_delta_usd=$50, max_orders=5")
 
     # Choose between unified and legacy runners
     if args.unified:
         # Use unified runner with production Kelly logic
         from .unified_runner import UnifiedBacktestRunner, UnifiedBacktestConfig
 
-        edge_buffer = EdgeBufferConfig(
-            required_roi=args.roi,
-            friction_mid=0.015,
-            friction_tail=0.03,
-            tail_threshold=0.09,
-            min_perceived_prob=args.min_perceived_prob,
-            min_market_price=args.min_market_price,
-        )
-
-        adaptive_delta = AdaptiveDeltaConfig(
-            base_delta=base_delta,
-            max_depth_fraction=0.10,
-            min_delta=1.0,
-        )
-
-        rate_limit = RateLimitConfig(
-            max_orders_per_tick=max_orders,
-            min_order_delay_seconds=0.0,
-            max_orders_per_minute=1000,
+        # Build KellyConfig with CLI overrides
+        trading_config = KellyConfig(
+            kappa=args.kappa,
+            min_utility=args.min_utility,
+            t_stop_hours=args.t_stop,
+            edge_buffer=EdgeBufferConfig(
+                required_roi=args.roi,
+                friction_mid=0.015,
+                friction_tail=0.03,
+                tail_threshold=0.09,
+                min_perceived_prob=args.min_perceived_prob,
+                min_market_price=args.min_market_price,
+            ),
+            adaptive_delta=AdaptiveDeltaConfig(
+                base_delta_usd=base_delta_usd,
+                max_depth_fraction=0.10,
+                min_delta_usd=1.0,
+            ),
+            rate_limit=RateLimitConfig(
+                max_orders_per_tick=max_orders,
+                min_order_delay_seconds=0.0,
+                max_orders_per_minute=1000,
+            ),
+            max_iters_per_tick=50,
         )
 
         unified_config = UnifiedBacktestConfig(
             initial_capital=args.capital,
             spread=args.spread,
             slippage=args.slippage,
-            kappa=args.kappa,
-            tau=args.tau,
-            t_stop_hours=args.t_stop,
-            edge_buffer=edge_buffer,
-            adaptive_delta=adaptive_delta,
-            rate_limit=rate_limit,
+            trading=trading_config,
             exit_hours_before_settlement=args.exit_hours,
             verbose=args.trade_verbose,
         )

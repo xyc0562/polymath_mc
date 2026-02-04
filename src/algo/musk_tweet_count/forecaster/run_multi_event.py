@@ -141,12 +141,43 @@ def create_clob_client() -> ClobClient:
         return ClobClient(host, key=private_key, chain_id=chain_id, creds=creds)
 
 
+def get_wallet_address_for_positions() -> str:
+    """
+    Get wallet address for position queries.
+
+    IMPORTANT: When using a proxy wallet (signature_type=1 or 2),
+    positions are held by the PROXY wallet (POLY_FUNDER), not the main wallet.
+    This is because trades are executed through the proxy.
+
+    Returns:
+        Wallet address that holds positions (proxy if configured, else main wallet)
+    """
+    # Check if proxy wallet is configured
+    funder = os.getenv("POLY_FUNDER")
+    signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+
+    if funder and signature_type in (1, 2):
+        # Proxy wallet holds the positions
+        logger.debug(f"Using proxy wallet for position queries: {funder}")
+        return funder
+
+    # No proxy - use main wallet
+    wallet = os.getenv("WALLET_ADDRESS")
+    if wallet:
+        return wallet
+
+    raise ValueError(
+        "No wallet address configured. "
+        "Set WALLET_ADDRESS or POLY_FUNDER (for proxy wallets)."
+    )
+
+
 def get_wallet_address(clob_client: ClobClient) -> str:
     """
-    Get wallet address from CLOB client.
+    Get wallet address from CLOB client (for signing).
 
-    Derives the address from the client's signer (private key).
-    Falls back to WALLET_ADDRESS env var if client method fails.
+    NOTE: For position queries, use get_wallet_address_for_positions() instead,
+    as positions may be held by a proxy wallet.
     """
     try:
         # Derive from CLOB client's signer
@@ -318,7 +349,7 @@ async def discover_musk_tweet_events(clob_client: ClobClient) -> List[EventInfo]
 
             lower, upper = parse_bin_bounds(outcome)
 
-            # Get token ID
+            # Get token IDs (index 0 = YES, index 1 = NO)
             clob_token_ids = market.get("clobTokenIds", [])
             if isinstance(clob_token_ids, str):
                 try:
@@ -326,13 +357,15 @@ async def discover_musk_tweet_events(clob_client: ClobClient) -> List[EventInfo]
                 except json.JSONDecodeError:
                     clob_token_ids = []
 
-            yes_token_id = clob_token_ids[0] if clob_token_ids else None
+            yes_token_id = clob_token_ids[0] if len(clob_token_ids) > 0 else None
+            no_token_id = clob_token_ids[1] if len(clob_token_ids) > 1 else None
 
             if yes_token_id:
                 bins.append({
                     "lower_bound": lower,
                     "upper_bound": upper,
                     "token_id": yes_token_id,
+                    "no_token_id": no_token_id,
                     "outcome": outcome,
                     "condition_id": market.get("conditionId"),
                 })
@@ -409,7 +442,7 @@ async def fetch_event_details(
 
         lower, upper = parse_bin_bounds(outcome)
 
-        # Get token ID
+        # Get token IDs (index 0 = YES, index 1 = NO)
         clob_token_ids = market.get("clobTokenIds", [])
         if isinstance(clob_token_ids, str):
             try:
@@ -417,13 +450,15 @@ async def fetch_event_details(
             except json.JSONDecodeError:
                 clob_token_ids = []
 
-        yes_token_id = clob_token_ids[0] if clob_token_ids else None
+        yes_token_id = clob_token_ids[0] if len(clob_token_ids) > 0 else None
+        no_token_id = clob_token_ids[1] if len(clob_token_ids) > 1 else None
 
         if yes_token_id:
             bins.append({
                 "lower_bound": lower,
                 "upper_bound": upper,
                 "token_id": yes_token_id,
+                "no_token_id": no_token_id,
                 "outcome": outcome,
                 "condition_id": market.get("conditionId"),
             })
@@ -499,6 +534,14 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Event IDs to trade (comma-separated) or 'auto' for discovery",
     )
+    parser.add_argument(
+        "--max-duration-days",
+        type=float,
+        default=0.0,
+        help="Trading window threshold in days (default: 0 = no limit). "
+             "For events longer than this, wait until remaining time < threshold. "
+             "E.g., 7 = for >7-day events, start trading when T-168h remaining",
+    )
 
     # Kelly configuration
     parser.add_argument(
@@ -513,19 +556,38 @@ def parse_args() -> argparse.Namespace:
         default=0.10,
         help="Required ROI for edge buffer (default: 0.10)",
     )
-
-    # Chunk sizing
     parser.add_argument(
-        "--base-delta",
+        "--min-prob",
         type=float,
-        default=10.0,
-        help="Base chunk size in shares per order (default: 10.0)",
+        default=0.05,
+        help="Minimum model probability to trade a bin (default: 0.05 = 5%%)",
     )
     parser.add_argument(
-        "--min-delta",
+        "--min-market-price",
         type=float,
-        default=1.0,
-        help="Minimum chunk size in shares (default: 1.0)",
+        default=0.03,
+        help="Minimum market price to trade (default: 0.03 = 3%%)",
+    )
+    parser.add_argument(
+        "--min-utility",
+        type=float,
+        default=0.0001,
+        help="Minimum utility gain threshold (default: 0.0001)",
+    )
+
+    # Chunk sizing in USD (defaults from AdaptiveDeltaConfig)
+    _adaptive_defaults = AdaptiveDeltaConfig()
+    parser.add_argument(
+        "--base-delta-usd",
+        type=float,
+        default=_adaptive_defaults.base_delta_usd,
+        help=f"Base chunk size in USD per order (default: ${_adaptive_defaults.base_delta_usd})",
+    )
+    parser.add_argument(
+        "--min-delta-usd",
+        type=float,
+        default=_adaptive_defaults.min_delta_usd,
+        help=f"Minimum chunk size in USD (default: ${_adaptive_defaults.min_delta_usd})",
     )
 
     # Other
@@ -533,6 +595,11 @@ def parse_args() -> argparse.Namespace:
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
+    )
+    parser.add_argument(
+        "--list-events",
+        action="store_true",
+        help="List all active Musk tweet events with IDs and exit",
     )
 
     return parser.parse_args()
@@ -542,6 +609,47 @@ async def main() -> None:
     """Main entry point."""
     args = parse_args()
     setup_logging(args.verbose)
+
+    # Handle --list-events: list events and exit
+    if args.list_events:
+        # Need a minimal CLOB client just for API discovery
+        try:
+            clob_client = create_clob_client()
+        except Exception as e:
+            logger.error(f"Failed to create CLOB client: {e}")
+            sys.exit(1)
+
+        events = await discover_musk_tweet_events(clob_client)
+
+        if not events:
+            print("\nNo active Musk tweet events found.")
+            sys.exit(0)
+
+        print(f"\n{'='*80}")
+        print(f"Active Musk Tweet Events ({len(events)} found)")
+        print(f"{'='*80}\n")
+
+        for event in sorted(events, key=lambda e: e.settlement_date):
+            now = datetime.now(timezone.utc)
+            settlement_dt = datetime.combine(
+                event.settlement_date,
+                datetime.min.time().replace(hour=17),
+                tzinfo=timezone.utc,
+            )
+            hours_remaining = (settlement_dt - now).total_seconds() / 3600
+
+            print(f"Event ID: {event.event_id}")
+            print(f"  Title:      {event.title}")
+            print(f"  Short Name: {event.short_name}")
+            print(f"  Dates:      {event.market_start_date} to {event.settlement_date}")
+            print(f"  Hours Left: {hours_remaining:.1f}h")
+            print(f"  Bins:       {len(event.bins)}")
+            print()
+
+        print(f"{'='*80}")
+        print("Usage: --events <id1>,<id2>,... to trade specific events")
+        print(f"{'='*80}")
+        sys.exit(0)
 
     # Validate dry-run vs live
     if args.live and args.dry_run:
@@ -568,15 +676,18 @@ async def main() -> None:
         required_roi=args.required_roi,
         friction_mid=0.015,
         friction_tail=0.03,
+        min_perceived_prob=args.min_prob,
+        min_market_price=args.min_market_price,
     )
 
     adaptive_delta_config = AdaptiveDeltaConfig(
-        base_delta=args.base_delta,
-        min_delta=args.min_delta,
+        base_delta_usd=args.base_delta_usd,
+        min_delta_usd=args.min_delta_usd,
     )
 
     kelly_config = KellyConfig(
         kappa=args.kappa,
+        min_utility=args.min_utility,
         edge_buffer=edge_buffer_config,
         adaptive_delta=adaptive_delta_config,
     )
@@ -597,12 +708,14 @@ async def main() -> None:
         max_per_event=max_per_event,
         tick_interval_seconds=args.tick_interval,
         dry_run=dry_run,
+        max_event_duration_days=args.max_duration_days,
     )
 
-    # Get wallet address for position fetching (derived from CLOB client)
+    # Get wallet address for position fetching
+    # IMPORTANT: Use proxy wallet if configured (positions are held there)
     try:
-        wallet_address = get_wallet_address(clob_client)
-        logger.info(f"Using wallet address: {wallet_address}")
+        wallet_address = get_wallet_address_for_positions()
+        logger.info(f"Using wallet address for positions: {wallet_address}")
     except ValueError as e:
         logger.error(f"{e}")
         sys.exit(1)
