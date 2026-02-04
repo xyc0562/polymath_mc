@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class BacktestConfig:
-    """Configuration for backtest backend."""
+class SimulationConfig:
+    """Configuration for market simulation in backtests."""
 
     # Market simulation
     spread: float = 0.02  # 2% bid-ask spread
@@ -50,7 +50,7 @@ class BacktestOrderbookProvider(OrderbookProvider):
 
     def __init__(
         self,
-        config: BacktestConfig,
+        config: SimulationConfig,
         token_ids: Dict[int, str],  # bin_index -> token_id
     ):
         """
@@ -159,7 +159,7 @@ class BacktestTradeExecutor(TradeExecutor):
 
     def __init__(
         self,
-        config: BacktestConfig,
+        config: SimulationConfig,
         portfolio: Portfolio,
     ):
         """

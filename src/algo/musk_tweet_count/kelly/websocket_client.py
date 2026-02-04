@@ -11,13 +11,32 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .config import WebSocketConfig
 from .orderbook import UnifiedOrderbook, OrderbookLevel
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WebSocketConfig:
+    """Configuration for WebSocket orderbook streaming."""
+
+    # Enable WebSocket streaming (vs polling)
+    enabled: bool = True
+
+    # Delay between reconnection attempts
+    reconnect_delay_seconds: float = 5.0
+
+    # Heartbeat interval to keep connection alive
+    heartbeat_interval_seconds: float = 30.0
+
+    # WebSocket endpoint
+    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +105,7 @@ class OrderbookWebSocket:
         try:
             self._ws = await websockets.connect(
                 self.config.ws_url,
+                open_timeout=20,
                 ping_interval=self.config.heartbeat_interval_seconds,
                 ping_timeout=10,
             )
@@ -252,6 +272,7 @@ class OrderbookWebSocket:
 
                 self._ws = await websockets.connect(
                     self.config.ws_url,
+                    open_timeout=20,
                     ping_interval=self.config.heartbeat_interval_seconds,
                     ping_timeout=10,
                 )
@@ -526,5 +547,10 @@ class OrderbookManager:
             return orderbook
 
         except Exception as e:
-            logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
+            error_str = str(e)
+            # 404 means no orderbook exists - this is normal for settled/delisted bins
+            if "404" in error_str or "No orderbook exists" in error_str:
+                logger.debug(f"No orderbook for token {token_id[:16]}...")
+            else:
+                logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
             return None

@@ -132,6 +132,14 @@ class UserStreamClient:
         # Config
         self.stale_order_timeout_seconds: float = 30.0
         self.stale_order_check_interval: float = 5.0
+        self.heartbeat_interval_seconds: float = 300.0  # 5 minutes
+
+        # Heartbeat tracking
+        self._connected_at: Optional[datetime] = None
+        self._last_message_at: Optional[datetime] = None
+        self._message_count: int = 0
+        self._fill_count: int = 0
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     def _generate_auth_object(self) -> Dict[str, str]:
         """Generate authentication object for WebSocket subscription message."""
@@ -160,6 +168,12 @@ class UserStreamClient:
             name="stale_order_cleanup"
         )
 
+        # Start heartbeat task
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(),
+            name="user_stream_heartbeat"
+        )
+
         logger.info("User stream client started")
 
     async def stop(self) -> None:
@@ -180,6 +194,13 @@ class UserStreamClient:
             except asyncio.CancelledError:
                 pass
 
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -188,6 +209,9 @@ class UserStreamClient:
 
     async def _listen_loop(self) -> None:
         """Main WebSocket listen loop with reconnection."""
+        # Brief delay on first connection to avoid contention with orderbook WS
+        await asyncio.sleep(1.0)
+
         while self._running:
             try:
                 await self._connect_and_listen()
@@ -209,11 +233,15 @@ class UserStreamClient:
         """Connect to WebSocket and listen for events."""
         async with websockets.connect(
             USER_WS_URL,
+            open_timeout=20,  # Allow more time for initial handshake
             ping_interval=30,
             ping_timeout=10,
         ) as ws:
             self._ws = ws
             self._reconnect_delay = 1.0  # Reset on successful connect
+            self._connected_at = datetime.now()
+            self._message_count = 0
+            self._fill_count = 0
 
             logger.info("Connected to Polymarket User WebSocket")
 
@@ -238,6 +266,9 @@ class UserStreamClient:
     async def _handle_message(self, message: str) -> None:
         """Handle incoming WebSocket message."""
         try:
+            self._last_message_at = datetime.now()
+            self._message_count += 1
+
             data = json.loads(message)
             await self._process_data(data)
 
@@ -307,6 +338,7 @@ class UserStreamClient:
 
             # Callback
             if self.on_fill:
+                self._fill_count += 1
                 self.on_fill(fill)
 
         except Exception as e:
@@ -384,6 +416,48 @@ class UserStreamClient:
 
     # Callback for stale orders (set by executor)
     on_stale_order: Optional[Callable[["PendingOrder"], Any]] = None
+
+    async def _heartbeat_loop(self) -> None:
+        """
+        Background loop to log heartbeat status every 5 minutes.
+
+        Shows that the user WebSocket is still connected and functioning.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self.heartbeat_interval_seconds)
+
+                if not self._connected_at:
+                    continue
+
+                # Calculate uptime
+                uptime = datetime.now() - self._connected_at
+                uptime_mins = uptime.total_seconds() / 60
+
+                # Last message age
+                if self._last_message_at:
+                    last_msg_age = (datetime.now() - self._last_message_at).total_seconds()
+                    last_msg_str = f"{last_msg_age:.0f}s ago"
+                else:
+                    last_msg_str = "none"
+
+                # Connection status
+                connected = self._ws is not None and not self._ws.closed
+
+                # Pending orders
+                pending_count = len(self._pending_orders)
+
+                logger.info(
+                    f"[UserWS] Heartbeat: connected={connected}, "
+                    f"uptime={uptime_mins:.1f}m, msgs={self._message_count}, "
+                    f"fills={self._fill_count}, pending={pending_count}, "
+                    f"last_msg={last_msg_str}"
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}")
 
     async def add_pending_order(self, order: PendingOrder) -> None:
         """Add an order to pending tracking."""

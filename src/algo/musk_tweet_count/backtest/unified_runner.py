@@ -22,7 +22,7 @@ from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, R
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import UnifiedKellyExecutor, TickResult
 from ..kelly.backtest_backend import (
-    BacktestConfig as BackendConfig,
+    SimulationConfig,
     BacktestOrderbookProvider,
     BacktestTradeExecutor,
     create_backtest_portfolio,
@@ -111,7 +111,6 @@ class UnifiedBacktestConfig:
     adaptive_delta: AdaptiveDeltaConfig = field(default_factory=lambda: AdaptiveDeltaConfig(
         base_delta=10.0,
         max_depth_fraction=0.10,
-        time_ramp_hours=6.0,
         min_delta=1.0,
     ))
 
@@ -235,7 +234,7 @@ class UnifiedBacktestRunner:
             bin_upper_bounds=bin_upper_bounds,
         )
 
-        backend_config = BackendConfig(
+        backend_config = SimulationConfig(
             spread=self.config.spread,
             slippage=self.config.slippage,
             log_trades=False,

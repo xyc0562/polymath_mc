@@ -555,7 +555,12 @@ class EventStore:
         for event in events:
             self.add_event(event)
 
-    def set_contract_day_events(self, contract_date: date, events: List[TweetEvent]) -> None:
+    def set_contract_day_events(
+        self,
+        contract_date: date,
+        events: List[TweetEvent],
+        allow_regression: bool = False,
+    ) -> bool:
         """
         Replace all events for a contract day.
 
@@ -565,6 +570,10 @@ class EventStore:
         Args:
             contract_date: The contract date to replace
             events: New list of events for that day
+            allow_regression: If False (default), refuse to replace if new count < old count
+
+        Returns:
+            True if events were updated, False if rejected due to regression
         """
         # Filter events to only those belonging to this contract day
         filtered = [
@@ -573,8 +582,20 @@ class EventStore:
         ]
 
         with self._lock:
+            old_count = len(self._events.get(contract_date, []))
+            new_count = len(filtered)
+
+            # Prevent regression unless explicitly allowed
+            if not allow_regression and new_count < old_count:
+                logger.warning(
+                    f"Rejecting event update for {contract_date}: "
+                    f"new count ({new_count}) < old count ({old_count})"
+                )
+                return False
+
             self._events[contract_date] = sorted(filtered, key=lambda e: e.timestamp)
             self._counts_cache.pop(contract_date, None)
+            return True
 
     def get_events(
         self,
@@ -652,12 +673,15 @@ class EventStore:
 
         return counts
 
-    def refresh_from_api(self, n_days: int = 90) -> None:
+    def refresh_from_api(self, n_days: int = 90) -> bool:
         """
         Refresh data from XTracker API. Thread-safe.
 
         Args:
             n_days: Number of days to fetch
+
+        Returns:
+            True if refresh was successful, False if rejected due to empty/regression
         """
         logger.info(f"Refreshing {n_days} days of data from XTracker API")
 
@@ -667,8 +691,24 @@ class EventStore:
             self.contract_utils,
         )
 
-        # Update storage atomically
+        # Don't replace with empty data
+        if not history:
+            logger.warning("Refresh returned no data, keeping cached data")
+            return False
+
+        new_total = sum(len(events) for events in history.values())
+
+        # Check for regression
         with self._lock:
+            old_total = sum(len(e) for e in self._events.values())
+
+            if new_total < old_total * 0.9:  # Allow 10% tolerance for edge cases
+                logger.warning(
+                    f"Refresh would cause major regression: "
+                    f"old={old_total}, new={new_total}. Keeping cached data."
+                )
+                return False
+
             for contract_date, events in history.items():
                 self._events[contract_date] = events
                 self._counts_cache[contract_date] = len(events)
@@ -676,6 +716,7 @@ class EventStore:
             total = sum(len(e) for e in self._events.values())
 
         logger.info(f"Loaded {total} total events")
+        return True
 
     def get_events_since_noon(self, contract_date: Optional[date] = None) -> List[TweetEvent]:
         """

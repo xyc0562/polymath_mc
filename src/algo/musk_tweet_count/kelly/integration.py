@@ -58,6 +58,7 @@ class KellyTradingBot:
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
         external_user_stream: Optional[UserStreamClient] = None,
+        disable_websocket: bool = False,
     ):
         """
         Initialize Kelly trading bot.
@@ -75,9 +76,11 @@ class KellyTradingBot:
             external_user_stream: Optional external UserStreamClient (from MultiEventManager).
                                  If provided, uses this instead of creating our own.
                                  Fill events are routed to this bot via handle_fill().
+            disable_websocket: If True, disable orderbook WebSocket (use REST polling)
         """
         self._external_user_stream = external_user_stream
         self._owns_user_stream = False  # Will be set in setup()
+        self._disable_websocket = disable_websocket
         self.clob_client = clob_client
         self.config = config
         self.probability_model = probability_model
@@ -136,9 +139,10 @@ class KellyTradingBot:
             bin_upper_bounds=self.bin_upper_bounds,
         )
 
-        # Initialize orderbook manager
+        # Initialize orderbook manager with WebSocket config
+        ws_config = WebSocketConfig(enabled=not self._disable_websocket)
         self.orderbook_manager = OrderbookManager(
-            config=self.config.websocket,
+            config=ws_config,
             clob_client=self.clob_client,
         )
 

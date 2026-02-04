@@ -14,10 +14,10 @@ from .config import (
     KellyConfig,
     EdgeBufferConfig,
     AdaptiveDeltaConfig,
-    WebSocketConfig,
     RateLimitConfig,
     CollateralConfig,
 )
+from .websocket_client import WebSocketConfig
 from .kelly_math import (
     compute_terminal_wealth,
     compute_normalizer_S,

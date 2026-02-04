@@ -131,7 +131,11 @@ class GASKellyTradingBot:
         self._market_bins: List[tuple] = []
 
         # XTracker count from market API (authoritative source)
-        self._xtracker_count: Optional[int] = None
+        # Used for dead bin detection to avoid betting on impossible bins
+        self._authoritative_count: Optional[int] = None
+
+        # Last known good count (for detecting regression/stale data)
+        self._last_known_count: Optional[int] = None
 
         # Stop event for graceful shutdown
         self._stop_event: Optional[asyncio.Event] = None
@@ -163,6 +167,62 @@ class GASKellyTradingBot:
         # Start True so first tick computes Monte Carlo forecast
         self._fresh_data_available: bool = True
         self._last_monte_carlo_time: Optional[datetime] = None
+
+        # Data freshness checker callback (set by MultiEventManager)
+        # Returns (is_fresh, age_seconds). If None, freshness check is skipped.
+        self._data_freshness_checker: Optional[callable] = None
+
+    def set_data_freshness_checker(self, checker: callable) -> None:
+        """
+        Set the data freshness checker callback.
+
+        Args:
+            checker: Callable that returns (is_fresh: bool, age_seconds: float)
+        """
+        self._data_freshness_checker = checker
+
+    def set_authoritative_count(self, count: int) -> None:
+        """
+        Set the authoritative count from XTracker trackings API.
+
+        This is used for dead bin detection to avoid betting on bins
+        that are impossible based on the authoritative count, even if
+        the posts-based count is lower.
+
+        Args:
+            count: Authoritative count from XTracker trackings API
+        """
+        if self._authoritative_count is not None and count < self._authoritative_count:
+            logger.warning(
+                f"Authoritative count regressed: {self._authoritative_count} -> {count}. "
+                f"Keeping higher value."
+            )
+            return
+        self._authoritative_count = count
+        logger.debug(f"Updated authoritative count: {count}")
+
+    def get_effective_count_for_dead_bins(self, computed_count: int) -> int:
+        """
+        Get the effective count for dead bin detection.
+
+        Uses max(computed_count, authoritative_count) to ensure we don't
+        bet on bins that are impossible from the authoritative perspective.
+
+        Args:
+            computed_count: Count computed from posts
+
+        Returns:
+            Effective count for dead bin detection
+        """
+        if self._authoritative_count is not None:
+            effective = max(computed_count, self._authoritative_count)
+            if effective > computed_count:
+                logger.debug(
+                    f"Using authoritative count ({self._authoritative_count}) > "
+                    f"computed count ({computed_count}) for dead bin detection"
+                )
+            return effective
+        return computed_count
 
     def notify_data_refreshed(self) -> None:
         """
@@ -359,15 +419,8 @@ class GASKellyTradingBot:
             skip_fetch=True,
         )
 
-        # Optionally disable WebSocket (use --no-ws flag)
-        kelly_config = self.kelly_config
+        # Log WebSocket status
         if self.bot_config.disable_websocket:
-            from dataclasses import replace
-            from ..kelly.config import WebSocketConfig
-            kelly_config = replace(
-                self.kelly_config,
-                websocket=WebSocketConfig(enabled=False),
-            )
             logger.info("WebSocket disabled (--no-ws flag)")
         else:
             logger.info("WebSocket enabled for real-time orderbook updates")
@@ -377,7 +430,7 @@ class GASKellyTradingBot:
         # Otherwise, KellyTradingBot will create its own if API credentials available
         self.kelly_bot = KellyTradingBot(
             clob_client=self.clob_client,
-            config=kelly_config,
+            config=self.kelly_config,
             probability_model=self._get_probabilities,
             dry_run=self.bot_config.dry_run,
             wallet_address=os.getenv("WALLET_ADDRESS"),
@@ -385,6 +438,7 @@ class GASKellyTradingBot:
             api_secret=os.getenv("CLOB_API_SECRET"),
             api_passphrase=os.getenv("CLOB_API_PASSPHRASE"),
             external_user_stream=self._external_user_stream,
+            disable_websocket=self.bot_config.disable_websocket,
         )
 
         # Setup Kelly bot
@@ -544,19 +598,63 @@ class GASKellyTradingBot:
         tick_start = datetime.now(self.forecaster.contract_utils.tz)
 
         try:
+            # 0. Check data freshness before trading
+            if self._data_freshness_checker is not None:
+                is_fresh, age_seconds = self._data_freshness_checker()
+                if not is_fresh:
+                    logger.warning(
+                        f"Data is stale ({age_seconds:.0f}s old), skipping trading tick. "
+                        f"Waiting for fresh data..."
+                    )
+                    return TickResult(
+                        tick_start_time=tick_start,
+                        num_candidates=0,
+                        num_executed=0,
+                        total_utility_gain=0.0,
+                        executions=[],
+                        elapsed_seconds=0.0,
+                    )
+
             # 1. Get timing info
             hours_elapsed, hours_remaining = self._get_timing()
 
             # 2. Get current cumulative count for the market's date range
             current_count = self._get_market_cumulative_count()
 
+            # 2b. Check for count regression (impossible for tweets - indicates stale data)
+            if self._last_known_count is not None and current_count < self._last_known_count:
+                logger.warning(
+                    f"Count regressed from {self._last_known_count} to {current_count}! "
+                    f"This indicates stale/corrupted data. Skipping trading tick."
+                )
+                return TickResult(
+                    tick_start_time=tick_start,
+                    num_candidates=0,
+                    num_executed=0,
+                    total_utility_gain=0.0,
+                    executions=[],
+                    elapsed_seconds=0.0,
+                )
+
+            # Update last known count
+            if current_count > (self._last_known_count or 0):
+                self._last_known_count = current_count
+
+            # 2c. Get effective count for dead bin detection (uses max of computed and authoritative)
+            effective_count = self.get_effective_count_for_dead_bins(current_count)
+
             # 3. Log header info (only for slow ticks / explicit requests)
             if log_header:
                 logger.info(f"Timing: {hours_elapsed:.1f}h elapsed, {hours_remaining:.1f}h remaining")
-                logger.info(f"Current 7-day cumulative count: {current_count}")
+                if effective_count > current_count:
+                    logger.info(
+                        f"Current count: {current_count} (posts), {effective_count} (authoritative)"
+                    )
+                else:
+                    logger.info(f"Current 7-day cumulative count: {current_count}")
 
-                # Log dead bins
-                dead_bins = [i for i, (lower, upper) in enumerate(self._market_bins) if upper < current_count]
+                # Log dead bins using effective count
+                dead_bins = [i for i, (lower, upper) in enumerate(self._market_bins) if upper < effective_count]
                 if dead_bins:
                     logger.info(f"Dead bins: {dead_bins}")
 
@@ -573,8 +671,9 @@ class GASKellyTradingBot:
                 )
 
             # 5. Run Kelly optimization tick
+            # Use effective_count for dead bin detection to avoid betting on impossible bins
             result = await self.kelly_bot.run_tick(
-                current_count=current_count,
+                current_count=effective_count,
                 hours_elapsed=hours_elapsed,
                 hours_to_settlement=hours_remaining,
                 forecast_mean=self._cached_forecast_mean,
@@ -590,7 +689,7 @@ class GASKellyTradingBot:
                 )
                 self._log_probability_comparison(
                     probabilities=probabilities,
-                    current_count=current_count,
+                    current_count=effective_count,  # Use effective count for dead bin display
                     hours_elapsed=hours_elapsed,
                     hours_remaining=hours_remaining,
                     forecast_mean=self._cached_forecast_mean,

@@ -263,25 +263,19 @@ def compute_adaptive_delta(
         t_stop_hours: T_stop cutoff hours
 
     Returns:
-        Adaptive chunk size in shares
+        Adaptive chunk size in shares (0 if past T_stop)
     """
-    # 1. Liquidity constraint: never take >X% of visible depth
-    liquidity_delta = available_depth * config.max_depth_fraction
-
-    # 2. Time constraint: ramp down as we approach T_stop
+    # Stop trading if past T_stop
     hours_until_stop = hours_to_settlement - t_stop_hours
     if hours_until_stop <= 0:
-        time_delta = config.min_delta  # At or past T_stop
-    elif hours_until_stop >= config.time_ramp_hours:
-        time_delta = config.base_delta  # Full size
-    else:
-        # Linear ramp: 100% at ramp_hours, 50% at 0h before T_stop
-        time_factor = 0.5 + 0.5 * (hours_until_stop / config.time_ramp_hours)
-        time_delta = config.base_delta * time_factor
+        return 0.0
+
+    # Liquidity constraint: never take >X% of visible depth
+    liquidity_delta = available_depth * config.max_depth_fraction
 
     return max(
         config.min_delta,
-        min(config.base_delta, liquidity_delta, time_delta),
+        min(config.base_delta, liquidity_delta),
     )
 
 

@@ -5,7 +5,6 @@ Run multi-event trading bot with shared capital pool.
 Usage:
     python -m src.algo.musk_tweet_count.forecaster.run_multi_event \
         --capital 5000 \
-        --max-per-event 1000 \
         --dry-run
 
     # With specific events (comma-separated event IDs or "auto" for discovery)
@@ -41,7 +40,7 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventConfig,
     EventInfo,
 )
-from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig
+from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
@@ -465,8 +464,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-per-event",
         type=float,
-        default=1000.0,
-        help="Maximum capital per event (default: 1000)",
+        default=None,
+        help="Maximum capital per event (default: from KellyConfig.collateral.c_event_max)",
     )
     parser.add_argument(
         "--min-allocation",
@@ -515,6 +514,20 @@ def parse_args() -> argparse.Namespace:
         help="Required ROI for edge buffer (default: 0.10)",
     )
 
+    # Chunk sizing
+    parser.add_argument(
+        "--base-delta",
+        type=float,
+        default=10.0,
+        help="Base chunk size in shares per order (default: 10.0)",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=1.0,
+        help="Minimum chunk size in shares (default: 1.0)",
+    )
+
     # Other
     parser.add_argument(
         "-v", "--verbose",
@@ -550,27 +563,38 @@ async def main() -> None:
         sys.exit(1)
 
     # Create configurations
-    capital_pool_config = CapitalPoolConfig(
-        total_capital=args.capital,
-        max_per_event=args.max_per_event,
-        min_allocation=args.min_allocation,
-    )
-
+    # Kelly config first (source of truth for c_event_max)
     edge_buffer_config = EdgeBufferConfig(
         required_roi=args.required_roi,
         friction_mid=0.015,
         friction_tail=0.03,
     )
 
+    adaptive_delta_config = AdaptiveDeltaConfig(
+        base_delta=args.base_delta,
+        min_delta=args.min_delta,
+    )
+
     kelly_config = KellyConfig(
         kappa=args.kappa,
         edge_buffer=edge_buffer_config,
+        adaptive_delta=adaptive_delta_config,
+    )
+
+    # max_per_event: CLI override or kelly_config default
+    max_per_event = args.max_per_event if args.max_per_event is not None else kelly_config.collateral.c_event_max
+    logger.info(f"Max capital per event: ${max_per_event:.2f}")
+
+    capital_pool_config = CapitalPoolConfig(
+        total_capital=args.capital,
+        min_allocation=args.min_allocation,
     )
 
     forecaster_config = ForecasterConfig()
 
     multi_event_config = MultiEventConfig(
         capital_pool=capital_pool_config,
+        max_per_event=max_per_event,
         tick_interval_seconds=args.tick_interval,
         dry_run=dry_run,
     )

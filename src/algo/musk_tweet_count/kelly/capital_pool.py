@@ -33,9 +33,6 @@ class CapitalPoolConfig:
     # Total capital in the pool (0 = auto-detect from API on startup)
     total_capital: float = 0.0
 
-    # Maximum capital per event (from CollateralConfig.c_event_max)
-    max_per_event: float = 500.0
-
     # Minimum capital to allocate (don't start event if less available)
     min_allocation: float = 100.0
 
@@ -62,14 +59,16 @@ class CapitalPool:
         await pool.return_capital("event_123", final_value=1100)
     """
 
-    def __init__(self, config: CapitalPoolConfig):
+    def __init__(self, config: CapitalPoolConfig, max_per_event: float = 500.0):
         """
         Initialize capital pool.
 
         Args:
             config: Pool configuration
+            max_per_event: Maximum capital per event (from KellyConfig.collateral.c_event_max)
         """
         self.config = config
+        self.max_per_event = max_per_event
         self._available: float = config.total_capital
         self._allocations: Dict[str, EventAllocation] = {}
         self._lock = asyncio.Lock()
@@ -79,7 +78,7 @@ class CapitalPool:
         if config.total_capital > 0:
             logger.info(
                 f"Capital pool initialized: total=${config.total_capital:.2f}, "
-                f"max_per_event=${config.max_per_event:.2f}"
+                f"max_per_event=${max_per_event:.2f}"
             )
         else:
             logger.info(
@@ -117,7 +116,7 @@ class CapitalPool:
 
         Args:
             event_id: Unique identifier for the event
-            max_amount: Maximum amount to allocate (defaults to config.max_per_event)
+            max_amount: Maximum amount to allocate (defaults to max_per_event)
 
         Returns:
             Amount actually allocated (may be less than requested, or 0 if none available)
@@ -142,9 +141,9 @@ class CapitalPool:
 
             # Determine max allocation
             if max_amount is None:
-                max_amount = self.config.max_per_event
+                max_amount = self.max_per_event
             else:
-                max_amount = min(max_amount, self.config.max_per_event)
+                max_amount = min(max_amount, self.max_per_event)
 
             # Determine actual allocation
             allocated = min(max_amount, self._available)
@@ -257,7 +256,7 @@ class CapitalPool:
                 for event_id, alloc in self._allocations.items()
             },
             "config": {
-                "max_per_event": self.config.max_per_event,
+                "max_per_event": self.max_per_event,
                 "min_allocation": self.config.min_allocation,
             },
         }

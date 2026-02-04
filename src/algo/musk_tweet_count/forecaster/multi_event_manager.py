@@ -70,6 +70,9 @@ class MultiEventConfig:
     # Capital pool configuration
     capital_pool: CapitalPoolConfig = field(default_factory=CapitalPoolConfig)
 
+    # Maximum capital per event (from KellyConfig.collateral.c_event_max)
+    max_per_event: float = 500.0
+
     # Trading bot configuration (shared across events)
     tick_interval_seconds: int = 300
     dry_run: bool = True
@@ -82,6 +85,10 @@ class MultiEventConfig:
     # XTracker posts update ~every 5 minutes, so 2.5 min refresh is safe
     posts_refresh_interval: int = 150  # 2.5 minutes
 
+    # Maximum age of data before it's considered stale (seconds)
+    # If data is older than this, skip trading until refreshed
+    max_data_age_seconds: int = 300  # 5 minutes
+
     # How often to validate counts against XTracker API (seconds)
     count_validation_interval: int = 900  # 15 minutes
 
@@ -91,10 +98,6 @@ class MultiEventConfig:
     # Start trading this many hours before settlement
     # (events closer to settlement than this won't be started)
     min_hours_before_settlement: float = 24.0
-
-    # Stop trading this many hours before settlement
-    # (from KellyConfig.t_stop_hours, but also used here for scheduling)
-    t_stop_hours: float = 3.0
 
     # Maximum completed events to keep in history (for memory management)
     max_completed_events: int = 100
@@ -179,7 +182,7 @@ class MultiEventManager:
         self._api_passphrase = api_passphrase or os.getenv("CLOB_API_PASSPHRASE", "")
 
         # Capital pool
-        self.capital_pool = CapitalPool(config.capital_pool)
+        self.capital_pool = CapitalPool(config.capital_pool, max_per_event=config.max_per_event)
 
         # Contract-day utilities (shared across all components)
         self.contract_utils = ContractDayUtils(
@@ -209,6 +212,9 @@ class MultiEventManager:
         # Track last refresh time for smart refresh scheduling
         self._last_full_refresh: Optional[datetime] = None
         self._last_refresh_contract_date: Optional[date] = None
+
+        # Track when data was last successfully refreshed (for freshness check)
+        self._last_data_refresh_time: Optional[datetime] = None
 
         # Global UserStreamClient for fill confirmations (shared across all bots)
         # This is more efficient than one UserStreamClient per bot since
@@ -389,6 +395,24 @@ class MultiEventManager:
             )
 
         self._data_prefetched = True
+        self._last_data_refresh_time = datetime.now(self._tz)
+
+    def is_data_fresh(self) -> Tuple[bool, float]:
+        """
+        Check if data is fresh enough for trading.
+
+        Returns:
+            Tuple of (is_fresh, age_seconds)
+            is_fresh is True if data is within max_data_age_seconds
+        """
+        if self._last_data_refresh_time is None:
+            return False, float('inf')
+
+        now = datetime.now(self._tz)
+        age = (now - self._last_data_refresh_time).total_seconds()
+        is_fresh = age <= self.config.max_data_age_seconds
+
+        return is_fresh, age
 
     async def refresh_shared_data(self) -> int:
         """
@@ -429,9 +453,16 @@ class MultiEventManager:
         self._last_refresh_contract_date = current_contract_date
         self._last_full_refresh = now
 
-        # Notify all active bots that fresh data is available
-        # This signals them to recompute Monte Carlo on their next slow tick
-        await self._notify_bots_of_fresh_data()
+        # Only update freshness timestamp if we actually got data
+        # (new_events can be 0 if fetch succeeded but no new posts)
+        # We check for >= 0 because 0 is valid (no new posts), but the fetch
+        # would return early with 0 if it failed
+        if new_events >= 0:
+            self._last_data_refresh_time = now  # Track successful refresh for freshness check
+
+            # Notify all active bots that fresh data is available
+            # This signals them to recompute Monte Carlo on their next slow tick
+            await self._notify_bots_of_fresh_data()
 
         return new_events
 
@@ -512,8 +543,11 @@ class MultiEventManager:
 
         logger.info(f"Full refresh: fetching {n_days} days of tweet data...")
 
-        # Clear and refetch
-        self.shared_event_store.refresh_from_api(n_days)
+        # Clear and refetch (returns False if rejected due to regression)
+        success = self.shared_event_store.refresh_from_api(n_days)
+        if not success:
+            logger.warning("Full refresh rejected due to data regression")
+            return 0
 
         date_range = self.shared_event_store.get_date_range()
         if date_range[0] and date_range[1]:
@@ -569,12 +603,30 @@ class MultiEventManager:
             end_date=calendar_today,  # Use calendar date, not contract date
         )
 
+        # IMPORTANT: Don't replace cache if fetch failed or returned empty
+        # This prevents count regression when network is unavailable
+        if not events:
+            logger.warning(
+                f"Incremental refresh: no events fetched, keeping cached data. "
+                f"Initial count: {initial_count}"
+            )
+            return 0
+
         # Group events by contract day
         events_by_day: Dict[date, List] = {d: [] for d in contract_days_to_update}
         for event in events:
             event_contract_date = self.contract_utils.get_contract_date(event.timestamp)
             if event_contract_date in events_by_day:
                 events_by_day[event_contract_date].append(event)
+
+        # Sanity check: count should never decrease (monotonic tweets)
+        new_total = sum(len(day_events) for day_events in events_by_day.values())
+        if new_total < initial_count:
+            logger.warning(
+                f"Incremental refresh: new count ({new_total}) < old count ({initial_count}). "
+                f"This is suspicious - keeping cached data to avoid regression."
+            )
+            return 0
 
         # Replace data for each day (not append - avoids duplicates)
         for contract_date, day_events in events_by_day.items():
@@ -722,19 +774,30 @@ class MultiEventManager:
 
     async def validate_all_event_counts(self) -> Dict[str, Tuple[int, Optional[int], bool]]:
         """
-        Validate counts for all active events.
+        Validate counts for all active events and update authoritative counts on bots.
+
+        This is called periodically (every count_validation_interval seconds) and:
+        1. Validates computed count against authoritative XTracker count
+        2. Updates the trading bot with the authoritative count for dead bin detection
 
         Returns:
             Dict mapping event_id -> (computed, api_count, is_valid)
         """
         # Get snapshot of active events under lock
         async with self._events_lock:
-            active_snapshot = [(eid, active.info) for eid, active in self._active_events.items()]
+            active_snapshot = [
+                (eid, active.info, active.bot)
+                for eid, active in self._active_events.items()
+            ]
 
         results = {}
-        for event_id, event_info in active_snapshot:
+        for event_id, event_info, bot in active_snapshot:
             computed, api_count, is_valid = await self.validate_counts_for_event(event_info)
             results[event_id] = (computed, api_count, is_valid)
+
+            # Update trading bot with authoritative count for dead bin detection
+            if api_count is not None:
+                bot.set_authoritative_count(api_count)
 
         return results
 
@@ -778,7 +841,7 @@ class MultiEventManager:
 
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
 
-            if hours_to_settlement <= self.config.t_stop_hours:
+            if hours_to_settlement <= self.kelly_config.t_stop_hours:
                 logger.info(
                     f"Event {event_id} too close to settlement "
                     f"({hours_to_settlement:.1f}h remaining)"
@@ -844,7 +907,7 @@ class MultiEventManager:
             )
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
 
-            if hours_to_settlement <= self.config.t_stop_hours:
+            if hours_to_settlement <= self.kelly_config.t_stop_hours:
                 logger.info(f"Event {event_id} expired, removing from pending")
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
@@ -918,6 +981,9 @@ class MultiEventManager:
         # Set market dates
         bot.market_start_date = event_info.market_start_date
         bot.settlement_date = event_info.settlement_date
+
+        # Set data freshness checker callback
+        bot.set_data_freshness_checker(self.is_data_fresh)
 
         # Start trading task
         task = asyncio.create_task(

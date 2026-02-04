@@ -469,7 +469,6 @@ def main():
         adaptive_delta = AdaptiveDeltaConfig(
             base_delta=base_delta,
             max_depth_fraction=0.10,
-            time_ramp_hours=6.0,
             min_delta=1.0,
         )
 

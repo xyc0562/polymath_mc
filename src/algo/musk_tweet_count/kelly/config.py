@@ -79,40 +79,19 @@ class AdaptiveDeltaConfig:
     """
     Configuration for adaptive chunk sizing.
 
-    Adapts trade size based on:
-    - Available liquidity (never take too much of visible depth)
-    - Time remaining (ramp down as we approach T_stop)
+    Adapts trade size based on available liquidity (never take too much of visible depth).
+    Trading stops entirely once past T_stop.
     """
 
     # Base chunk size in shares
-    base_delta: float = 10.0
+    base_delta: float = 50
 
     # Maximum fraction of visible depth to take per trade
     # Set to 1.0 for production (no depth impact limit)
-    max_depth_fraction: float = 1.0
-
-    # Hours before T_stop to start ramping down chunk size
-    time_ramp_hours: float = 6.0
+    max_depth_fraction: float = 0.3
 
     # Minimum chunk size in shares
     min_delta: float = 1.0
-
-
-@dataclass
-class WebSocketConfig:
-    """Configuration for WebSocket orderbook streaming."""
-
-    # Enable WebSocket streaming (vs polling)
-    enabled: bool = True
-
-    # Delay between reconnection attempts
-    reconnect_delay_seconds: float = 5.0
-
-    # Heartbeat interval to keep connection alive
-    heartbeat_interval_seconds: float = 30.0
-
-    # WebSocket endpoint
-    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 @dataclass
@@ -159,9 +138,6 @@ class KellyConfig:
     # Adaptive delta configuration
     adaptive_delta: AdaptiveDeltaConfig = field(default_factory=AdaptiveDeltaConfig)
 
-    # WebSocket configuration
-    websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
-
     # Collateral limits
     collateral: CollateralConfig = field(default_factory=CollateralConfig)
 
@@ -174,14 +150,15 @@ class KellyConfig:
         # Extract nested configs
         edge_buffer_data = data.pop("edge_buffer", {})
         adaptive_delta_data = data.pop("adaptive_delta", {})
-        websocket_data = data.pop("websocket", {})
         collateral_data = data.pop("collateral", {})
         rate_limit_data = data.pop("rate_limit", {})
+
+        # Ignore websocket config if present (moved to websocket_client.py)
+        data.pop("websocket", None)
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),
             adaptive_delta=AdaptiveDeltaConfig(**adaptive_delta_data),
-            websocket=WebSocketConfig(**websocket_data),
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
             **data,
