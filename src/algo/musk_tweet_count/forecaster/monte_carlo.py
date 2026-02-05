@@ -220,7 +220,7 @@ class MonteCarloForecaster:
                 # PIG sampling: dispersion_param is sigma where Var = μ + σ²μ²
                 # Apply dispersion inflation by scaling sigma
                 sigma_inflated = dispersion_param * np.sqrt(dispersion_inflation)
-                sample = self.interday.regime.sample(adjusted_mean, rng)
+                sample = self.interday.regime.sample(adjusted_mean, rng, sigma=sigma_inflated)
             else:
                 # NegBin sampling: dispersion_param is k where Var = μ + μ²/k
                 # Apply dispersion inflation: k' = k / s

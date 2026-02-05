@@ -27,6 +27,7 @@ from ..kelly.backtest_backend import (
     BacktestTradeExecutor,
     create_backtest_portfolio,
 )
+from ..forecaster.projection import ProjectionModel, AsymmetricProjection, create_projection_model
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,11 @@ class UnifiedBacktestConfig:
     # Early exit: close all positions X hours before settlement (0 = disabled)
     exit_hours_before_settlement: float = 0.0
 
+    # Projection model type: "asymmetric" (default) or "normal"
+    # - asymmetric: Uses actual Monte Carlo samples (preserves right-skew)
+    # - normal: Approximates with Normal distribution (symmetric)
+    projection_model: str = "asymmetric"
+
 
 class UnifiedBacktestRunner:
     """
@@ -153,6 +159,9 @@ class UnifiedBacktestRunner:
             slippage=config.slippage,
         )
         self.posts_provider = CachedPostsProvider(cache_dir=cache_dir)
+
+        # Projection model for computing bin probabilities
+        self._projection: ProjectionModel = create_projection_model(config.projection_model)
 
         # State during backtest
         self._trades: List[Trade] = []
@@ -357,12 +366,19 @@ class UnifiedBacktestRunner:
                 end_ts=ts,
             )
 
-            # Compute bin probabilities using the asymmetric Monte Carlo samples
+            # Compute bin probabilities using the configured projection model
             probabilities = self._compute_bin_probabilities(
                 event=event,
                 forecast=forecast,
                 current_count=current_count,
             )
+
+            # Log forecast std for debugging (projection model doesn't affect this)
+            if i % 20 == 0:
+                logger.debug(
+                    f"  Forecast: mean={forecast.mean:.1f}, std={forecast.std:.1f}, "
+                    f"projection={self._projection.name}"
+                )
 
             # Determine dead bins
             dead_bins = [
@@ -728,41 +744,24 @@ class UnifiedBacktestRunner:
         current_count: int,
     ) -> List[float]:
         """
-        Compute probability for each bin using forecast distribution.
+        Compute probability for each bin using the configured projection model.
 
-        Uses the actual Monte Carlo samples from the forecaster, which preserve
-        the asymmetric distribution (Log-normal + Negative Binomial). Falls back
-        to Normal approximation only if samples aren't available.
+        The projection model determines how bin probabilities are computed:
+        - AsymmetricProjection: Uses actual MC samples (preserves right-skew)
+        - NormalProjection: Approximates with Normal (symmetric)
         """
-        import numpy as np
+        # Build bins list from event data
+        bins = [(b.lower_bound, b.upper_bound) for b in event.bins]
 
-        # Use the actual Monte Carlo samples from the forecaster
-        # These preserve the asymmetric distribution
-        if forecast.samples is None:
-            raise RuntimeError(
-                "Forecast result has no samples - cannot compute probabilities. "
-                "This indicates a bug in the forecaster."
-            )
+        # Use projection model to compute bin probabilities
+        probabilities = self._projection.compute_bin_probabilities(
+            forecast=forecast,
+            bins=bins,
+            shift=0,  # No shift - forecast already includes past counts
+            floor=current_count,  # Samples can't be below current count
+        )
 
-        samples = forecast.samples.copy()
-
-        # Floor samples at current_count (can't go below current count)
-        samples = np.maximum(samples, current_count)
-        n_samples = len(samples)
-
-        probabilities = []
-        for bin_data in event.bins:
-            if bin_data.upper_bound < current_count:
-                prob = 0.0  # Dead bin
-            else:
-                count = np.sum(
-                    (samples >= bin_data.lower_bound) &
-                    (samples <= bin_data.upper_bound)
-                )
-                prob = count / n_samples
-            probabilities.append(prob)
-
-        # Renormalize
+        # Renormalize to sum to 1.0
         total = sum(probabilities)
         if total > 0:
             probabilities = [p / total for p in probabilities]

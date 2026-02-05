@@ -266,15 +266,22 @@ class PIGGASRegimeModel:
 
         return np.exp(f_h)
 
-    def sample(self, mu: float, rng: np.random.Generator) -> int:
+    def sample(self, mu: float, rng: np.random.Generator, sigma: float = None) -> int:
         """
         Sample from PIG(μ, σ) distribution.
 
         Uses composition: Y | Z ~ Poisson(μZ), Z ~ IG(1, 1/σ²)
+
+        Args:
+            mu: Mean parameter
+            rng: Random number generator
+            sigma: Dispersion parameter (default: self.sigma)
         """
         # Sample Z from Inverse Gaussian(mean=1, shape=1/σ²)
         # Using the standard IG sampling algorithm
-        phi = 1 / (self.sigma ** 2)  # shape parameter
+        if sigma is None:
+            sigma = self.sigma
+        phi = 1 / (sigma ** 2)  # shape parameter
 
         # Sampling from IG(1, phi) using Michael et al. (1976) algorithm
         v = rng.standard_normal()

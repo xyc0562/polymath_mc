@@ -391,6 +391,19 @@ def main():
              "Recommended: 0.15-0.20 based on backtest analysis. Default: 0 (disabled)",
     )
 
+    parser.add_argument(
+        "--max-spread-ratio",
+        type=float,
+        default=2.0,
+        help="Maximum spread ratio (ask-bid)/bid to trade. Default: 2.0. Set to 0 to disable.",
+    )
+
+    parser.add_argument(
+        "--no-require-two-sided",
+        action="store_true",
+        help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
+    )
+
     # Default from AdaptiveDeltaConfig
     _adaptive_defaults = AdaptiveDeltaConfig()
     parser.add_argument(
@@ -411,8 +424,20 @@ def main():
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Quick backtest mode: larger trades (base_delta=200), fewer orders (max=5). "
-             "Use this for faster iteration.",
+        help="Quick backtest mode: base_delta_usd=$50 (unless overridden), max_orders=5. "
+             "Use this for faster iteration. Combine with --base-delta-usd to customize.",
+    )
+
+    parser.add_argument(
+        "--projection",
+        type=str,
+        default="asymmetric",
+        choices=["asymmetric", "normal", "skew_normal", "gamma"],
+        help="Projection model for computing bin probabilities. "
+             "'asymmetric' (default) uses actual Monte Carlo samples. "
+             "'normal' uses symmetric Normal CDF. "
+             "'skew_normal' uses Skew-Normal CDF (captures right-skew). "
+             "'gamma' uses Gamma CDF (natural for positive sums).",
     )
 
     args = parser.parse_args()
@@ -447,12 +472,15 @@ def main():
             return
 
     # Apply --quick mode overrides
+    # Quick mode sets defaults for faster backtests, but user can override
     base_delta_usd = args.base_delta_usd
     max_orders = args.max_orders
     if args.quick:
-        base_delta_usd = 50.0  # Larger trades ($50 per trade)
+        # Only override base_delta_usd if user didn't explicitly set it
+        if args.base_delta_usd == _adaptive_defaults.base_delta_usd:
+            base_delta_usd = 50.0  # Quick mode default
         max_orders = 5  # Fewer orders per tick
-        logger.info("Quick mode: base_delta_usd=$50, max_orders=5")
+        logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
 
     # Choose between unified and legacy runners
     if args.unified:
@@ -471,6 +499,8 @@ def main():
                 tail_threshold=0.09,
                 min_perceived_prob=args.min_perceived_prob,
                 min_market_price=args.min_market_price,
+                max_spread_ratio=args.max_spread_ratio,
+                require_two_sided_liquidity=not args.no_require_two_sided,
             ),
             adaptive_delta=AdaptiveDeltaConfig(
                 base_delta_usd=base_delta_usd,
@@ -492,6 +522,7 @@ def main():
             trading=trading_config,
             exit_hours_before_settlement=args.exit_hours,
             verbose=args.trade_verbose,
+            projection_model=args.projection,
         )
 
         runner = UnifiedBacktestRunner(
@@ -499,7 +530,8 @@ def main():
             price_data_dir=price_data_dir,
             cache_dir=cache_dir,
         )
-        logger.info("Using UNIFIED runner (same Kelly logic as production)")
+        logger.info(f"Using UNIFIED runner (same Kelly logic as production)")
+        logger.info(f"Projection model: {args.projection}")
     else:
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(
@@ -509,6 +541,8 @@ def main():
             tail_threshold=0.09,  # 9% threshold
             min_perceived_prob=args.min_perceived_prob,
             min_market_price=args.min_market_price,
+            max_spread_ratio=args.max_spread_ratio,
+            require_two_sided_liquidity=not args.no_require_two_sided,
         )
         config = BacktestConfig(
             initial_capital=args.capital,

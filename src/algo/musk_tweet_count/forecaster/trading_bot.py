@@ -16,6 +16,7 @@ from py_clob_client.client import ClobClient
 
 from .config import ForecasterConfig
 from .forecaster import Musk7DayForecaster
+from .projection import ProjectionModel, AsymmetricProjection, create_projection_model
 from ..kelly.config import KellyConfig
 from ..kelly.integration import KellyTradingBot
 from ..kelly.executor import TickResult
@@ -79,6 +80,11 @@ class TradingBotConfig:
 
     # Event name for logging (e.g., "Feb 03 - Feb 10")
     event_name: Optional[str] = None
+
+    # Projection model type: "asymmetric" (default) or "normal"
+    # - asymmetric: Uses actual Monte Carlo samples (preserves right-skew)
+    # - normal: Approximates with Normal distribution (symmetric)
+    projection_model: str = "asymmetric"
 
     # Legacy alias for slow_tick_interval_seconds
     @property
@@ -174,6 +180,9 @@ class GASKellyTradingBot:
         self._last_ws_callback_time: Optional[datetime] = None
         self._ws_callback_count: int = 0
         self._last_ws_log_time: Optional[datetime] = None
+
+        # Projection model for computing bin probabilities
+        self._projection: ProjectionModel = create_projection_model(bot_config.projection_model)
 
         # Cached forecast for table display (avoid recomputing every tick)
         self._cached_forecast_mean: Optional[float] = None
@@ -284,7 +293,7 @@ class GASKellyTradingBot:
 
     def _compute_probabilities(self, current_count: int) -> List[float]:
         """
-        Compute probabilities using Monte Carlo simulation.
+        Compute probabilities using the configured projection model.
 
         Called by slow loop to update cached probabilities.
 
@@ -292,12 +301,10 @@ class GASKellyTradingBot:
         1. Actual tweet counts from completed days in the event window
         2. Forecasts only the remaining days until settlement
 
-        The forecaster returns asymmetric Monte Carlo samples (from Log-normal
-        and Negative Binomial distributions), which we use directly to compute
-        probabilities for the market-specific bins.
+        The projection model determines how bin probabilities are computed:
+        - AsymmetricProjection: Uses actual MC samples (preserves right-skew)
+        - NormalProjection: Approximates with Normal (symmetric)
         """
-        import numpy as np
-
         # Get forecast for this specific event's window
         # This accounts for past actual counts + remaining forecast
         if self.market_start_date and self.settlement_date:
@@ -309,47 +316,40 @@ class GASKellyTradingBot:
             # Fallback to generic 7-day forecast if no event window specified
             result = self.forecaster.forecast_7day_distribution(use_cache=False)
 
-        # Use the actual Monte Carlo samples from the forecaster
-        # These preserve the asymmetric distribution (Log-normal + NegBin)
-        if result.samples is None:
-            logger.error(
-                "Forecast result has no samples - cannot compute probabilities. "
-                "This indicates a bug in the forecaster."
+        # Use projection model to compute bin probabilities
+        # The projection handles:
+        # - Using actual samples (asymmetric) or Normal approximation
+        # - Applying floor at current_count
+        try:
+            probabilities = self._projection.compute_bin_probabilities(
+                forecast=result,
+                bins=self._market_bins,
+                shift=0,  # No shift - forecast already includes past counts
+                floor=current_count,  # Samples can't be below current count
             )
-            # Return cached probabilities if available, otherwise uniform
+        except RuntimeError as e:
+            # Asymmetric projection requires samples - log and fall back
+            logger.error(f"Projection failed: {e}")
             if self._cached_probabilities:
                 return self._cached_probabilities
             num_bins = len(self._market_bins)
             return [1.0 / num_bins] * num_bins if num_bins > 0 else []
 
-        samples = result.samples.copy()
-
-        # Floor samples at current_count (can't go below current count)
-        samples = np.maximum(samples, current_count)
-        n_samples = len(samples)
-
-        # Compute probabilities for each market bin
-        probabilities = []
-        for lower, upper in self._market_bins:
-            if upper < current_count:
-                prob = 0.0  # Dead bin
-            else:
-                count = np.sum((samples >= lower) & (samples <= upper))
-                prob = count / n_samples
-            probabilities.append(prob)
-
-        # Renormalize
+        # Renormalize to sum to 1.0
         total = sum(probabilities)
         if total > 0:
             probabilities = [p / total for p in probabilities]
         else:
             live_bins = [i for i, (lower, upper) in enumerate(self._market_bins) if upper >= current_count]
             if live_bins:
+                probabilities = [0.0] * len(self._market_bins)
                 for i in live_bins:
                     probabilities[i] = 1.0 / len(live_bins)
 
         # Update cache
         self._cached_probabilities = probabilities
+
+        logger.debug(f"Computed probabilities using {self._projection.name} projection")
 
         return probabilities
 

@@ -19,6 +19,7 @@ from .data import ContractDayUtils, EventStore, TweetEvent, XTrackerClient
 from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast
 from .interday import InterdayForecaster
 from .monte_carlo import MonteCarloForecaster, ForecastResult
+from .projection import ProjectionModel, AsymmetricProjection, create_projection_model
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class Musk7DayForecaster:
         self,
         config: Optional[ForecasterConfig] = None,
         event_store: Optional[EventStore] = None,
+        projection_model: Optional[ProjectionModel] = None,
     ):
         """
         Initialize forecaster.
@@ -45,8 +47,10 @@ class Musk7DayForecaster:
         Args:
             config: Forecaster configuration (uses defaults if None)
             event_store: Optional shared EventStore (creates own if None)
+            projection_model: Model for computing bin probabilities (default: AsymmetricProjection)
         """
         self.config = config or ForecasterConfig()
+        self.projection = projection_model or AsymmetricProjection()
 
         # Contract-day utilities
         self.contract_utils = ContractDayUtils(
@@ -688,20 +692,23 @@ class Musk7DayForecaster:
         """
         Recompute bin probabilities after shifting the distribution.
 
-        Uses the actual Monte Carlo samples (which preserve asymmetry) shifted
-        by the past_count, rather than regenerating with a symmetric Normal.
+        Uses the configured projection model to compute probabilities.
+        Default (AsymmetricProjection) preserves the actual sample distribution.
         """
-        if forecast.samples is None:
-            raise RuntimeError(
-                "No samples in forecast result - cannot shift bin probabilities. "
-                "This indicates a bug: simulate_horizon should return samples."
-            )
+        from .monte_carlo import BinProbability
 
-        # Shift the actual asymmetric samples
-        samples = forecast.samples + shift
+        # Use projection model to compute probabilities
+        probs = self.projection.compute_bin_probabilities(
+            forecast=forecast,
+            bins=self.config.bins,
+            shift=shift,
+        )
 
-        # Compute bin probabilities from shifted samples
-        return self.monte_carlo._compute_bin_probabilities(samples)
+        # Convert to BinProbability objects
+        return [
+            BinProbability(lower=lower, upper=upper, probability=prob)
+            for (lower, upper), prob in zip(self.config.bins, probs)
+        ]
 
     # Methods for backtesting compatibility
 

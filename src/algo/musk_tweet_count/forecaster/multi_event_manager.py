@@ -95,6 +95,11 @@ class MultiEventConfig:
     # How often to check for new events (seconds)
     event_scan_interval: int = 3600  # 1 hour
 
+    # Projection model type: "asymmetric" (default) or "normal"
+    # - asymmetric: Uses actual Monte Carlo samples (preserves right-skew)
+    # - normal: Approximates with Normal distribution (symmetric)
+    projection_model: str = "asymmetric"
+
     # Start trading this many hours before settlement
     # (events closer to settlement than this won't be started)
     min_hours_before_settlement: float = 24.0
@@ -1011,6 +1016,7 @@ class MultiEventManager:
             training_days=self.config.training_days,
             use_gas=self.config.use_gas,
             event_name=event_info.short_name,
+            projection_model=self.config.projection_model,
         )
 
         # Create bot with shared EventStore

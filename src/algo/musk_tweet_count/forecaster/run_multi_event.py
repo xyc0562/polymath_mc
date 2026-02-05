@@ -569,6 +569,17 @@ def parse_args() -> argparse.Namespace:
         help="Minimum market price to trade (default: 0.03 = 3%%)",
     )
     parser.add_argument(
+        "--max-spread-ratio",
+        type=float,
+        default=2.0,
+        help="Maximum spread ratio (ask-bid)/bid to trade. Default: 2.0. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--no-require-two-sided",
+        action="store_true",
+        help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
+    )
+    parser.add_argument(
         "--min-utility",
         type=float,
         default=0.0001,
@@ -588,6 +599,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=_adaptive_defaults.min_delta_usd,
         help=f"Minimum chunk size in USD (default: ${_adaptive_defaults.min_delta_usd})",
+    )
+
+    # Projection model
+    parser.add_argument(
+        "--projection",
+        type=str,
+        default="asymmetric",
+        choices=["asymmetric", "normal", "skew_normal", "gamma"],
+        help="Projection model for computing bin probabilities. "
+             "'asymmetric' (default) uses actual Monte Carlo samples. "
+             "'normal' uses symmetric Normal CDF. "
+             "'skew_normal' uses Skew-Normal CDF (captures right-skew). "
+             "'gamma' uses Gamma CDF (natural for positive sums).",
     )
 
     # Other
@@ -662,6 +686,8 @@ async def main() -> None:
     else:
         logger.warning("Running in LIVE mode - real orders will be placed!")
 
+    logger.info(f"Projection model: {args.projection}")
+
     # Create CLOB client
     try:
         clob_client = create_clob_client()
@@ -678,6 +704,8 @@ async def main() -> None:
         friction_tail=0.03,
         min_perceived_prob=args.min_prob,
         min_market_price=args.min_market_price,
+        max_spread_ratio=args.max_spread_ratio,
+        require_two_sided_liquidity=not args.no_require_two_sided,
     )
 
     adaptive_delta_config = AdaptiveDeltaConfig(
@@ -709,6 +737,7 @@ async def main() -> None:
         tick_interval_seconds=args.tick_interval,
         dry_run=dry_run,
         max_event_duration_days=args.max_duration_days,
+        projection_model=args.projection,
     )
 
     # Get wallet address for position fetching

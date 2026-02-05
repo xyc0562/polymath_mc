@@ -620,8 +620,10 @@ def _generate_buy_yes_candidate(
             return None
 
     # Check minimum perceived probability (from our model)
-    if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
-        reject(f"model prob too low ({reservation_price:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
+    # Use actual model probability, not Kelly reservation price
+    model_prob_yes = portfolio.probabilities[bin_index]
+    if config.edge_buffer.min_perceived_prob > 0 and model_prob_yes < config.edge_buffer.min_perceived_prob:
+        reject(f"model prob too low ({model_prob_yes:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
         return None
 
     # Check minimum market price
@@ -847,8 +849,10 @@ def _generate_buy_no_candidate(
             return None
 
     # Check minimum perceived probability (from our model)
-    if config.edge_buffer.min_perceived_prob > 0 and reservation_price < config.edge_buffer.min_perceived_prob:
-        reject(f"model prob too low ({reservation_price:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
+    # Use actual model probability for NO, not Kelly reservation price
+    model_prob_no = 1.0 - portfolio.probabilities[bin_index]
+    if config.edge_buffer.min_perceived_prob > 0 and model_prob_no < config.edge_buffer.min_perceived_prob:
+        reject(f"model prob too low ({model_prob_no:.1%} < {config.edge_buffer.min_perceived_prob:.1%})")
         return None
 
     # Check minimum market price
