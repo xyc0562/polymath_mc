@@ -71,6 +71,9 @@ class ForecastResult:
     # Pure regime forecast for days 1-6 (no adjustment) — for baseline comparison
     future_days_pure: float = 0.0
 
+    # Raw Monte Carlo samples (optional, for computing custom bin probabilities)
+    samples: Optional[np.ndarray] = None
+
     def get_bin_probability(self, count: int) -> float:
         """Get probability that final count falls in the bin containing 'count'."""
         for bp in self.bin_probabilities:
@@ -324,6 +327,7 @@ class MonteCarloForecaster:
         now: datetime,
         horizon: int = 7,
         n_simulations: Optional[int] = None,
+        return_samples: bool = False,
     ) -> ForecastResult:
         """
         Run Monte Carlo simulation for N-day sum.
@@ -334,6 +338,7 @@ class MonteCarloForecaster:
             now: Current timestamp
             horizon: Forecast horizon in days (1-7)
             n_simulations: Number of simulations (default from config)
+            return_samples: If True, include raw Monte Carlo samples in result
 
         Returns:
             ForecastResult with distribution and bin probabilities
@@ -395,6 +400,7 @@ class MonteCarloForecaster:
                 simulation_time_ms=elapsed_ms,
                 today_interday_estimate=today_interday_mean,
                 future_days_pure=0.0,
+                samples=sums if return_samples else None,
             )
 
             logger.debug(
@@ -472,6 +478,7 @@ class MonteCarloForecaster:
             n_simulations=n_simulations,
             simulation_time_ms=elapsed_ms,
             future_days_pure=sum(future_means),
+            samples=sums if return_samples else None,
         )
 
         logger.debug(
@@ -486,6 +493,7 @@ class MonteCarloForecaster:
         base_date: date,
         horizon: int = 7,
         n_simulations: Optional[int] = None,
+        return_samples: bool = False,
     ) -> ForecastResult:
         """
         Forecast using only interday model (no intraday nowcast).
@@ -498,6 +506,7 @@ class MonteCarloForecaster:
             base_date: First day of the counting window (for weekend effect calculation)
             horizon: Number of days to forecast
             n_simulations: Number of simulations (default from config)
+            return_samples: If True, include raw Monte Carlo samples in result
 
         Returns:
             ForecastResult with distribution and bin probabilities
@@ -569,6 +578,7 @@ class MonteCarloForecaster:
             n_simulations=n_simulations,
             simulation_time_ms=elapsed_ms,
             future_days_pure=sum(all_means),
+            samples=sums if return_samples else None,
         )
 
         logger.debug(

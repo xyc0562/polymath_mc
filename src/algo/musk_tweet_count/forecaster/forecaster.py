@@ -623,6 +623,7 @@ class Musk7DayForecaster:
             )
 
         # Run Monte Carlo simulation for remaining days
+        # Always request samples so we can shift them properly for past_count
         if today < market_start_date:
             # Before counting window starts - use pure interday forecast
             # No intraday nowcast since we have no data from the counting window yet
@@ -631,6 +632,7 @@ class Musk7DayForecaster:
                 base_date=market_start_date,
                 horizon=remaining_days,
                 n_simulations=n_simulations,
+                return_samples=True,
             )
             logger.debug(
                 f"[forecast_for_event_window] Pre-counting window: using pure interday "
@@ -644,6 +646,7 @@ class Musk7DayForecaster:
                 now=now,
                 horizon=remaining_days,
                 n_simulations=n_simulations,
+                return_samples=True,
             )
 
         logger.debug(
@@ -653,7 +656,11 @@ class Musk7DayForecaster:
         )
 
         # Add past_count to the forecast distribution
-        # This shifts the entire distribution up by past_count
+        # This shifts the entire distribution (including raw samples) up by past_count
+        shifted_samples = None
+        if forecast.samples is not None:
+            shifted_samples = forecast.samples + past_count
+
         return ForecastResult(
             mean=forecast.mean + past_count,
             median=forecast.median + past_count,
@@ -662,9 +669,7 @@ class Musk7DayForecaster:
             p25=forecast.p25 + past_count,
             p75=forecast.p75 + past_count,
             p95=forecast.p95 + past_count,
-            bin_probabilities=self._shift_bin_probabilities(
-                forecast, past_count, n_simulations or self.config.monte_carlo.n_simulations
-            ),
+            bin_probabilities=self._shift_bin_probabilities(forecast, past_count),
             today_estimate=forecast.today_estimate,
             future_days_estimate=forecast.future_days_estimate,
             regime_adjustment=forecast.regime_adjustment,
@@ -672,25 +677,30 @@ class Musk7DayForecaster:
             simulation_time_ms=forecast.simulation_time_ms,
             today_interday_estimate=forecast.today_interday_estimate,
             future_days_pure=forecast.future_days_pure,
+            samples=shifted_samples,
         )
 
     def _shift_bin_probabilities(
         self,
         forecast: ForecastResult,
         shift: int,
-        n_simulations: int,
     ) -> List:
         """
         Recompute bin probabilities after shifting the distribution.
 
-        Instead of just shifting probabilities (which doesn't work for bins),
-        we regenerate samples from the shifted distribution.
+        Uses the actual Monte Carlo samples (which preserve asymmetry) shifted
+        by the past_count, rather than regenerating with a symmetric Normal.
         """
-        # Regenerate samples from the forecast distribution (approximated as normal)
-        rng = np.random.default_rng(42)
-        samples = rng.normal(forecast.mean + shift, forecast.std, n_simulations)
+        if forecast.samples is None:
+            raise RuntimeError(
+                "No samples in forecast result - cannot shift bin probabilities. "
+                "This indicates a bug: simulate_horizon should return samples."
+            )
 
-        # Compute bin probabilities
+        # Shift the actual asymmetric samples
+        samples = forecast.samples + shift
+
+        # Compute bin probabilities from shifted samples
         return self.monte_carlo._compute_bin_probabilities(samples)
 
     # Methods for backtesting compatibility

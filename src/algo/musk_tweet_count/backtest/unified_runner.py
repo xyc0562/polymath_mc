@@ -357,11 +357,10 @@ class UnifiedBacktestRunner:
                 end_ts=ts,
             )
 
-            # Compute bin probabilities
+            # Compute bin probabilities using the asymmetric Monte Carlo samples
             probabilities = self._compute_bin_probabilities(
                 event=event,
-                forecast_mean=forecast.mean,
-                forecast_std=max(30.0, forecast.std),
+                forecast=forecast,
                 current_count=current_count,
             )
 
@@ -725,18 +724,31 @@ class UnifiedBacktestRunner:
     def _compute_bin_probabilities(
         self,
         event: EventPriceData,
-        forecast_mean: float,
-        forecast_std: float,
+        forecast: "ForecastResult",
         current_count: int,
     ) -> List[float]:
-        """Compute probability for each bin using forecast distribution."""
+        """
+        Compute probability for each bin using forecast distribution.
+
+        Uses the actual Monte Carlo samples from the forecaster, which preserve
+        the asymmetric distribution (Log-normal + Negative Binomial). Falls back
+        to Normal approximation only if samples aren't available.
+        """
         import numpy as np
 
-        # Use seeded generator for reproducibility (avoid global random state)
-        rng = np.random.default_rng(42)
-        n_samples = 10000
-        samples = rng.normal(forecast_mean, forecast_std, n_samples)
+        # Use the actual Monte Carlo samples from the forecaster
+        # These preserve the asymmetric distribution
+        if forecast.samples is None:
+            raise RuntimeError(
+                "Forecast result has no samples - cannot compute probabilities. "
+                "This indicates a bug in the forecaster."
+            )
+
+        samples = forecast.samples.copy()
+
+        # Floor samples at current_count (can't go below current count)
         samples = np.maximum(samples, current_count)
+        n_samples = len(samples)
 
         probabilities = []
         for bin_data in event.bins:

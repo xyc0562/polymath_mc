@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # Orders below this will be rejected by the API
 MIN_ORDER_VALUE_USD = 1.0
 
+# Polymarket minimum order size (shares)
+# Orders below this will be rejected by the API
+MIN_ORDER_SIZE = 15
+
 
 def check_orderbook_liquidity(
     orderbook: UnifiedOrderbook,
@@ -569,6 +573,11 @@ def _generate_buy_yes_candidate(
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_ask
 
+    # Enforce minimum size (Polymarket 15 shares minimum)
+    if delta < MIN_ORDER_SIZE:
+        reject(f"size {delta:.1f} below minimum {MIN_ORDER_SIZE}")
+        return None
+
     # Check we have capital
     if portfolio.available_capital < delta_usd:
         reject(f"insufficient capital (need ${delta_usd:.2f})")
@@ -694,11 +703,15 @@ def _generate_sell_yes_candidate(
     delta = delta_usd / best_bid
 
     # Don't sell more than we have
+    # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.yes_shares)
-    delta *= config.kappa
 
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_bid < MIN_ORDER_VALUE_USD:
+        return None
+
+    # Enforce minimum size (Polymarket 15 shares minimum)
+    if delta < MIN_ORDER_SIZE:
         return None
 
     vwap, filled = compute_vwap_sell_yes(orderbook, delta)
@@ -788,6 +801,11 @@ def _generate_buy_no_candidate(
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_no_price
+
+    # Enforce minimum size (Polymarket 15 shares minimum)
+    if delta < MIN_ORDER_SIZE:
+        reject(f"size {delta:.1f} below minimum {MIN_ORDER_SIZE}")
+        return None
 
     if portfolio.available_capital < delta_usd:
         reject(f"insufficient capital (need ${delta_usd:.2f})")
@@ -912,11 +930,16 @@ def _generate_sell_no_candidate(
     # Convert USD to shares
     delta = delta_usd / best_no_price
 
+    # Don't sell more than we have
+    # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.no_shares)
-    delta *= config.kappa
 
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_no_price < MIN_ORDER_VALUE_USD:
+        return None
+
+    # Enforce minimum size (Polymarket 15 shares minimum)
+    if delta < MIN_ORDER_SIZE:
         return None
 
     vwap, filled = compute_vwap_sell_no(orderbook, delta)

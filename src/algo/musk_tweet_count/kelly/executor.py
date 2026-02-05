@@ -30,6 +30,7 @@ from .candidates import (
     TradeCandidate,
     TradeAction,
     generate_candidates,
+    MIN_ORDER_SIZE,
 )
 from .websocket_client import OrderbookManager
 
@@ -119,9 +120,6 @@ class OrderExecutor:
             # - Size: integer shares (avoids precision issues)
             rounded_price = round(price, 2)
             rounded_size = round(size)  # Round to integer shares
-
-            # Polymarket minimum order size is typically 15 shares
-            MIN_ORDER_SIZE = 15
 
             # Ensure minimum values
             if rounded_price <= 0 or rounded_price >= 1:

@@ -291,6 +291,10 @@ class GASKellyTradingBot:
         Uses forecast_for_event_window() which properly accounts for:
         1. Actual tweet counts from completed days in the event window
         2. Forecasts only the remaining days until settlement
+
+        The forecaster returns asymmetric Monte Carlo samples (from Log-normal
+        and Negative Binomial distributions), which we use directly to compute
+        probabilities for the market-specific bins.
         """
         import numpy as np
 
@@ -305,10 +309,24 @@ class GASKellyTradingBot:
             # Fallback to generic 7-day forecast if no event window specified
             result = self.forecaster.forecast_7day_distribution(use_cache=False)
 
-        # Use Monte Carlo samples to compute probabilities for market bins
-        n_samples = 10000
-        samples = np.random.normal(result.mean, result.std, n_samples)
-        samples = np.maximum(samples, current_count)  # Can't go below current count
+        # Use the actual Monte Carlo samples from the forecaster
+        # These preserve the asymmetric distribution (Log-normal + NegBin)
+        if result.samples is None:
+            logger.error(
+                "Forecast result has no samples - cannot compute probabilities. "
+                "This indicates a bug in the forecaster."
+            )
+            # Return cached probabilities if available, otherwise uniform
+            if self._cached_probabilities:
+                return self._cached_probabilities
+            num_bins = len(self._market_bins)
+            return [1.0 / num_bins] * num_bins if num_bins > 0 else []
+
+        samples = result.samples.copy()
+
+        # Floor samples at current_count (can't go below current count)
+        samples = np.maximum(samples, current_count)
+        n_samples = len(samples)
 
         # Compute probabilities for each market bin
         probabilities = []
