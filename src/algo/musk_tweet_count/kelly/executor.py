@@ -131,9 +131,9 @@ class OrderExecutor:
                 logger.warning(f"Size {rounded_size} below minimum {MIN_ORDER_SIZE}")
                 return None
 
-            logger.debug(
-                f"Order params: token={token_id[:16]}..., side={side}, "
-                f"price={rounded_price}, size={rounded_size}"
+            logger.info(
+                f"[ORDER PARAMS] {side} size={rounded_size:.2f} @ {rounded_price:.2f} "
+                f"(raw: {size:.4f} @ {price:.4f})"
             )
 
             order_args = OrderArgs(
@@ -246,10 +246,10 @@ class OrderExecutor:
                 error=f"Unknown action: {action}",
             )
 
-        # Log order details before placement
+        # Log order details before placement (note: size will be floored to 2 decimals in place_limit_order)
         logger.info(
             f"Placing order: {action.value} bin={candidate.bin_index} | "
-            f"{side} {size:.4f} @ {order_price:.4f} | "
+            f"{side} {size:.2f} @ {order_price:.2f} | "
             f"fair={candidate.reservation_price:.4f} edge={candidate.edge:+.2%} util={candidate.utility_gain:.4f} | "
             f"token={token_id[:16]}..."
         )
