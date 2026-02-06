@@ -692,6 +692,13 @@ class KellyExecutor:
                     # Continue to next iteration instead of breaking
                     # The bin will be filtered out by cooldown
                     continue
+                # Check if this is a balance/allowance error (e.g., rounding issues on SELL)
+                if result.error and "not enough balance" in result.error.lower():
+                    self._record_fak_failure(best.bin_index)
+                    logger.warning(
+                        f"Balance error for bin {best.bin_index}, adding to cooldown"
+                    )
+                    continue
                 # For other errors, break the loop
                 break
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 import logging
+import math
 
 from .config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig
 from .orderbook import (
@@ -708,6 +709,10 @@ def _generate_sell_yes_candidate(
     # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.yes_shares)
 
+    # Round down to 2 decimal places to avoid "not enough balance" errors
+    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.94279)
+    delta = math.floor(delta * 100) / 100
+
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_bid < MIN_ORDER_VALUE_USD:
         return None
@@ -738,8 +743,13 @@ def _generate_sell_yes_candidate(
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # For exits, skip tau check - we already passed fair value threshold
-    # Utility gain at fair value is ~0, which would block exits unnecessarily
+    # For exits, allow utility >= 0 (selling at or above fair value)
+    # Block negative utility (selling below fair value is always bad)
+    if utility_gain < 0:
+        logger.debug(
+            f"SELL_YES bin {bin_index}: negative utility ({utility_gain:.6f}), skipping"
+        )
+        return None
 
     return TradeCandidate(
         bin_index=bin_index,
@@ -938,6 +948,10 @@ def _generate_sell_no_candidate(
     # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.no_shares)
 
+    # Round down to 2 decimal places to avoid "not enough balance" errors
+    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.94279)
+    delta = math.floor(delta * 100) / 100
+
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_no_price < MIN_ORDER_VALUE_USD:
         return None
@@ -968,8 +982,13 @@ def _generate_sell_no_candidate(
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # For exits, skip tau check - we already passed fair value threshold
-    # Utility gain at fair value is ~0, which would block exits unnecessarily
+    # For exits, allow utility >= 0 (selling at or above fair value)
+    # Block negative utility (selling below fair value is always bad)
+    if utility_gain < 0:
+        logger.debug(
+            f"SELL_NO bin {bin_index}: negative utility ({utility_gain:.6f}), skipping"
+        )
+        return None
 
     return TradeCandidate(
         bin_index=bin_index,

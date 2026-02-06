@@ -50,7 +50,7 @@ class EdgeBufferConfig:
     # Minimum market price to trade (avoids illiquid tail bets)
     # Don't buy YES if market price < this, don't buy NO if market price < this
     # Set to 0 to disable.
-    min_market_price: float = 0.03  # 3%
+    min_market_price: float = 0.02  # 3%
 
     # Require two-sided liquidity (both bid and ask must exist)
     # If True, skip bins where only one side has liquidity
