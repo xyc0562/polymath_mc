@@ -119,9 +119,10 @@ class OrderExecutor:
         try:
             # Round to Polymarket precision requirements:
             # - Price: 2 decimals (tick_size=0.01)
-            # - Size: 2 decimals, floor to avoid exceeding balance/holdings
+            # - Maker amount (size * price) must be 2 decimals max
+            # Using integer size guarantees maker_amount has at most 2 decimals
             rounded_price = round(price, 2)
-            rounded_size = math.floor(size * 100) / 100
+            rounded_size = math.floor(size)  # Integer to ensure maker_amount precision
 
             # Ensure minimum values
             if rounded_price <= 0 or rounded_price >= 1:
@@ -131,9 +132,10 @@ class OrderExecutor:
                 logger.warning(f"Size {rounded_size} below minimum {MIN_ORDER_SIZE}")
                 return None
 
+            maker_amount = rounded_size * rounded_price
             logger.info(
-                f"[ORDER PARAMS] {side} size={rounded_size:.2f} @ {rounded_price:.2f} "
-                f"(raw: {size:.4f} @ {price:.4f})"
+                f"[ORDER PARAMS] {side} size={rounded_size:.0f} @ {rounded_price:.2f} "
+                f"maker_amt={maker_amount:.2f} (raw: {size:.4f} @ {price:.4f})"
             )
 
             order_args = OrderArgs(
