@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .runner import BacktestRunner, BacktestConfig, BacktestResult
-from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, CollateralConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
 import sys
@@ -369,6 +369,14 @@ def main():
     )
 
     parser.add_argument(
+        "--c-bin-max-ratio",
+        type=float,
+        default=0.15,
+        help="Max collateral per bin as ratio of c_event_max. Default: 0.15 (15%%). "
+             "With $500 event max, this means $75 max per bin.",
+    )
+
+    parser.add_argument(
         "--trade-verbose",
         action="store_true",
         help="Print detailed information about each trade (unified mode only). "
@@ -512,6 +520,9 @@ def main():
                 max_orders_per_tick=max_orders,
                 min_order_delay_seconds=0.0,
                 max_orders_per_minute=1000,
+            ),
+            collateral=CollateralConfig(
+                c_bin_max_ratio=args.c_bin_max_ratio,
             ),
             max_iters_per_tick=50,
         )
