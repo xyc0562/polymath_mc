@@ -364,8 +364,8 @@ def main():
     parser.add_argument(
         "--t-stop",
         type=float,
-        default=3.0,
-        help="Stop trading X hours before settlement. Default: 3.0",
+        default=None,
+        help="Stop trading X hours before settlement (default: from KellyConfig)",
     )
 
     parser.add_argument(
@@ -488,10 +488,11 @@ def main():
         from .unified_runner import UnifiedBacktestRunner, UnifiedBacktestConfig
 
         # Build KellyConfig with CLI overrides
+        _default_kelly = KellyConfig()
         trading_config = KellyConfig(
             kappa=args.kappa,
             min_utility=args.min_utility,
-            t_stop_hours=args.t_stop,
+            t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
             edge_buffer=EdgeBufferConfig(
                 required_roi=args.roi,
                 friction_mid=0.015,
