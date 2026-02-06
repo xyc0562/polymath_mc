@@ -421,7 +421,15 @@ def generate_candidates(
 
         # Generate BUY YES candidate (only if we don't have NO position)
         # If we have NO, we should SELL_NO first rather than buying YES
-        if not has_no:
+        # EXCEPTION: If NO position is stranded (below minimum size OR value < $1), allow buying YES
+        no_is_stranded = False
+        if has_no:
+            no_shares = position.no_shares
+            # NO sell price = 1 - YES ask price
+            no_sell_price = 1.0 - orderbook.yes_asks[0].price if orderbook.yes_asks else 0.0
+            no_value = no_shares * no_sell_price
+            no_is_stranded = no_shares < MIN_ORDER_SIZE or no_value < MIN_ORDER_VALUE_USD
+        if not has_no or no_is_stranded:
             if yes_liquidity_ok:
                 candidate = _generate_buy_yes_candidate(
                     bin_index=bin_index,
@@ -456,7 +464,15 @@ def generate_candidates(
 
         # Generate BUY NO candidate (only if we don't have YES position)
         # If we have YES, we should SELL_YES first rather than buying NO
-        if not has_yes:
+        # EXCEPTION: If YES position is stranded (below minimum size OR value < $1), allow buying NO
+        yes_is_stranded = False
+        if has_yes:
+            yes_shares = position.yes_shares
+            # YES sell price = best bid
+            yes_sell_price = orderbook.yes_bids[0].price if orderbook.yes_bids else 0.0
+            yes_value = yes_shares * yes_sell_price
+            yes_is_stranded = yes_shares < MIN_ORDER_SIZE or yes_value < MIN_ORDER_VALUE_USD
+        if not has_yes or yes_is_stranded:
             if no_liquidity_ok:
                 candidate = _generate_buy_no_candidate(
                     bin_index=bin_index,
@@ -713,6 +729,16 @@ def _generate_sell_yes_candidate(
     # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
 
+    # PREVENTION: Don't leave stranded positions (below minimum size or value)
+    # If partial sell would leave < MIN_ORDER_SIZE shares, either sell all or don't sell
+    remaining_shares = position.yes_shares - delta
+    if remaining_shares > 0:
+        remaining_value = remaining_shares * best_bid
+        if remaining_shares < MIN_ORDER_SIZE or remaining_value < MIN_ORDER_VALUE_USD:
+            # Would create stranded position - sell all instead
+            delta = position.yes_shares
+            delta = math.floor(delta * 100) / 100
+
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_bid < MIN_ORDER_VALUE_USD:
         return None
@@ -951,6 +977,16 @@ def _generate_sell_no_candidate(
     # Floor to 2 decimal places to avoid "not enough balance" errors
     # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
+
+    # PREVENTION: Don't leave stranded positions (below minimum size or value)
+    # If partial sell would leave < MIN_ORDER_SIZE shares, either sell all or don't sell
+    remaining_shares = position.no_shares - delta
+    if remaining_shares > 0:
+        remaining_value = remaining_shares * best_no_price
+        if remaining_shares < MIN_ORDER_SIZE or remaining_value < MIN_ORDER_VALUE_USD:
+            # Would create stranded position - sell all instead
+            delta = position.no_shares
+            delta = math.floor(delta * 100) / 100
 
     # For exits, enforce minimum value (Polymarket $1 minimum)
     if delta * best_no_price < MIN_ORDER_VALUE_USD:
