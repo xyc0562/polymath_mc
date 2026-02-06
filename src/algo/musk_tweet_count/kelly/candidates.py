@@ -445,9 +445,14 @@ def generate_candidates(
                     candidates.append(candidate)
             elif verbose:
                 rejection_reasons.setdefault(bin_index, []).append(f"BUY_YES: {yes_reason}")
+        elif verbose and has_no and not no_is_stranded:
+            # Log why BUY_YES is blocked due to existing NO position
+            rejection_reasons.setdefault(bin_index, []).append(
+                f"BUY_YES: have {position.no_shares:.0f} NO shares (sell NO first)"
+            )
 
         # Generate SELL YES candidate (if we have position)
-        # Use model probability (not reservation price) for exit threshold
+        # Use min(model probability, Kelly reservation) for exit threshold
         # NOTE: Always allow selling even if liquidity is poor (need to exit positions)
         if has_yes:
             model_prob_yes = portfolio.probabilities[bin_index]
@@ -456,6 +461,7 @@ def generate_candidates(
                 orderbook=orderbook,
                 portfolio=portfolio,
                 model_probability=model_prob_yes,
+                reservation_price=reservation_yes,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
             )
@@ -488,9 +494,14 @@ def generate_candidates(
                     candidates.append(candidate)
             elif verbose:
                 rejection_reasons.setdefault(bin_index, []).append(f"BUY_NO: {no_reason}")
+        elif verbose and has_yes and not yes_is_stranded:
+            # Log why BUY_NO is blocked due to existing YES position
+            rejection_reasons.setdefault(bin_index, []).append(
+                f"BUY_NO: have {position.yes_shares:.0f} YES shares (sell YES first)"
+            )
 
         # Generate SELL NO candidate (if we have position)
-        # Use model probability (not reservation price) for exit threshold
+        # Use min(model probability, Kelly reservation) for exit threshold
         # NOTE: Always allow selling even if liquidity is poor (need to exit positions)
         if has_no:
             model_prob_no = 1.0 - portfolio.probabilities[bin_index]
@@ -499,6 +510,7 @@ def generate_candidates(
                 orderbook=orderbook,
                 portfolio=portfolio,
                 model_probability=model_prob_no,
+                reservation_price=reservation_no,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
             )
@@ -681,6 +693,7 @@ def _generate_sell_yes_candidate(
     orderbook: UnifiedOrderbook,
     portfolio: Portfolio,
     model_probability: float,
+    reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
@@ -690,8 +703,11 @@ def _generate_sell_yes_candidate(
     Since we only generate SELL_YES when we have a YES position, this is
     always an EXIT (closing existing long), not a new short.
 
-    For exits, we use model probability as the exit threshold (not reservation
-    price). Exit when edge disappears (market >= model fair value).
+    For exits, we use the LOWER of model probability and Kelly reservation
+    price as the threshold. This allows:
+    1. Exit when market >= model fair value (edge disappeared)
+    2. Exit when market >= Kelly reservation price (utility-based exit,
+       e.g., when concentrated position makes hedging valuable)
     """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_yes_position:
@@ -751,20 +767,22 @@ def _generate_sell_yes_candidate(
     if filled <= 0:
         return None
 
-    # For EXITS: use model probability as threshold (exit when edge disappears)
-    # We exit when market >= model fair value, not based on Kelly reservation
-    exit_threshold = model_probability
+    # For EXITS: use the LOWER of model probability and Kelly reservation price
+    # This allows exit when EITHER condition is met:
+    # 1. Market >= model fair value (edge disappeared)
+    # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
+    exit_threshold = min(model_probability, reservation_price)
 
-    # Only exit if we can get fair value or better
+    # Only exit if we can get threshold or better
     if vwap < exit_threshold:
         logger.debug(
             f"SELL_YES bin {bin_index}: below exit threshold "
-            f"(vwap={vwap:.4f}, fair={exit_threshold:.4f})"
+            f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
         )
         return None
 
-    # Calculate edge relative to model fair value
-    actual_edge = (vwap - model_probability) / model_probability if model_probability > 0 else 0.0
+    # Calculate edge relative to the threshold used
+    actual_edge = (vwap - exit_threshold) / exit_threshold if exit_threshold > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
@@ -783,7 +801,7 @@ def _generate_sell_yes_candidate(
         size=filled,
         price=vwap,
         utility_gain=utility_gain,
-        reservation_price=model_probability,  # Use model prob as "fair price" for exits
+        reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
     )
 
@@ -928,6 +946,7 @@ def _generate_sell_no_candidate(
     orderbook: UnifiedOrderbook,
     portfolio: Portfolio,
     model_probability: float,
+    reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
 ) -> Optional[TradeCandidate]:
@@ -937,8 +956,11 @@ def _generate_sell_no_candidate(
     Since we only generate SELL_NO when we have a NO position, this is
     always an EXIT (closing existing long), not a new short.
 
-    For exits, we use model probability as the exit threshold (not reservation
-    price). Exit when edge disappears (market >= model fair value).
+    For exits, we use the LOWER of model probability and Kelly reservation
+    price as the threshold. This allows:
+    1. Exit when market >= model fair value (edge disappeared)
+    2. Exit when market >= Kelly reservation price (utility-based exit,
+       e.g., when concentrated position makes hedging valuable)
     """
     position = portfolio.get_position(bin_index)
     if not position or not position.has_no_position:
@@ -1000,20 +1022,22 @@ def _generate_sell_no_candidate(
     if filled <= 0:
         return None
 
-    # For EXITS: use model probability as threshold (exit when edge disappears)
-    # We exit when market >= model fair value, not based on Kelly reservation
-    exit_threshold = model_probability
+    # For EXITS: use the LOWER of model probability and Kelly reservation price
+    # This allows exit when EITHER condition is met:
+    # 1. Market >= model fair value (edge disappeared)
+    # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
+    exit_threshold = min(model_probability, reservation_price)
 
-    # Only exit if we can get fair value or better
+    # Only exit if we can get threshold or better
     if vwap < exit_threshold:
         logger.debug(
             f"SELL_NO bin {bin_index}: below exit threshold "
-            f"(vwap={vwap:.4f}, fair={exit_threshold:.4f})"
+            f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
         )
         return None
 
-    # Calculate edge relative to model fair value
-    actual_edge = (vwap - model_probability) / model_probability if model_probability > 0 else 0.0
+    # Calculate edge relative to the threshold used
+    actual_edge = (vwap - exit_threshold) / exit_threshold if exit_threshold > 0 else 0.0
 
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
@@ -1032,7 +1056,7 @@ def _generate_sell_no_candidate(
         size=filled,
         price=vwap,
         utility_gain=utility_gain,
-        reservation_price=model_probability,  # Use model prob as "fair price" for exits
+        reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
     )
 
