@@ -587,7 +587,10 @@ class GASKellyTradingBot:
             current_date += timedelta(days=1)
 
         # Calculate remaining days
-        if today > last_counting_day:
+        if today < self.market_start_date:
+            # Before counting window starts - use window start, not current date
+            remaining_days = (last_counting_day - self.market_start_date).days + 1
+        elif today > last_counting_day:
             remaining_days = 0
         else:
             remaining_days = (last_counting_day - today).days + 1

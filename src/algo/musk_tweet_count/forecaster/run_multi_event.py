@@ -319,6 +319,12 @@ async def discover_musk_tweet_events(clob_client: ClobClient) -> List[EventInfo]
         event_title = event_data.get("title", "")
         event_id = event_data.get("id", "")
 
+        # Filter for Musk tweet events only (API may return other events under same tag)
+        title_lower = event_title.lower()
+        if "musk" not in title_lower and "elon" not in title_lower:
+            logger.debug(f"Skipping non-Musk event: {event_title}")
+            continue
+
         # Parse counting dates from title
         market_start, settlement = parse_counting_dates_from_title(event_title)
 

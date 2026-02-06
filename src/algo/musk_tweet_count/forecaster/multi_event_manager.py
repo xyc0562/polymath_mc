@@ -1578,20 +1578,21 @@ class MultiEventManager:
                 if not token_id or size <= 0:
                     return None, None
 
-                # Extract value - use initialValue (cost basis) or compute from avgPrice
+                # Extract both cost basis and current market value
                 avg_price = float(pos.get("avgPrice", 0))
                 initial_value = float(pos.get("initialValue", 0))
                 current_value = float(pos.get("currentValue", 0))
 
-                # Use initialValue (cost basis) as the position value for collateral tracking
-                # This represents what we actually spent, not current market value
-                value = initial_value if initial_value > 0 else (size * avg_price)
+                # Cost basis: what we actually spent (for allocation limit tracking)
+                cost_basis = initial_value if initial_value > 0 else (size * avg_price)
+                # Current value: what it's worth now (for portfolio value tracking)
+                market_value = current_value if current_value > 0 else (size * avg_price)
 
                 return token_id, {
                     "shares": size,
-                    "value": value,
+                    "cost_basis": cost_basis,
+                    "current_value": market_value,
                     "avg_price": avg_price,
-                    "current_value": current_value,
                 }
 
             # Handle different response formats
