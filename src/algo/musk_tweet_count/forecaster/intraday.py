@@ -530,16 +530,38 @@ class IntradayNowcast:
         # Ensure prediction is at least cum_so_far
         prediction = max(prediction, cum_so_far)
 
-        # Get uncertainty
-        uncertainty = self._get_uncertainty()
+        # Get uncertainty (scaled by remaining time)
+        uncertainty = self._get_uncertainty(F_tau)
 
         return prediction, uncertainty
 
-    def _get_uncertainty(self) -> float:
-        """Get prediction uncertainty (std)."""
+    def _get_uncertainty(self, F_tau: float = 0.0) -> float:
+        """
+        Get prediction uncertainty (std), scaled by remaining time.
+
+        Uncertainty decays as more of the day is observed. The remaining
+        variance is proportional to (1 - F_tau), so std scales as sqrt(1 - F_tau).
+
+        At F_tau = 0 (start of day): full uncertainty
+        At F_tau = 0.5 (midday): ~71% of full uncertainty
+        At F_tau = 0.9 (90% done): ~32% of full uncertainty
+        At F_tau = 0.97 (1.4h left): ~17% of full uncertainty
+
+        Args:
+            F_tau: Fractional progress through the day (0 to 1)
+
+        Returns:
+            Scaled uncertainty std
+        """
         if self._model is not None and self._residual_std > 0:
-            return self._residual_std
-        return self._historical_std
+            base_std = self._residual_std
+        else:
+            base_std = self._historical_std
+
+        # Scale by remaining time fraction
+        # Clip F_tau to [0, 0.99] to avoid zero std at end of day
+        remaining_fraction = max(1.0 - F_tau, 0.01)
+        return base_std * np.sqrt(remaining_fraction)
 
     @property
     def historical_mean(self) -> float:
