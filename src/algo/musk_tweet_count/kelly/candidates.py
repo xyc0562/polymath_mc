@@ -709,8 +709,8 @@ def _generate_sell_yes_candidate(
     # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.yes_shares)
 
-    # Round down to 2 decimal places to avoid "not enough balance" errors
-    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.94279)
+    # Floor to 2 decimal places to avoid "not enough balance" errors
+    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
 
     # For exits, enforce minimum value (Polymarket $1 minimum)
@@ -948,8 +948,8 @@ def _generate_sell_no_candidate(
     # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
     delta = min(delta, position.no_shares)
 
-    # Round down to 2 decimal places to avoid "not enough balance" errors
-    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.94279)
+    # Floor to 2 decimal places to avoid "not enough balance" errors
+    # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
 
     # For exits, enforce minimum value (Polymarket $1 minimum)

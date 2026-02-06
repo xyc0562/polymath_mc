@@ -16,6 +16,7 @@ This ensures portfolio state matches actual on-chain positions.
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, TYPE_CHECKING
@@ -87,6 +88,7 @@ class OrderExecutor:
         """
         self.client = clob_client
         self.dry_run = dry_run
+        self._last_error: Optional[str] = None  # Store last error message for cooldown logic
 
     def place_limit_order(
         self,
@@ -117,9 +119,9 @@ class OrderExecutor:
         try:
             # Round to Polymarket precision requirements:
             # - Price: 2 decimals (tick_size=0.01)
-            # - Size: integer shares (avoids precision issues)
+            # - Size: 2 decimals, floor to avoid exceeding balance/holdings
             rounded_price = round(price, 2)
-            rounded_size = round(size)  # Round to integer shares
+            rounded_size = math.floor(size * 100) / 100
 
             # Ensure minimum values
             if rounded_price <= 0 or rounded_price >= 1:
@@ -155,6 +157,7 @@ class OrderExecutor:
 
         except Exception as e:
             logger.error(f"Order failed: {e}")
+            self._last_error = str(e)
             return None
 
     def place_market_order(
@@ -273,7 +276,7 @@ class OrderExecutor:
             return ExecutionResult(
                 success=False,
                 candidate=candidate,
-                error="Order placement failed",
+                error=self._last_error or "Order placement failed",
                 is_pending=False,
             )
 
