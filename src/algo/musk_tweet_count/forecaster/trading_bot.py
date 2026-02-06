@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from py_clob_client.client import ClobClient
 
 from .config import ForecasterConfig
-from .forecaster import Musk7DayForecaster
+from .forecaster import TweetCountForecaster
 from .projection import ProjectionModel, AsymmetricProjection, create_projection_model
 from ..kelly.config import KellyConfig
 from ..kelly.integration import KellyTradingBot
@@ -134,7 +134,7 @@ class GASKellyTradingBot:
 
         # Initialize forecaster with shared EventStore
         # Bot relies on upstream MultiEventManager for data (no standalone mode)
-        self.forecaster = Musk7DayForecaster(forecaster_config, event_store=event_store)
+        self.forecaster = TweetCountForecaster(forecaster_config, event_store=event_store)
 
         # Kelly bot (initialized during setup)
         self.kelly_bot: Optional[KellyTradingBot] = None

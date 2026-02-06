@@ -15,7 +15,7 @@ import numpy as np
 
 from .config import ForecasterConfig
 from .data import ContractDayUtils, TweetEvent
-from .intraday import IntradayNowcast
+from .intraday import BaseIntradayForecaster
 from .interday import InterdayForecaster
 from .monte_carlo import BinProbability, ForecastResult
 
@@ -34,7 +34,7 @@ class EnsembleMonteCarloForecaster:
     def __init__(
         self,
         config: ForecasterConfig,
-        nowcast: IntradayNowcast,
+        nowcast: BaseIntradayForecaster,
         interday_forecasters: List[InterdayForecaster],
         contract_utils: ContractDayUtils,
         weights: Optional[List[float]] = None,
@@ -148,7 +148,7 @@ class EnsembleMonteCarloForecaster:
             return 1.0
 
         is_weekend = self.contract_utils.is_weekend(contract_date)
-        F_tau = self.nowcast.progress_curve.get_expected_progress(tau, is_weekend)
+        F_tau = self.nowcast.get_expected_progress(tau, is_weekend)
 
         if F_tau < F_gate:
             return 1.0

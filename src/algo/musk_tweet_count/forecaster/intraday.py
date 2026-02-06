@@ -4,18 +4,22 @@ Intraday model for nowcasting today's final tweet count.
 Components:
 - IntradayProgressCurve: F(τ) = expected fraction of day's tweets by minute τ
 - BurstFeatureExtractor: Extract burst/session features from timestamps
-- IntradayNowcast: Ridge regression model to predict final daily count
+- BaseIntradayForecaster: Abstract interface for intraday forecasters
+- IntradayNowcast: Ridge regression model (original implementation)
+- BucketIntradayForecaster: Bucket-based model with regime adjustment
 """
 
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy import stats
 from sklearn.linear_model import Ridge
 
-from .config import IntradayCurveConfig, BurstFeaturesConfig, NowcastConfig
+from .config import IntradayCurveConfig, BurstFeaturesConfig, NowcastConfig, BucketNowcastConfig
 from .data import ContractDayUtils, TweetEvent
 
 logger = logging.getLogger(__name__)
@@ -50,19 +54,25 @@ class IntradayProgressCurve:
         # Fallback curve (uniform progress)
         self._fallback_curve = np.linspace(0, 1, self.n_bins + 1)[1:]
 
-    def fit(self, historical_timestamps: Dict[date, List[datetime]]) -> None:
+    def fit(
+        self,
+        historical_timestamps: Dict[date, List[datetime]],
+        as_of_date: Optional[date] = None,
+    ) -> None:
         """
         Fit progress curves from historical data.
 
         Args:
             historical_timestamps: Dict mapping contract_date -> List[timestamp]
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
         """
         weekday_curves = []
         weekend_curves = []
         weekday_weights = []
         weekend_weights = []
 
-        today = self.contract_utils.get_current_contract_date()
+        # Use as_of_date for backtesting, otherwise use actual current date
+        today = as_of_date if as_of_date is not None else self.contract_utils.get_current_contract_date()
 
         for contract_date, timestamps in historical_timestamps.items():
             # Skip if not enough tweets
@@ -320,9 +330,88 @@ class BurstFeatureExtractor:
         return max_count
 
 
-class IntradayNowcast:
+class BaseIntradayForecaster(ABC):
+    """
+    Abstract base class for intraday forecasters.
+
+    All intraday forecasters must implement:
+    - fit(): Train the model on historical data
+    - predict(): Predict final count and uncertainty for today
+    - historical_mean, historical_std: Properties for fallback values
+    """
+
+    @abstractmethod
+    def fit(
+        self,
+        historical_events: Dict[date, List[TweetEvent]],
+        historical_counts: Dict[date, int],
+        as_of_date: Optional[date] = None,
+    ) -> None:
+        """
+        Fit the forecaster on historical data.
+
+        Args:
+            historical_events: Dict mapping contract_date -> events
+            historical_counts: Dict mapping contract_date -> final count
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
+        """
+        pass
+
+    @abstractmethod
+    def predict(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+    ) -> Tuple[float, float]:
+        """
+        Predict final count for today.
+
+        Args:
+            events: Today's events so far
+            contract_date: Today's contract date
+            now: Current timestamp
+
+        Returns:
+            Tuple of (predicted_count, uncertainty_std)
+        """
+        pass
+
+    @abstractmethod
+    def get_expected_progress(self, tau: int, is_weekend: bool = False) -> float:
+        """
+        Get expected fraction of day's activity completed by minute τ.
+
+        This is used for regime adjustment calculations.
+
+        Args:
+            tau: Minutes since noon
+            is_weekend: Whether it's a weekend contract-day
+
+        Returns:
+            Expected fraction (0 to 1)
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def historical_mean(self) -> float:
+        """Get historical daily mean."""
+        pass
+
+    @property
+    @abstractmethod
+    def historical_std(self) -> float:
+        """Get historical daily std."""
+        pass
+
+
+class IntradayNowcast(BaseIntradayForecaster):
     """
     Ridge regression model to predict today's final tweet count.
+
+    Original implementation using F(τ) progress curve and Ridge regression
+    with burst features.
     """
 
     def __init__(
@@ -356,6 +445,7 @@ class IntradayNowcast:
         self,
         historical_events: Dict[date, List[TweetEvent]],
         historical_counts: Dict[date, int],
+        as_of_date: Optional[date] = None,
     ) -> None:
         """
         Fit the nowcast model.
@@ -363,12 +453,14 @@ class IntradayNowcast:
         Args:
             historical_events: Dict mapping contract_date -> events
             historical_counts: Dict mapping contract_date -> final count
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
         """
         X = []
         y = []
         weights = []
 
-        today = self.contract_utils.get_current_contract_date()
+        # Use as_of_date for backtesting, otherwise use actual current date
+        today = as_of_date if as_of_date is not None else self.contract_utils.get_current_contract_date()
 
         for contract_date, events in historical_events.items():
             final_count = historical_counts.get(contract_date, len(events))
@@ -562,6 +654,394 @@ class IntradayNowcast:
         # Clip F_tau to [0, 0.99] to avoid zero std at end of day
         remaining_fraction = max(1.0 - F_tau, 0.01)
         return base_std * np.sqrt(remaining_fraction)
+
+    def get_expected_progress(self, tau: int, is_weekend: bool = False) -> float:
+        """
+        Get expected fraction of day's activity completed by minute τ.
+
+        Delegates to the progress curve.
+        """
+        return self.progress_curve.get_expected_progress(tau, is_weekend)
+
+    @property
+    def historical_mean(self) -> float:
+        """Get historical daily mean."""
+        return self._historical_mean
+
+    @property
+    def historical_std(self) -> float:
+        """Get historical daily std."""
+        return self._historical_std
+
+
+@dataclass
+class BucketDistribution:
+    """Distribution parameters for a single time bucket."""
+
+    bucket_idx: int
+    start_tau: int  # Minutes since noon
+    end_tau: int
+    mean: float  # Historical mean count for this bucket
+    std: float  # Historical std
+    dispersion_k: float  # Negative Binomial dispersion parameter
+
+
+class BucketIntradayForecaster(BaseIntradayForecaster):
+    """
+    Bucket-based intraday forecaster.
+
+    Divides the day into N buckets (default 8 = 3-hour windows) and learns
+    the distribution of tweet counts for each bucket. At forecast time:
+
+    1. Compute regime multiplier = observed / expected (clamped)
+    2. Sample remaining buckets from Negative Binomial distributions
+    3. Return: observed + sum(sampled remaining buckets)
+
+    This approach respects intraday activity patterns (e.g., low activity
+    during sleep hours, peak activity in evening).
+    """
+
+    def __init__(
+        self,
+        config: BucketNowcastConfig,
+        contract_utils: ContractDayUtils,
+    ):
+        """
+        Initialize bucket forecaster.
+
+        Args:
+            config: Bucket nowcast configuration
+            contract_utils: Contract-day utilities
+        """
+        self.config = config
+        self.contract_utils = contract_utils
+
+        # Bucket parameters
+        self.n_buckets = config.n_buckets
+        self.bucket_size = 1440 // config.n_buckets  # Minutes per bucket
+
+        # Learned distributions (separate for weekday/weekend)
+        self._weekday_buckets: List[BucketDistribution] = []
+        self._weekend_buckets: List[BucketDistribution] = []
+
+        # Historical stats
+        self._historical_mean: float = 50.0
+        self._historical_std: float = 30.0
+
+        # Fitted flag
+        self._fitted = False
+
+    def fit(
+        self,
+        historical_events: Dict[date, List[TweetEvent]],
+        historical_counts: Dict[date, int],
+        as_of_date: Optional[date] = None,
+    ) -> None:
+        """
+        Fit bucket distributions from historical data.
+
+        Args:
+            historical_events: Dict mapping contract_date -> events
+            historical_counts: Dict mapping contract_date -> final count
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
+        """
+        # Compute overall historical stats
+        counts = list(historical_counts.values())
+        if not counts:
+            raise ValueError(
+                "No historical counts provided to BucketIntradayForecaster.fit(). "
+                "Cannot train without data."
+            )
+        self._historical_mean = float(np.mean(counts))
+        self._historical_std = float(np.std(counts))
+
+        # Separate weekday and weekend data
+        weekday_bucket_counts: Dict[int, List[int]] = {i: [] for i in range(self.n_buckets)}
+        weekend_bucket_counts: Dict[int, List[int]] = {i: [] for i in range(self.n_buckets)}
+
+        # Use as_of_date for backtesting, otherwise use actual current date
+        today = as_of_date if as_of_date is not None else self.contract_utils.get_current_contract_date()
+
+        for contract_date, events in historical_events.items():
+            # Skip if outside training window
+            days_ago = (today - contract_date).days
+            if days_ago > self.config.training_window_days:
+                continue
+
+            # Count tweets per bucket
+            bucket_counts = self._count_events_per_bucket(events, contract_date)
+
+            # Add to appropriate list
+            is_weekend = self.contract_utils.is_weekend(contract_date)
+            target = weekend_bucket_counts if is_weekend else weekday_bucket_counts
+
+            for bucket_idx, count in enumerate(bucket_counts):
+                target[bucket_idx].append(count)
+
+        # Fit distributions for each bucket
+        self._weekday_buckets = self._fit_bucket_distributions(weekday_bucket_counts)
+        self._weekend_buckets = self._fit_bucket_distributions(weekend_bucket_counts)
+
+        self._fitted = True
+
+        logger.info(
+            f"Fitted bucket forecaster: {self.n_buckets} buckets, "
+            f"bucket_size={self.bucket_size}min, "
+            f"weekday_days={len(weekday_bucket_counts[0])}, "
+            f"weekend_days={len(weekend_bucket_counts[0])}"
+        )
+
+        # Log bucket means for debugging
+        if self._weekday_buckets:
+            means = [b.mean for b in self._weekday_buckets]
+            logger.debug(f"Weekday bucket means: {[f'{m:.1f}' for m in means]}")
+        if self._weekend_buckets:
+            means = [b.mean for b in self._weekend_buckets]
+            logger.debug(f"Weekend bucket means: {[f'{m:.1f}' for m in means]}")
+
+    def _count_events_per_bucket(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+    ) -> List[int]:
+        """Count events in each bucket for a given day."""
+        counts = [0] * self.n_buckets
+
+        for event in events:
+            tau = self.contract_utils.get_tau(event.timestamp, contract_date)
+            bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
+            counts[bucket_idx] += 1
+
+        return counts
+
+    def _fit_bucket_distributions(
+        self,
+        bucket_counts: Dict[int, List[int]],
+    ) -> List[BucketDistribution]:
+        """Fit Negative Binomial distribution for each bucket."""
+        distributions = []
+
+        for bucket_idx in range(self.n_buckets):
+            counts = bucket_counts[bucket_idx]
+
+            if not counts:
+                raise ValueError(
+                    f"No data for bucket {bucket_idx} (τ={bucket_idx * self.bucket_size}-"
+                    f"{(bucket_idx + 1) * self.bucket_size}). "
+                    f"Insufficient training data - need more historical days."
+                )
+
+            else:
+                mean = float(np.mean(counts))
+                std = float(np.std(counts))
+                var = std ** 2
+
+                # Fit Negative Binomial dispersion k
+                # Var = μ + μ²/k  →  k = μ² / (Var - μ)
+                if var > mean and mean > 0:
+                    k = mean ** 2 / (var - mean)
+                    k = max(k, self.config.min_dispersion_k)
+                else:
+                    # Underdispersed or zero mean - use high k (approaches Poisson)
+                    k = 100.0
+
+                dist = BucketDistribution(
+                    bucket_idx=bucket_idx,
+                    start_tau=bucket_idx * self.bucket_size,
+                    end_tau=(bucket_idx + 1) * self.bucket_size,
+                    mean=mean,
+                    std=std,
+                    dispersion_k=k,
+                )
+
+            distributions.append(dist)
+
+        return distributions
+
+    def predict(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+    ) -> Tuple[float, float]:
+        """
+        Predict final count using bucket-based Monte Carlo.
+
+        Args:
+            events: Today's events so far
+            contract_date: Today's contract date
+            now: Current timestamp
+
+        Returns:
+            Tuple of (predicted_count, uncertainty_std)
+        """
+        if not self._fitted:
+            raise RuntimeError(
+                "BucketIntradayForecaster.predict() called before fit(). "
+                "Must call fit() with historical data first."
+            )
+
+        tau = self.contract_utils.get_tau(now, contract_date)
+        is_weekend = self.contract_utils.is_weekend(contract_date)
+        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
+
+        if not buckets:
+            raise RuntimeError(
+                f"No bucket distributions available for {'weekend' if is_weekend else 'weekday'}. "
+                f"fit() may have failed or data was insufficient."
+            )
+
+        # Count observed events
+        observed = len([e for e in events if e.timestamp < now])
+
+        # Determine current bucket and partial fraction
+        current_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
+        partial_fraction = (tau % self.bucket_size) / self.bucket_size
+
+        # Compute expected count by now (sum of completed bucket means + partial current)
+        expected_so_far = sum(b.mean for b in buckets[:current_bucket_idx])
+        expected_so_far += buckets[current_bucket_idx].mean * partial_fraction
+
+        # Compute regime multiplier
+        if expected_so_far >= self.config.min_expected_for_regime:
+            regime = observed / expected_so_far
+            regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
+        else:
+            regime = 1.0
+
+        # Monte Carlo sampling for remaining buckets
+        n_simulations = 1000
+        samples = self._sample_remaining(
+            observed=observed,
+            current_bucket_idx=current_bucket_idx,
+            partial_fraction=partial_fraction,
+            buckets=buckets,
+            regime=regime,
+            n_simulations=n_simulations,
+        )
+
+        mean = float(np.mean(samples))
+        std = float(np.std(samples))
+
+        # Ensure prediction is at least observed
+        mean = max(mean, observed)
+
+        return mean, std
+
+    def _sample_remaining(
+        self,
+        observed: int,
+        current_bucket_idx: int,
+        partial_fraction: float,
+        buckets: List[BucketDistribution],
+        regime: float,
+        n_simulations: int,
+    ) -> np.ndarray:
+        """Sample remaining bucket counts via Monte Carlo."""
+        rng = np.random.default_rng()
+        samples = np.full(n_simulations, observed, dtype=float)
+
+        # Sample remaining portion of current bucket
+        if partial_fraction < 1.0:
+            current_bucket = buckets[current_bucket_idx]
+            remaining_mean = current_bucket.mean * (1.0 - partial_fraction) * regime
+
+            if remaining_mean > 0:
+                remaining_samples = self._sample_negative_binomial(
+                    mean=remaining_mean,
+                    k=current_bucket.dispersion_k,
+                    size=n_simulations,
+                    rng=rng,
+                )
+                samples += remaining_samples
+
+        # Sample full remaining buckets
+        for bucket_idx in range(current_bucket_idx + 1, self.n_buckets):
+            bucket = buckets[bucket_idx]
+            bucket_mean = bucket.mean * regime
+
+            if bucket_mean > 0:
+                bucket_samples = self._sample_negative_binomial(
+                    mean=bucket_mean,
+                    k=bucket.dispersion_k,
+                    size=n_simulations,
+                    rng=rng,
+                )
+                samples += bucket_samples
+
+        return samples
+
+    def _sample_negative_binomial(
+        self,
+        mean: float,
+        k: float,
+        size: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Sample from Negative Binomial distribution."""
+        if mean <= 0:
+            return np.zeros(size)
+
+        # numpy uses (n, p) parameterization where n=k, p=k/(k+μ)
+        p = k / (k + mean)
+
+        # Handle edge cases
+        if p <= 0 or p >= 1 or k <= 0:
+            return np.full(size, int(round(mean)))
+
+        return rng.negative_binomial(k, p, size=size)
+
+    def get_expected_progress(self, tau: int, is_weekend: bool = False) -> float:
+        """
+        Get expected fraction of day's activity completed by minute τ.
+
+        Computed from bucket means: sum of completed bucket means / total daily mean.
+        """
+        if not self._fitted:
+            raise RuntimeError(
+                "BucketIntradayForecaster.get_expected_progress() called before fit(). "
+                "Must call fit() with historical data first."
+            )
+
+        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
+
+        if not buckets:
+            raise RuntimeError(
+                f"No bucket distributions available for {'weekend' if is_weekend else 'weekday'}. "
+                f"fit() may have failed or data was insufficient."
+            )
+
+        # Total expected daily count
+        total_mean = sum(b.mean for b in buckets)
+        if total_mean <= 0:
+            raise RuntimeError(
+                f"Total bucket mean is {total_mean} (expected > 0). "
+                f"fit() may have failed or data was invalid."
+            )
+
+        # Compute cumulative expected by tau
+        current_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
+        partial_fraction = (tau % self.bucket_size) / self.bucket_size
+
+        expected_so_far = sum(b.mean for b in buckets[:current_bucket_idx])
+        expected_so_far += buckets[current_bucket_idx].mean * partial_fraction
+
+        return min(expected_so_far / total_mean, 1.0)
+
+    def get_bucket_stats(self, is_weekend: bool = False) -> List[Dict]:
+        """Get bucket statistics for debugging/display."""
+        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
+        return [
+            {
+                "bucket": b.bucket_idx,
+                "start_tau": b.start_tau,
+                "end_tau": b.end_tau,
+                "mean": b.mean,
+                "std": b.std,
+                "k": b.dispersion_k,
+            }
+            for b in buckets
+        ]
 
     @property
     def historical_mean(self) -> float:

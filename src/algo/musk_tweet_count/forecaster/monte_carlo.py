@@ -14,7 +14,7 @@ import numpy as np
 
 from .config import MonteCarloConfig, ForecasterConfig
 from .data import ContractDayUtils, TweetEvent
-from .intraday import IntradayNowcast
+from .intraday import BaseIntradayForecaster
 from .interday import InterdayForecaster
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ class MonteCarloForecaster:
     def __init__(
         self,
         config: ForecasterConfig,
-        nowcast: IntradayNowcast,
+        nowcast: BaseIntradayForecaster,
         interday: InterdayForecaster,
         contract_utils: ContractDayUtils,
     ):
@@ -117,7 +117,7 @@ class MonteCarloForecaster:
 
         Args:
             config: Full forecaster configuration
-            nowcast: Fitted intraday nowcast model
+            nowcast: Fitted intraday forecaster (Ridge or Bucket-based)
             interday: Fitted interday forecaster (EWMA-based)
             contract_utils: Contract-day utilities
         """
@@ -282,7 +282,7 @@ class MonteCarloForecaster:
 
         # Get expected progress
         is_weekend = self.contract_utils.is_weekend(contract_date)
-        F_tau = self.nowcast.progress_curve.get_expected_progress(tau, is_weekend)
+        F_tau = self.nowcast.get_expected_progress(tau, is_weekend)
 
         if F_tau < F_gate:
             return 1.0

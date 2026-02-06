@@ -392,7 +392,7 @@ class BacktestRunner:
             from the event period that will be added incrementally during backtest.
         """
         from ..forecaster.config import ForecasterConfig, MonteCarloConfig
-        from ..forecaster.forecaster import Musk7DayForecaster
+        from ..forecaster.forecaster import TweetCountForecaster
         from ..forecaster.data import EventStore, ContractDayUtils, XTrackerClient, TweetEvent
         from datetime import timezone as tz
         from zoneinfo import ZoneInfo
@@ -471,7 +471,7 @@ class BacktestRunner:
         )
 
         # Create forecaster
-        forecaster = Musk7DayForecaster(config, event_store=event_store)
+        forecaster = TweetCountForecaster(config, event_store=event_store)
 
         # Fit on historical data (skip API fetch since we have cached data)
         # Use event start_date as the reference "today" for training

@@ -3,7 +3,10 @@ Configuration dataclasses for Kelly criterion trading.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import yaml
 
 
 @dataclass
@@ -214,4 +217,161 @@ class KellyConfig:
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
             **data,
+        )
+
+
+@dataclass
+class EventCategoryRules:
+    """
+    Trading rules for a specific event duration category.
+
+    Controls when trading is allowed based on:
+    - Whether counting period has started
+    - How far before/after counting we can trade
+    - Minimum time before settlement to stop trading
+    """
+
+    # Name for this category (e.g., "short", "weekly", "monthly")
+    name: str
+
+    # Duration range in days [min, max) - max is exclusive
+    # e.g., [0, 3] means events lasting 0, 1, or 2 days
+    duration_min_days: int
+    duration_max_days: int
+
+    # If True, only trade after counting period has started (cnt > 0 possible)
+    require_counting_started: bool = True
+
+    # Maximum hours before counting starts that we can begin trading
+    # Only applies if require_counting_started=False
+    # e.g., 72 means can trade up to 72h before counting starts
+    max_hours_before_counting: Optional[float] = None
+
+    # Maximum days before settlement to start trading
+    # e.g., 7 means only trade when <= 7 days remain until settlement
+    # This replaces the old max_event_duration_days parameter
+    max_days_before_settlement: Optional[float] = None
+
+    # Minimum hours before settlement to stop trading
+    # e.g., 3 means stop trading 3h before settlement
+    min_hours_before_settlement: float = 3.0
+
+    def matches_duration(self, event_duration_days: int) -> bool:
+        """Check if this category applies to an event of given duration."""
+        return self.duration_min_days <= event_duration_days < self.duration_max_days
+
+
+@dataclass
+class EventTradingRulesConfig:
+    """
+    Configuration for event-specific trading rules.
+
+    Allows different rules for different event durations (short, weekly, monthly).
+    Loaded from YAML file.
+    """
+
+    # List of category rules, checked in order
+    categories: List[EventCategoryRules] = field(default_factory=list)
+
+    # Default rules if no category matches
+    default_require_counting_started: bool = True
+    default_min_hours_before_settlement: float = 3.0
+
+    def get_rules_for_event(self, event_duration_days: int) -> EventCategoryRules:
+        """
+        Get the trading rules for an event of given duration.
+
+        Args:
+            event_duration_days: Duration of the event in days
+
+        Returns:
+            EventCategoryRules for this event duration
+        """
+        for category in self.categories:
+            if category.matches_duration(event_duration_days):
+                return category
+
+        # Return default rules
+        return EventCategoryRules(
+            name="default",
+            duration_min_days=0,
+            duration_max_days=9999,
+            require_counting_started=self.default_require_counting_started,
+            min_hours_before_settlement=self.default_min_hours_before_settlement,
+        )
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "EventTradingRulesConfig":
+        """Load configuration from YAML file."""
+        path = Path(yaml_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Event trading rules config not found: {yaml_path}")
+
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EventTradingRulesConfig":
+        """Create config from dictionary."""
+        categories = []
+
+        for cat_data in data.get("event_categories", []):
+            duration_range = cat_data.get("duration_days", [0, 9999])
+            rules_data = cat_data.get("trading_rules", {})
+
+            category = EventCategoryRules(
+                name=cat_data.get("name", "unnamed"),
+                duration_min_days=duration_range[0],
+                duration_max_days=duration_range[1],
+                require_counting_started=rules_data.get("require_counting_started", True),
+                max_hours_before_counting=rules_data.get("max_hours_before_counting"),
+                max_days_before_settlement=rules_data.get("max_days_before_settlement"),
+                min_hours_before_settlement=rules_data.get("min_hours_before_settlement", 3.0),
+            )
+            categories.append(category)
+
+        default_rules = data.get("default_rules", {})
+
+        return cls(
+            categories=categories,
+            default_require_counting_started=default_rules.get("require_counting_started", True),
+            default_min_hours_before_settlement=default_rules.get("min_hours_before_settlement", 3.0),
+        )
+
+    @classmethod
+    def default(cls) -> "EventTradingRulesConfig":
+        """Create default configuration."""
+        return cls(
+            categories=[
+                # Short events (0-3 days): require counting started
+                EventCategoryRules(
+                    name="short",
+                    duration_min_days=0,
+                    duration_max_days=4,
+                    require_counting_started=True,
+                    min_hours_before_settlement=1.0,
+                ),
+                # Weekly events (4-8 days): can trade before counting, up to 72h early
+                EventCategoryRules(
+                    name="weekly",
+                    duration_min_days=4,
+                    duration_max_days=9,
+                    require_counting_started=False,
+                    max_hours_before_counting=72.0,
+                    min_hours_before_settlement=3.0,
+                ),
+                # Monthly events (9+ days): wait until 7 days remain
+                EventCategoryRules(
+                    name="monthly",
+                    duration_min_days=9,
+                    duration_max_days=9999,
+                    require_counting_started=False,
+                    max_days_before_settlement=7.0,
+                    min_hours_before_settlement=6.0,
+                ),
+            ],
+            default_require_counting_started=True,
+            default_min_hours_before_settlement=3.0,
         )

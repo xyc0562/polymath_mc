@@ -153,9 +153,10 @@ def run_full_backtest(
     use_ensemble: bool = False,
     use_gas: bool = False,
     use_pig: bool = False,
+    intraday_mode: str = "ridge",
 ) -> None:
     """Run full backtest with multiple τ values."""
-    logger.info(f"Running full backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig})...")
+    logger.info(f"Running full backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig}, intraday={intraday_mode})...")
 
     # Configure for available data
     # With ~85 days, use 45-day training to maximize test window
@@ -169,7 +170,8 @@ def run_full_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
+    forecaster_config = ForecasterConfig(intraday_mode=intraday_mode)
+    backtester = Backtester(forecaster_config=forecaster_config, backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
     results = backtester.run(events_by_date)
 
     # Print results
@@ -270,9 +272,10 @@ def run_quick_backtest(
     use_ensemble: bool = False,
     use_gas: bool = False,
     use_pig: bool = False,
+    intraday_mode: str = "ridge",
 ) -> None:
     """Run quick backtest with single τ value."""
-    logger.info(f"Running quick backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig})...")
+    logger.info(f"Running quick backtest (ensemble={use_ensemble}, gas={use_gas}, pig={use_pig}, intraday={intraday_mode})...")
 
     config = BacktestConfig(
         training_window_days=60,
@@ -284,7 +287,8 @@ def run_quick_backtest(
         verbose=True,
     )
 
-    backtester = Backtester(backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
+    forecaster_config = ForecasterConfig(intraday_mode=intraday_mode)
+    backtester = Backtester(forecaster_config=forecaster_config, backtest_config=config, use_ensemble=use_ensemble, use_gas=use_gas, use_pig=use_pig)
     results = backtester.run(events_by_date)
 
     print(results.summary())
@@ -294,9 +298,10 @@ def run_quick_backtest(
 def run_ablation_study(
     events_by_date: Dict[date, List[TweetEvent]],
     n_simulations: int = 2000,
+    intraday_mode: str = "ridge",
 ) -> None:
     """Run ablation study comparing different configurations."""
-    logger.info("Running ablation study...")
+    logger.info(f"Running ablation study (intraday={intraday_mode})...")
 
     backtest_config = BacktestConfig(
         training_window_days=45,
@@ -307,7 +312,8 @@ def run_ablation_study(
         verbose=False,  # Less verbose for ablation
     )
 
-    study = AblationStudy(backtest_config=backtest_config)
+    forecaster_config = ForecasterConfig(intraday_mode=intraday_mode)
+    study = AblationStudy(base_config=forecaster_config, backtest_config=backtest_config)
     results = study.run(events_by_date)
 
     print(study.summary(results))
@@ -335,6 +341,7 @@ def run_dispersion_grid_search(
     inflation_values: List[float] = None,
     use_gas: bool = False,
     use_pig: bool = False,
+    intraday_mode: str = "ridge",
 ) -> None:
     """
     Grid search for optimal dispersion inflation factor.
@@ -360,7 +367,7 @@ def run_dispersion_grid_search(
         logger.info(f"\nTesting dispersion_inflation_factor = {s}")
 
         # Create config with this inflation factor
-        forecaster_config = ForecasterConfig()
+        forecaster_config = ForecasterConfig(intraday_mode=intraday_mode)
         forecaster_config.monte_carlo.dispersion_inflation_factor = s
         forecaster_config.monte_carlo.today_std_inflation_factor = s
 
@@ -503,6 +510,14 @@ def main():
         action="store_true",
         help="Use PIG-GAS regime model (Poisson-Inverse Gaussian, heavier tails than NB)",
     )
+    parser.add_argument(
+        "--intraday-mode",
+        type=str,
+        default="ridge",
+        choices=["ridge", "bucket"],
+        help="Intraday forecaster mode: 'ridge' (default) uses Ridge regression with "
+             "linear F(τ) scaling, 'bucket' uses Negative Binomial per 3-hour bucket.",
+    )
 
     args = parser.parse_args()
 
@@ -534,14 +549,17 @@ def main():
         return
 
     # Run appropriate backtest
+    intraday_mode = args.intraday_mode
+    logger.info(f"Intraday mode: {intraday_mode}")
+
     if args.grid_search:
-        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations, use_gas=args.gas, use_pig=args.pig)
+        run_dispersion_grid_search(events_by_date, n_simulations=args.n_simulations, use_gas=args.gas, use_pig=args.pig, intraday_mode=intraday_mode)
     elif args.ablation:
-        run_ablation_study(events_by_date, n_simulations=args.n_simulations)
+        run_ablation_study(events_by_date, n_simulations=args.n_simulations, intraday_mode=intraday_mode)
     elif args.quick:
-        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig)
+        run_quick_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig, intraday_mode=intraday_mode)
     else:
-        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig)
+        run_full_backtest(events_by_date, n_simulations=args.n_simulations, use_ensemble=args.ensemble, use_gas=args.gas, use_pig=args.pig, intraday_mode=intraday_mode)
 
 
 if __name__ == "__main__":

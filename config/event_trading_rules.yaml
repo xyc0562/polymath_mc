@@ -1,0 +1,45 @@
+# Event Trading Rules Configuration
+#
+# Controls when trading is allowed for different event durations.
+# This replaces the old max_event_duration_days parameter with more
+# fine-grained control.
+#
+# Key insight: Short events (2-3 days) perform poorly when we trade
+# BEFORE the counting period starts, because we have no observed data
+# to anchor our regime forecasts. For these events, we should wait
+# until counting has begun.
+
+event_categories:
+  # Short events (0-3 days): MUST wait for counting to start
+  # Rationale: With no observed data, regime errors are devastating
+  # for short horizons where we can't average out mistakes.
+  - name: "short"
+    duration_days: [0, 4]  # 0, 1, 2, 3 day events
+    trading_rules:
+      require_counting_started: true
+      min_hours_before_settlement: 1.0
+
+  # Weekly events (4-8 days): Can trade before counting, but limited
+  # Rationale: Longer horizon provides some buffer against regime errors,
+  # and early trading can capture mispriced markets.
+  - name: "weekly"
+    duration_days: [4, 9]  # 4, 5, 6, 7, 8 day events
+    trading_rules:
+      require_counting_started: false
+      max_hours_before_counting: 72.0  # Can trade up to 3 days before counting
+      min_hours_before_settlement: 1.0
+
+  # Monthly events (9+ days): Wait until 7 days remain
+  # Rationale: Very long events have high regime uncertainty far out.
+  # Better to wait until we're in a "weekly-equivalent" window.
+  - name: "monthly"
+    duration_days: [9, 9999]  # 9+ day events
+    trading_rules:
+      require_counting_started: false
+      max_days_before_settlement: 7.0  # Only trade when <= 7 days left
+      min_hours_before_settlement: 1.0
+
+# Default rules if event doesn't match any category
+default_rules:
+  require_counting_started: true
+  min_hours_before_settlement: 1.0

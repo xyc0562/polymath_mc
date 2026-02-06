@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .runner import BacktestRunner, BacktestConfig, BacktestResult
-from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, CollateralConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, CollateralConfig, EventTradingRulesConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
 import sys
@@ -121,8 +121,9 @@ def filter_events_by_duration(
     for event_dir in events:
         event = provider.load_event(event_dir)
         if event and event.counting_start_date and event.counting_end_date:
-            # Calculate duration (inclusive of both start and end dates)
-            event_duration = (event.counting_end_date - event.counting_start_date).days + 1
+            # Calculate duration (matches trading rules convention)
+            # "Dec 19 - Dec 26" = 7 days (noon Dec 19 to noon Dec 26)
+            event_duration = (event.counting_end_date - event.counting_start_date).days
             if event_duration == duration_days:
                 filtered.append(event_dir)
 
@@ -386,17 +387,17 @@ def main():
     parser.add_argument(
         "--min-perceived-prob",
         type=float,
-        default=0.0,
+        default=EdgeBufferConfig.min_perceived_prob,
         help="Minimum perceived probability (from model) to trade. "
-             "Don't trade if our model assigns probability below this. Default: 0 (disabled)",
+             "Don't trade if our model assigns probability below this. Default: EdgeBufferConfig.min_perceived_prob",
     )
 
     parser.add_argument(
         "--min-market-price",
         type=float,
-        default=0.0,
+        default=EdgeBufferConfig.min_market_price,
         help="Minimum market price to trade. Don't buy YES or NO if market price is below this. "
-             "Recommended: 0.15-0.20 based on backtest analysis. Default: 0 (disabled)",
+             "Recommended: 0.15-0.20 based on backtest analysis. Default: EdgeBufferConfig.min_market_price",
     )
 
     parser.add_argument(
@@ -448,6 +449,25 @@ def main():
              "'gamma' uses Gamma CDF (natural for positive sums).",
     )
 
+    parser.add_argument(
+        "--intraday-mode",
+        type=str,
+        default="ridge",
+        choices=["ridge", "bucket"],
+        help="Intraday forecaster mode. "
+             "'ridge' (default) uses Ridge regression with F(τ) progress curve. "
+             "'bucket' uses bucket-based forecaster with 8 time buckets.",
+    )
+
+    parser.add_argument(
+        "--event-rules",
+        type=str,
+        default=None,
+        help="Path to YAML file with event trading rules configuration. "
+             "Controls when trading is allowed based on event duration. "
+             "Example: config/event_trading_rules.yaml",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -489,6 +509,14 @@ def main():
             base_delta_usd = 50.0  # Quick mode default
         max_orders = 5  # Fewer orders per tick
         logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
+
+    # Load event trading rules if specified
+    event_trading_rules = None
+    if args.event_rules:
+        event_trading_rules = EventTradingRulesConfig.from_yaml(args.event_rules)
+        logger.info(f"Loaded event trading rules from: {args.event_rules}")
+        for cat in event_trading_rules.categories:
+            logger.info(f"  {cat.name}: duration=[{cat.duration_min_days}, {cat.duration_max_days}) days")
 
     # Choose between unified and legacy runners
     if args.unified:
@@ -535,6 +563,8 @@ def main():
             exit_hours_before_settlement=args.exit_hours,
             verbose=args.trade_verbose,
             projection_model=args.projection,
+            intraday_mode=args.intraday_mode,
+            event_trading_rules=event_trading_rules,
         )
 
         runner = UnifiedBacktestRunner(
@@ -544,6 +574,7 @@ def main():
         )
         logger.info(f"Using UNIFIED runner (same Kelly logic as production)")
         logger.info(f"Projection model: {args.projection}")
+        logger.info(f"Intraday mode: {args.intraday_mode}")
     else:
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(

@@ -40,7 +40,7 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventConfig,
     EventInfo,
 )
-from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig
+from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, EventTradingRulesConfig
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
@@ -541,12 +541,11 @@ def parse_args() -> argparse.Namespace:
         help="Event IDs to trade (comma-separated) or 'auto' for discovery",
     )
     parser.add_argument(
-        "--max-duration-days",
-        type=float,
-        default=0.0,
-        help="Trading window threshold in days (default: 0 = no limit). "
-             "For events longer than this, wait until remaining time < threshold. "
-             "E.g., 7 = for >7-day events, start trading when T-168h remaining",
+        "--event-rules",
+        type=str,
+        default="config/event_trading_rules.yaml",
+        help="Path to event trading rules YAML config (default: config/event_trading_rules.yaml). "
+             "Controls when trading is allowed based on event duration and counting status.",
     )
 
     # Kelly configuration
@@ -618,6 +617,16 @@ def parse_args() -> argparse.Namespace:
              "'normal' uses symmetric Normal CDF. "
              "'skew_normal' uses Skew-Normal CDF (captures right-skew). "
              "'gamma' uses Gamma CDF (natural for positive sums).",
+    )
+
+    # Intraday forecaster mode
+    parser.add_argument(
+        "--intraday-mode",
+        type=str,
+        default="ridge",
+        choices=["ridge", "bucket"],
+        help="Intraday forecaster mode: 'ridge' (default) uses Ridge regression with "
+             "linear F(τ) scaling, 'bucket' uses Negative Binomial per 3-hour bucket.",
     )
 
     # Other
@@ -693,6 +702,7 @@ async def main() -> None:
         logger.warning("Running in LIVE mode - real orders will be placed!")
 
     logger.info(f"Projection model: {args.projection}")
+    logger.info(f"Intraday mode: {args.intraday_mode}")
 
     # Create CLOB client
     try:
@@ -735,14 +745,36 @@ async def main() -> None:
         min_allocation=args.min_allocation,
     )
 
-    forecaster_config = ForecasterConfig()
+    forecaster_config = ForecasterConfig(intraday_mode=args.intraday_mode)
+
+    # Load event trading rules
+    event_trading_rules = None
+    if args.event_rules:
+        try:
+            from pathlib import Path
+            rules_path = Path(args.event_rules)
+            if rules_path.exists():
+                event_trading_rules = EventTradingRulesConfig.from_yaml(str(rules_path))
+                logger.info(f"Loaded event trading rules from {args.event_rules}")
+                for cat in event_trading_rules.categories:
+                    logger.info(
+                        f"  {cat.name}: {cat.duration_min_days}-{cat.duration_max_days}d, "
+                        f"require_counting={cat.require_counting_started}"
+                    )
+            else:
+                logger.warning(f"Event rules file not found: {args.event_rules}, using defaults")
+                event_trading_rules = EventTradingRulesConfig.default()
+        except Exception as e:
+            logger.error(f"Failed to load event rules from {args.event_rules}: {e}")
+            logger.info("Using default event trading rules")
+            event_trading_rules = EventTradingRulesConfig.default()
 
     multi_event_config = MultiEventConfig(
         capital_pool=capital_pool_config,
         max_per_event=max_per_event,
         tick_interval_seconds=args.tick_interval,
         dry_run=dry_run,
-        max_event_duration_days=args.max_duration_days,
+        event_trading_rules=event_trading_rules,
         projection_model=args.projection,
     )
 

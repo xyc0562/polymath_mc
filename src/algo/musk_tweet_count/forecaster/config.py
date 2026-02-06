@@ -60,6 +60,30 @@ class NowcastConfig:
 
 
 @dataclass
+class BucketNowcastConfig:
+    """Configuration for bucket-based intraday nowcast model."""
+
+    # Number of buckets per day (8 = 3-hour buckets)
+    n_buckets: int = 8
+
+    # Training window in days
+    training_window_days: int = 45
+
+    # Half-life for sample weighting (days)
+    weight_half_life_days: float = 14.0
+
+    # Regime multiplier bounds (clamp to prevent extreme adjustments)
+    regime_min: float = 0.85
+    regime_max: float = 1.15
+
+    # Minimum expected count to compute regime (avoid division by near-zero)
+    min_expected_for_regime: float = 1.0
+
+    # Minimum dispersion k (floor for Negative Binomial)
+    min_dispersion_k: float = 0.5
+
+
+@dataclass
 class RegimeConfig:
     """Configuration for interday regime model."""
 
@@ -249,10 +273,14 @@ class ForecasterConfig:
     # Contract-day boundary hour (12 = noon)
     contract_boundary_hour: int = 12
 
+    # Intraday forecaster mode: "ridge" (original) or "bucket" (new)
+    intraday_mode: str = "ridge"
+
     # Component configs
     intraday_curve: IntradayCurveConfig = field(default_factory=IntradayCurveConfig)
     burst_features: BurstFeaturesConfig = field(default_factory=BurstFeaturesConfig)
     nowcast: NowcastConfig = field(default_factory=NowcastConfig)
+    bucket_nowcast: BucketNowcastConfig = field(default_factory=BucketNowcastConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     dispersion: DispersionConfig = field(default_factory=DispersionConfig)
     weekend: WeekendConfig = field(default_factory=WeekendConfig)

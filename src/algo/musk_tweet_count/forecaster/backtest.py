@@ -20,7 +20,7 @@ import numpy as np
 
 from .config import ForecasterConfig
 from .data import ContractDayUtils, TweetEvent, XTrackerClient, EventStore
-from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast
+from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast, BucketIntradayForecaster
 from .interday import InterdayForecaster, GASInterdayForecaster, PIGInterdayForecaster
 from .monte_carlo import (
     MonteCarloForecaster,
@@ -360,10 +360,10 @@ class Backtester:
             d: [e.timestamp for e in events]
             for d, events in training_events.items()
         }
-        forecaster.progress_curve.fit(historical_timestamps)
+        forecaster.progress_curve.fit(historical_timestamps, as_of_date=forecast_date)
 
         # Fit nowcast
-        forecaster.nowcast.fit(training_events, training_counts)
+        forecaster.nowcast.fit(training_events, training_counts, as_of_date=forecast_date)
 
         # Get today's events
         today_events = events_by_date.get(forecast_date, [])
@@ -498,26 +498,39 @@ class Backtester:
 
     def _create_forecaster(self):
         """Create forecaster components for a single forecast."""
-        from .forecaster import Musk7DayForecaster
+        from .forecaster import TweetCountForecaster
 
         class MinimalForecaster:
             pass
 
         forecaster = MinimalForecaster()
-        forecaster.progress_curve = IntradayProgressCurve(
-            self.forecaster_config.intraday_curve,
-            self.contract_utils,
-        )
-        forecaster.burst_extractor = BurstFeatureExtractor(
-            self.forecaster_config.burst_features,
-            self.contract_utils,
-        )
-        forecaster.nowcast = IntradayNowcast(
-            self.forecaster_config.nowcast,
-            forecaster.progress_curve,
-            forecaster.burst_extractor,
-            self.contract_utils,
-        )
+
+        # Create intraday forecaster based on mode
+        if self.forecaster_config.intraday_mode == "bucket":
+            # Bucket-based intraday forecaster (no progress curve or burst features needed)
+            forecaster.progress_curve = None
+            forecaster.burst_extractor = None
+            forecaster.nowcast = BucketIntradayForecaster(
+                self.forecaster_config.bucket_nowcast,
+                self.contract_utils,
+            )
+        else:
+            # Ridge-based intraday forecaster (default)
+            forecaster.progress_curve = IntradayProgressCurve(
+                self.forecaster_config.intraday_curve,
+                self.contract_utils,
+            )
+            forecaster.burst_extractor = BurstFeatureExtractor(
+                self.forecaster_config.burst_features,
+                self.contract_utils,
+            )
+            forecaster.nowcast = IntradayNowcast(
+                self.forecaster_config.nowcast,
+                forecaster.progress_curve,
+                forecaster.burst_extractor,
+                self.contract_utils,
+            )
+
         forecaster.interday = InterdayForecaster(
             self.forecaster_config.regime,
             self.forecaster_config.dispersion,

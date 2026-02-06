@@ -18,7 +18,7 @@ from .data_provider import (
 )
 
 # Import Kelly trading infrastructure
-from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, EventTradingRulesConfig
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import UnifiedKellyExecutor, TickResult
 from ..kelly.backtest_backend import (
@@ -125,6 +125,16 @@ class UnifiedBacktestConfig:
     # - normal: Approximates with Normal distribution (symmetric)
     projection_model: str = "asymmetric"
 
+    # Intraday forecaster mode: "ridge" (default) or "bucket"
+    # - ridge: Original Ridge regression with F(τ) progress curve
+    # - bucket: Bucket-based forecaster with 8 time buckets
+    intraday_mode: str = "ridge"
+
+    # Event trading rules configuration
+    # Controls when trading is allowed based on event duration
+    # If None, no duration-based restrictions are applied
+    event_trading_rules: Optional[EventTradingRulesConfig] = None
+
 
 class UnifiedBacktestRunner:
     """
@@ -186,6 +196,19 @@ class UnifiedBacktestRunner:
         logger.info(f"  Trading period: {event.start_date} to {event.end_date}")
         logger.info(f"  Counting period: {event.counting_start_date} to {event.counting_end_date}")
         logger.info(f"  Bins: {len(event.bins)}, Winner: bin {event.winner_bin_index}")
+
+        # Log event trading rules if configured
+        if self.config.event_trading_rules is not None:
+            event_duration_days = (event.counting_end_date - event.counting_start_date).days
+            rules = self.config.event_trading_rules.get_rules_for_event(event_duration_days)
+            logger.info(f"  Event duration: {event_duration_days} days → using '{rules.name}' trading rules")
+            if rules.require_counting_started:
+                logger.info(f"    - Require counting started: yes")
+            if rules.max_hours_before_counting is not None:
+                logger.info(f"    - Max hours before counting: {rules.max_hours_before_counting}")
+            if rules.max_days_before_settlement is not None:
+                logger.info(f"    - Max days before settlement: {rules.max_days_before_settlement}")
+            logger.info(f"    - Min hours before settlement: {rules.min_hours_before_settlement}")
 
         # Validate training data availability
         training_start_needed = event.start_date - timedelta(days=self.config.training_days)
@@ -275,6 +298,12 @@ class UnifiedBacktestRunner:
             datetime.min.time().replace(hour=12),  # 12pm noon ET = settlement
             tzinfo=est_tz
         )
+        # Calculate counting start time (noon ET on counting_start_date)
+        counting_start_dt = datetime.combine(
+            event.counting_start_date,
+            datetime.min.time().replace(hour=12),
+            tzinfo=est_tz
+        )
         # Also use this to stop processing ticks after settlement
         settlement_ts = int(settlement_dt.timestamp())
         exit_window_start = settlement_dt - timedelta(hours=self.config.exit_hours_before_settlement)
@@ -332,6 +361,21 @@ class UnifiedBacktestRunner:
 
             if in_exit_mode:
                 continue
+
+            # Check event trading rules (duration-based restrictions)
+            if self.config.event_trading_rules is not None:
+                # Convert dt to EST for consistent comparison with counting_start_dt and settlement_dt
+                dt_est = dt.astimezone(est_tz)
+                is_allowed, reason = self._check_trading_rules(
+                    event=event,
+                    current_dt=dt_est,
+                    counting_start_dt=counting_start_dt,
+                    settlement_dt=settlement_dt,
+                )
+                if not is_allowed:
+                    if i == 0 or i % 100 == 0:  # Log occasionally to avoid spam
+                        logger.debug(f"  Trading blocked: {reason}")
+                    continue
 
             # Skip if capital is exhausted (less than $1 available)
             if portfolio.available_capital < 1.0:
@@ -517,6 +561,54 @@ class UnifiedBacktestRunner:
         """Return the trading config (KellyConfig) from backtest config."""
         return self.config.trading
 
+    def _check_trading_rules(
+        self,
+        event: EventPriceData,
+        current_dt: datetime,
+        counting_start_dt: datetime,
+        settlement_dt: datetime,
+    ) -> tuple:
+        """
+        Check if trading is allowed based on event trading rules.
+
+        Returns:
+            Tuple of (is_allowed, reason) where reason explains why trading is blocked
+        """
+        if self.config.event_trading_rules is None:
+            return True, ""
+
+        # Calculate event duration in days
+        event_duration_days = (event.counting_end_date - event.counting_start_date).days
+
+        # Get rules for this event duration
+        rules = self.config.event_trading_rules.get_rules_for_event(event_duration_days)
+
+        # Check min_hours_before_settlement (stop trading close to settlement)
+        hours_to_settlement = (settlement_dt - current_dt).total_seconds() / 3600.0
+        if hours_to_settlement < rules.min_hours_before_settlement:
+            return False, f"Too close to settlement ({hours_to_settlement:.1f}h < {rules.min_hours_before_settlement}h min)"
+
+        # Check max_days_before_settlement (don't trade too far from settlement)
+        days_to_settlement = hours_to_settlement / 24.0
+        if rules.max_days_before_settlement is not None:
+            if days_to_settlement > rules.max_days_before_settlement:
+                return False, f"Too far from settlement ({days_to_settlement:.1f}d > {rules.max_days_before_settlement}d max)"
+
+        # Check if counting has started
+        counting_started = current_dt >= counting_start_dt
+
+        if rules.require_counting_started:
+            if not counting_started:
+                return False, "Counting period has not started yet"
+        else:
+            # Check max_hours_before_counting if set
+            if rules.max_hours_before_counting is not None and not counting_started:
+                hours_before_counting = (counting_start_dt - current_dt).total_seconds() / 3600.0
+                if hours_before_counting > rules.max_hours_before_counting:
+                    return False, f"Too far before counting ({hours_before_counting:.1f}h > {rules.max_hours_before_counting}h max)"
+
+        return True, ""
+
     def _record_trade(self, result) -> None:
         """Record a trade from the executor callback."""
         from ..kelly.candidates import TradeAction
@@ -657,14 +749,17 @@ class UnifiedBacktestRunner:
             from the event period that will be added incrementally during backtest.
         """
         from ..forecaster.config import ForecasterConfig, MonteCarloConfig
-        from ..forecaster.forecaster import Musk7DayForecaster
+        from ..forecaster.forecaster import TweetCountForecaster
         from ..forecaster.data import EventStore, ContractDayUtils, XTrackerClient, TweetEvent
         from datetime import timezone as tz
         from zoneinfo import ZoneInfo
 
         # Use fixed seed for reproducible backtests
         mc_config = MonteCarloConfig(random_seed=42)
-        config = ForecasterConfig(monte_carlo=mc_config)
+        config = ForecasterConfig(
+            monte_carlo=mc_config,
+            intraday_mode=self.config.intraday_mode,
+        )
         contract_utils = ContractDayUtils(
             timezone=config.timezone,
             boundary_hour=config.contract_boundary_hour,
@@ -728,7 +823,7 @@ class UnifiedBacktestRunner:
             f"{len(backtest_posts)} backtest posts will be added incrementally"
         )
 
-        forecaster = Musk7DayForecaster(config, event_store=event_store)
+        forecaster = TweetCountForecaster(config, event_store=event_store)
         forecaster.fit(
             n_days=self.config.training_days,
             skip_fetch=True,

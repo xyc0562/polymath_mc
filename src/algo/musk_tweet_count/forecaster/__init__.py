@@ -1,22 +1,27 @@
 """
-Musk 7-Day Tweet Count Forecaster
+Tweet Count Forecaster
 
 A comprehensive forecasting system for Polymarket's Elon Musk tweet count markets.
+Supports variable-length events (2-day, 7-day, monthly, etc.).
 
 Main Components:
-- Musk7DayForecaster: Main forecasting interface
+- TweetCountForecaster: Main forecasting interface
 - ForecastResult: Result container with bin probabilities
 - Backtester: Rolling window backtesting framework
 
 Usage:
-    from forecaster import Musk7DayForecaster, ForecasterConfig
+    from forecaster import TweetCountForecaster, ForecasterConfig
 
     # Create and fit forecaster
-    forecaster = Musk7DayForecaster()
+    forecaster = TweetCountForecaster()
     forecaster.fit(n_days=90)
 
-    # Get 7-day forecast
-    result = forecaster.forecast_7day_distribution()
+    # Get forecast for event window
+    result = forecaster.forecast_for_event_window(
+        market_start_date=start,
+        settlement_date=end,
+        now=datetime.now(),
+    )
 
     # Get bin probabilities for trading
     probs = forecaster.get_bin_probabilities()
@@ -27,6 +32,7 @@ from .config import (
     IntradayCurveConfig,
     BurstFeaturesConfig,
     NowcastConfig,
+    BucketNowcastConfig,
     RegimeConfig,
     DispersionConfig,
     WeekendConfig,
@@ -47,7 +53,10 @@ from .intraday import (
     IntradayProgressCurve,
     BurstFeatures,
     BurstFeatureExtractor,
+    BaseIntradayForecaster,
     IntradayNowcast,
+    BucketIntradayForecaster,
+    BucketDistribution,
 )
 
 from .interday import (
@@ -77,7 +86,7 @@ from .monte_carlo import (
 )
 
 from .forecaster import (
-    Musk7DayForecaster,
+    TweetCountForecaster,
     create_forecaster,
 )
 
@@ -106,7 +115,7 @@ from .trading_bot import (
 
 __all__ = [
     # Main forecaster
-    "Musk7DayForecaster",
+    "TweetCountForecaster",
     "create_forecaster",
     "ForecastResult",
 
@@ -115,6 +124,7 @@ __all__ = [
     "IntradayCurveConfig",
     "BurstFeaturesConfig",
     "NowcastConfig",
+    "BucketNowcastConfig",
     "RegimeConfig",
     "DispersionConfig",
     "WeekendConfig",
@@ -132,7 +142,10 @@ __all__ = [
     "IntradayProgressCurve",
     "BurstFeatures",
     "BurstFeatureExtractor",
+    "BaseIntradayForecaster",
     "IntradayNowcast",
+    "BucketIntradayForecaster",
+    "BucketDistribution",
 
     # Interday components
     "RegimeState",

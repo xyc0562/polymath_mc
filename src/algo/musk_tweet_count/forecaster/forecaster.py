@@ -1,11 +1,13 @@
 """
-Main Musk 7-Day Tweet Count Forecaster.
+Tweet Count Forecaster.
 
 Integrates all components:
 - Data layer (XTracker API, event storage)
 - Intraday model (progress curve, burst features, nowcast)
 - Interday model (regime, dispersion, weekend effects)
-- Monte Carlo simulation (7-day distribution)
+- Monte Carlo simulation (generates probability distributions)
+
+Supports variable-length events (2-day, 7-day, monthly, etc.).
 """
 
 import logging
@@ -16,7 +18,13 @@ import numpy as np
 
 from .config import ForecasterConfig
 from .data import ContractDayUtils, EventStore, TweetEvent, XTrackerClient
-from .intraday import IntradayProgressCurve, BurstFeatureExtractor, IntradayNowcast
+from .intraday import (
+    IntradayProgressCurve,
+    BurstFeatureExtractor,
+    BaseIntradayForecaster,
+    IntradayNowcast,
+    BucketIntradayForecaster,
+)
 from .interday import InterdayForecaster
 from .monte_carlo import MonteCarloForecaster, ForecastResult
 from .projection import ProjectionModel, AsymmetricProjection, create_projection_model
@@ -24,14 +32,14 @@ from .projection import ProjectionModel, AsymmetricProjection, create_projection
 logger = logging.getLogger(__name__)
 
 
-class Musk7DayForecaster:
+class TweetCountForecaster:
     """
     Complete forecasting system for Musk tweet count markets.
 
     This class provides the main interface for:
     - Fetching and managing tweet data
     - Nowcasting today's final count
-    - Forecasting 7-day sum distribution
+    - Forecasting sum distribution for variable-length event windows
     - Generating bin probabilities for trading
     """
 
@@ -68,21 +76,34 @@ class Musk7DayForecaster:
             self.event_store = EventStore(self.contract_utils, self.xtracker)
             self._uses_shared_store = False
 
-        # Intraday components
-        self.progress_curve = IntradayProgressCurve(
-            self.config.intraday_curve,
-            self.contract_utils,
-        )
-        self.burst_extractor = BurstFeatureExtractor(
-            self.config.burst_features,
-            self.contract_utils,
-        )
-        self.nowcast = IntradayNowcast(
-            self.config.nowcast,
-            self.progress_curve,
-            self.burst_extractor,
-            self.contract_utils,
-        )
+        # Intraday components - choose based on config
+        if self.config.intraday_mode == "bucket":
+            # Bucket-based intraday forecaster (new)
+            self.nowcast: BaseIntradayForecaster = BucketIntradayForecaster(
+                self.config.bucket_nowcast,
+                self.contract_utils,
+            )
+            # Progress curve and burst extractor not needed for bucket mode
+            self.progress_curve = None
+            self.burst_extractor = None
+            logger.info("Using BUCKET intraday forecaster")
+        else:
+            # Ridge-based intraday forecaster (original)
+            self.progress_curve = IntradayProgressCurve(
+                self.config.intraday_curve,
+                self.contract_utils,
+            )
+            self.burst_extractor = BurstFeatureExtractor(
+                self.config.burst_features,
+                self.contract_utils,
+            )
+            self.nowcast = IntradayNowcast(
+                self.config.nowcast,
+                self.progress_curve,
+                self.burst_extractor,
+                self.contract_utils,
+            )
+            logger.info("Using RIDGE intraday forecaster")
 
         # Interday components
         self.interday = InterdayForecaster(
@@ -131,15 +152,16 @@ class Musk7DayForecaster:
             n_days, as_of_date=as_of_date
         )
 
-        # Fit progress curve
-        self.progress_curve.fit(historical_timestamps)
+        # Fit progress curve (only for Ridge mode)
+        if self.progress_curve is not None:
+            self.progress_curve.fit(historical_timestamps, as_of_date=as_of_date)
 
         # Fit nowcast model
         historical_events = {
             d: self.event_store.get_contract_day_events(d)
             for d in historical_counts.keys()
         }
-        self.nowcast.fit(historical_events, historical_counts)
+        self.nowcast.fit(historical_events, historical_counts, as_of_date=as_of_date)
 
         # Fit interday model
         self.interday.fit(historical_counts)
@@ -159,6 +181,7 @@ class Musk7DayForecaster:
         self,
         events_by_date: Dict[date, List[TweetEvent]],
         counts_by_date: Optional[Dict[date, int]] = None,
+        as_of_date: Optional[date] = None,
     ) -> None:
         """
         Fit from pre-loaded data (useful for backtesting).
@@ -166,6 +189,7 @@ class Musk7DayForecaster:
         Args:
             events_by_date: Dict mapping contract_date -> events
             counts_by_date: Optional explicit counts (otherwise computed from events)
+            as_of_date: Reference date for "today" (for backtesting). Default: actual today.
         """
         # Load events into store
         for contract_date, events in events_by_date.items():
@@ -182,11 +206,12 @@ class Musk7DayForecaster:
             for d, events in events_by_date.items()
         }
 
-        # Fit progress curve
-        self.progress_curve.fit(historical_timestamps)
+        # Fit progress curve (only for Ridge mode)
+        if self.progress_curve is not None:
+            self.progress_curve.fit(historical_timestamps, as_of_date=as_of_date)
 
         # Fit nowcast
-        self.nowcast.fit(events_by_date, counts_by_date)
+        self.nowcast.fit(events_by_date, counts_by_date, as_of_date=as_of_date)
 
         # Fit interday
         self.interday.fit(counts_by_date)
@@ -760,7 +785,7 @@ def create_forecaster(
     timezone: str = "America/New_York",
     n_simulations: int = 10000,
     **config_overrides,
-) -> Musk7DayForecaster:
+) -> TweetCountForecaster:
     """
     Factory function to create a configured forecaster.
 
@@ -770,7 +795,7 @@ def create_forecaster(
         **config_overrides: Additional config overrides
 
     Returns:
-        Configured Musk7DayForecaster instance
+        Configured TweetCountForecaster instance
     """
     from .config import MonteCarloConfig
 
@@ -779,4 +804,4 @@ def create_forecaster(
         monte_carlo=MonteCarloConfig(n_simulations=n_simulations),
     )
 
-    return Musk7DayForecaster(config)
+    return TweetCountForecaster(config)

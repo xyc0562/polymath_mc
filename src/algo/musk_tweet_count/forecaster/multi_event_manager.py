@@ -29,7 +29,7 @@ from .config import ForecasterConfig
 from .trading_bot import GASKellyTradingBot, TradingBotConfig
 from .data import EventStore, ContractDayUtils, XTrackerClient as PostsXTrackerClient
 from ..musk_tweet_count import XTrackerClient as TrackingsXTrackerClient
-from ..kelly.config import KellyConfig
+from ..kelly.config import KellyConfig, EventTradingRulesConfig
 from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from ..kelly.user_stream import UserStreamClient, FillEvent
 
@@ -102,14 +102,13 @@ class MultiEventConfig:
 
     # Start trading this many hours before settlement
     # (events closer to settlement than this won't be started)
+    # NOTE: This is a global minimum; per-category rules may have stricter limits
     min_hours_before_settlement: float = 24.0
 
-    # Maximum event duration (counting window length) in days
-    # e.g., 7.0 means skip events with counting windows longer than 7 days
-    # Event duration = (settlement_date - market_start_date).days
-    # For Jan 1-8 event: duration = 7 days (counting Jan 1-7, settle Jan 8)
-    # Set to 0 to disable (consider all events regardless of duration)
-    max_event_duration_days: float = 0.0
+    # Event trading rules configuration
+    # Controls when trading is allowed based on event duration and counting status
+    # If None, uses EventTradingRulesConfig.default()
+    event_trading_rules: Optional[EventTradingRulesConfig] = None
 
     # Maximum completed events to keep in history (for memory management)
     max_completed_events: int = 100
@@ -570,6 +569,78 @@ class MultiEventManager:
 
         logger.debug(f"Unregistered tokens for event {event_info.event_id}")
 
+    def _get_event_trading_rules(self) -> EventTradingRulesConfig:
+        """Get event trading rules config, using default if not configured."""
+        if self.config.event_trading_rules is not None:
+            return self.config.event_trading_rules
+        return EventTradingRulesConfig.default()
+
+    def _check_event_trading_rules(
+        self,
+        event_info: EventInfo,
+        rules: "EventCategoryRules",
+        now: datetime,
+        hours_to_settlement: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check if trading is allowed for an event based on its rules.
+
+        Args:
+            event_info: Event information
+            rules: Trading rules for this event's category
+            now: Current time (UTC)
+            hours_to_settlement: Hours until settlement
+
+        Returns:
+            Tuple of (should_skip, reason) - if should_skip is True, don't trade yet
+        """
+        from ..kelly.config import EventCategoryRules
+
+        event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+
+        # Calculate counting start time (noon ET on market_start_date)
+        counting_start_dt = datetime.combine(
+            event_info.market_start_date,
+            datetime.min.time().replace(hour=17)  # 12:00 ET = 17:00 UTC
+        )
+        hours_until_counting = (counting_start_dt - now).total_seconds() / 3600
+        counting_started = hours_until_counting <= 0
+
+        # Check min_hours_before_settlement (from rules)
+        if hours_to_settlement <= rules.min_hours_before_settlement:
+            return True, (
+                f"Too close to settlement: {hours_to_settlement:.1f}h remaining, "
+                f"rule requires > {rules.min_hours_before_settlement:.1f}h"
+            )
+
+        # Check require_counting_started
+        if rules.require_counting_started and not counting_started:
+            return True, (
+                f"Waiting for counting to start ({rules.name} event, {event_duration_days}d duration). "
+                f"Counting starts in {hours_until_counting:.1f}h"
+            )
+
+        # Check max_hours_before_counting (if not requiring counting to start)
+        if not rules.require_counting_started and rules.max_hours_before_counting is not None:
+            if hours_until_counting > rules.max_hours_before_counting:
+                return True, (
+                    f"Too early before counting ({rules.name} event). "
+                    f"Can trade {rules.max_hours_before_counting:.0f}h before counting, "
+                    f"currently {hours_until_counting:.1f}h before"
+                )
+
+        # Check max_days_before_settlement
+        if rules.max_days_before_settlement is not None:
+            max_hours = rules.max_days_before_settlement * 24
+            if hours_to_settlement > max_hours:
+                return True, (
+                    f"Waiting for T-{max_hours:.0f}h ({rules.name} event, {event_duration_days}d duration). "
+                    f"Currently T-{hours_to_settlement:.1f}h"
+                )
+
+        # All checks passed
+        return False, ""
+
     async def _do_full_refresh(self) -> int:
         """Do a full refresh of tweet data."""
         n_days = self.config.training_days
@@ -949,21 +1020,20 @@ class MultiEventManager:
                     self._pending_events.pop(event_id, None)
                 continue
 
-            # For long-duration events, only start when remaining time < threshold
-            # Events with duration > max_event_duration_days wait until remaining time
-            # is less than max_event_duration_days * 24 hours
-            if self.config.max_event_duration_days > 0:
-                event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
-                max_hours_threshold = self.config.max_event_duration_days * 24
+            # Get event trading rules for this event's duration
+            event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+            trading_rules = self._get_event_trading_rules()
+            rules = trading_rules.get_rules_for_event(event_duration_days)
 
-                if event_duration_days > self.config.max_event_duration_days:
-                    if hours_to_settlement > max_hours_threshold:
-                        logger.debug(
-                            f"Event {event_id} is long-duration ({event_duration_days}d), "
-                            f"waiting until T-{max_hours_threshold:.0f}h "
-                            f"(currently T-{hours_to_settlement:.1f}h)"
-                        )
-                        continue
+            # Check if trading is allowed based on rules
+            should_skip, skip_reason = self._check_event_trading_rules(
+                event_info, rules, now, hours_to_settlement
+            )
+            if should_skip:
+                logger.debug(
+                    f"Event {event_id} ({event_info.short_name}): {skip_reason}"
+                )
+                continue
 
             # Request capital (CapitalPool has its own lock)
             allocated = await self.capital_pool.request_capital(event_id)
