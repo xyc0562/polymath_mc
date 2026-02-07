@@ -137,3 +137,4 @@ backtest/token_shortlist
 config/hidden_files/*
 .encrypted_key
 .env
+data/backtest_cache
