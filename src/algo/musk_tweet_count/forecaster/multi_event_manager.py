@@ -363,7 +363,7 @@ class MultiEventManager:
 
         # Use actual values from API (cost basis / initialValue)
         for token_id, pos_info in all_positions.items():
-            position_value += pos_info["value"]
+            position_value += pos_info["cost_basis"]
 
         total_capital = usdc_balance + position_value
 
@@ -1030,8 +1030,8 @@ class MultiEventManager:
                 event_info, rules, now, hours_to_settlement
             )
             if should_skip:
-                logger.debug(
-                    f"Event {event_id} ({event_info.short_name}): {skip_reason}"
+                logger.info(
+                    f"Event {event_id} ({event_info.short_name}) pending: {skip_reason}"
                 )
                 continue
 
@@ -1672,7 +1672,7 @@ class MultiEventManager:
                         token_id, pos_info = parse_position(pos)
                         if token_id:
                             positions[token_id] = pos_info
-                            logger.debug(f"Found position: token={token_id[:20]}..., shares={pos_info['shares']:.2f}, value=${pos_info['value']:.2f}")
+                            logger.debug(f"Found position: token={token_id[:20]}..., shares={pos_info['shares']:.2f}, cost=${pos_info['cost_basis']:.2f}")
                     elif isinstance(pos, str):
                         logger.warning(f"Unexpected position format (string): {pos[:100]}")
             elif isinstance(positions_data, dict):
@@ -1798,10 +1798,10 @@ class MultiEventManager:
 
                 event_positions[event_id][token_id] = pos_info
                 # Use actual value from API (cost basis / initialValue)
-                event_values[event_id] += pos_info["value"]
+                event_values[event_id] += pos_info["cost_basis"]
 
                 logger.info(
-                    f"Position: {pos_info['shares']:.2f} shares @ ${pos_info['avg_price']:.4f} = ${pos_info['value']:.2f} "
+                    f"Position: {pos_info['shares']:.2f} shares @ ${pos_info['avg_price']:.4f} = ${pos_info['cost_basis']:.2f} "
                     f"of {event_info.short_name} (token {token_id[:16]}...)"
                 )
 
