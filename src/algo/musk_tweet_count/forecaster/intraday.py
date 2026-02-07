@@ -393,6 +393,65 @@ class BaseIntradayForecaster(ABC):
         """
         pass
 
+    def predict_samples(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+        n_samples: int,
+        rng: np.random.Generator,
+        std_inflation_factor: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Draw n_samples of today's final count as discrete integers.
+
+        Default implementation (used by Ridge path):
+        - Calls predict() to get (mean, std)
+        - Applies std_inflation_factor to widen variance
+        - Moment-matches to NegBin (or Poisson if underdispersed)
+        - Floors every sample at cum_so_far
+
+        Subclasses (e.g. BucketIntradayForecaster) may override to
+        produce samples directly from their internal bucket model.
+
+        Args:
+            events: Today's events so far
+            contract_date: Today's contract date
+            now: Current timestamp
+            n_samples: Number of samples to draw
+            rng: Caller-provided random number generator
+            std_inflation_factor: Multiply variance by this factor (>=1)
+
+        Returns:
+            Integer array of shape (n_samples,)
+        """
+        mean, std = self.predict(events, contract_date, now)
+        cum_so_far = len([e for e in events if e.timestamp < now])
+
+        # Inflate std: var' = var * factor, so std' = std * sqrt(factor)
+        if std_inflation_factor > 1.0:
+            std = std * np.sqrt(std_inflation_factor)
+
+        if mean <= 0 or std <= 0:
+            return np.full(n_samples, max(int(round(mean)), cum_so_far), dtype=int)
+
+        var = std ** 2
+
+        if var > mean:
+            # Overdispersed → Negative Binomial
+            # Var = μ + μ²/k  →  k = μ² / (Var - μ)
+            k = mean ** 2 / (var - mean)
+            k = max(k, 0.1)
+            p = k / (k + mean)
+            samples = rng.negative_binomial(k, p, size=n_samples)
+        else:
+            # Underdispersed or equidispersed → Poisson
+            samples = rng.poisson(mean, size=n_samples)
+
+        # Floor at cum_so_far
+        samples = np.maximum(samples, cum_so_far)
+        return samples.astype(int)
+
     @property
     @abstractmethod
     def historical_mean(self) -> float:
@@ -928,6 +987,63 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         return mean, std
 
+    def predict_samples(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+        n_samples: int,
+        rng: np.random.Generator,
+        std_inflation_factor: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Draw n_samples of today's final count directly from the bucket model.
+
+        Reuses the same regime / bucket logic as predict() but returns
+        the raw discrete NegBin samples instead of collapsing to (mean, std).
+        """
+        if not self._fitted:
+            raise RuntimeError(
+                "BucketIntradayForecaster.predict_samples() called before fit()."
+            )
+
+        tau = self.contract_utils.get_tau(now, contract_date)
+        is_weekend = self.contract_utils.is_weekend(contract_date)
+        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
+
+        if not buckets:
+            raise RuntimeError(
+                f"No bucket distributions for {'weekend' if is_weekend else 'weekday'}."
+            )
+
+        observed = len([e for e in events if e.timestamp < now])
+        current_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
+        partial_fraction = (tau % self.bucket_size) / self.bucket_size
+
+        # Compute expected count by now
+        expected_so_far = sum(b.mean for b in buckets[:current_bucket_idx])
+        expected_so_far += buckets[current_bucket_idx].mean * partial_fraction
+
+        # Regime multiplier
+        if expected_so_far >= self.config.min_expected_for_regime:
+            regime = observed / expected_so_far
+            regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
+        else:
+            regime = 1.0
+
+        samples = self._sample_remaining(
+            observed=observed,
+            current_bucket_idx=current_bucket_idx,
+            partial_fraction=partial_fraction,
+            buckets=buckets,
+            regime=regime,
+            n_simulations=n_samples,
+            rng=rng,
+            std_inflation_factor=std_inflation_factor,
+        )
+
+        return samples.astype(int)
+
     def _sample_remaining(
         self,
         observed: int,
@@ -936,20 +1052,26 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         buckets: List[BucketDistribution],
         regime: float,
         n_simulations: int,
+        rng: Optional[np.random.Generator] = None,
+        std_inflation_factor: float = 1.0,
     ) -> np.ndarray:
         """Sample remaining bucket counts via Monte Carlo."""
-        rng = np.random.default_rng()
+        if rng is None:
+            rng = np.random.default_rng()
         samples = np.full(n_simulations, observed, dtype=float)
 
         # Sample remaining portion of current bucket
         if partial_fraction < 1.0:
             current_bucket = buckets[current_bucket_idx]
             remaining_mean = current_bucket.mean * (1.0 - partial_fraction) * regime
+            k = current_bucket.dispersion_k
+            if std_inflation_factor > 1.0:
+                k = k / std_inflation_factor
 
             if remaining_mean > 0:
                 remaining_samples = self._sample_negative_binomial(
                     mean=remaining_mean,
-                    k=current_bucket.dispersion_k,
+                    k=k,
                     size=n_simulations,
                     rng=rng,
                 )
@@ -959,11 +1081,14 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         for bucket_idx in range(current_bucket_idx + 1, self.n_buckets):
             bucket = buckets[bucket_idx]
             bucket_mean = bucket.mean * regime
+            k = bucket.dispersion_k
+            if std_inflation_factor > 1.0:
+                k = k / std_inflation_factor
 
             if bucket_mean > 0:
                 bucket_samples = self._sample_negative_binomial(
                     mean=bucket_mean,
-                    k=bucket.dispersion_k,
+                    k=k,
                     size=n_simulations,
                     rng=rng,
                 )

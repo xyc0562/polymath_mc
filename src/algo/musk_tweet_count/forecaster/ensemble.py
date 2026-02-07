@@ -186,9 +186,7 @@ class EnsembleMonteCarloForecaster:
         n_simulations: int,
         seed: Optional[int],
         member_idx: int,
-        today_mean: float,
-        today_std: float,
-        cum_so_far: int,
+        today_samples: np.ndarray,
     ) -> np.ndarray:
         """Run simulation for a single ensemble member."""
         # Use different seed for each member to ensure diversity
@@ -198,15 +196,14 @@ class EnsembleMonteCarloForecaster:
             member_seed = None
         rng = np.random.default_rng(member_seed)
 
-        sums = np.zeros(n_simulations)
+        sums = today_samples.astype(float)
 
         if horizon == 1:
             # Today only - no interday component
-            for i in range(n_simulations):
-                sums[i] = self._sample_today(today_mean, today_std, cum_so_far, rng)
             return sums
 
         # For horizon > 1, compute regime adjustment for this member
+        cum_so_far = len([e for e in events if e.timestamp < now])
         tau = self.contract_utils.get_tau(now, contract_date)
         regime_adjustment = self._compute_regime_adjustment(
             interday, cum_so_far, tau, contract_date
@@ -215,11 +212,10 @@ class EnsembleMonteCarloForecaster:
         future_horizons = list(range(1, horizon))
 
         for i in range(n_simulations):
-            today_sample = self._sample_today(today_mean, today_std, cum_so_far, rng)
             future_samples = self._sample_future_days(
                 interday, contract_date, future_horizons, rng, regime_adjustment
             )
-            sums[i] = today_sample + sum(future_samples)
+            sums[i] += sum(future_samples)
 
         return sums
 
@@ -265,14 +261,9 @@ class EnsembleMonteCarloForecaster:
 
         seed = self.mc_config.random_seed
 
-        # Get today's nowcast (shared across all members)
+        # Get today's nowcast (keep mean for metadata in ForecastResult)
         today_mean, today_std = self.nowcast.predict(events, contract_date, now)
         cum_so_far = len([e for e in events if e.timestamp < now])
-
-        # Apply today's std inflation if configured
-        today_std_inflation = self.mc_config.today_std_inflation_factor
-        if today_std_inflation > 1.0:
-            today_std = today_std * np.sqrt(today_std_inflation)
 
         # Compute number of simulations per member based on weights
         n_per_member = [int(n_simulations * w) for w in self.weights]
@@ -289,6 +280,14 @@ class EnsembleMonteCarloForecaster:
             if n_sims <= 0:
                 continue
 
+            # Generate discrete today-samples for this member with its own rng
+            member_seed_today = (seed + idx * 1000 + 500) if seed is not None else None
+            member_rng_today = np.random.default_rng(member_seed_today)
+            today_samples = self.nowcast.predict_samples(
+                events, contract_date, now, n_sims, member_rng_today,
+                std_inflation_factor=self.mc_config.today_std_inflation_factor,
+            )
+
             member_sums = self._run_member_simulation(
                 interday,
                 events,
@@ -298,9 +297,7 @@ class EnsembleMonteCarloForecaster:
                 n_sims,
                 seed,
                 idx,
-                today_mean,
-                today_std,
-                cum_so_far,
+                today_samples,
             )
             all_samples.append(member_sums)
 

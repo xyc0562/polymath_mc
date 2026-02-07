@@ -607,12 +607,16 @@ class KellyTradingBot:
         """
         Sync portfolio state from Polymarket API.
 
-        IMPORTANT: The Data API has significant latency (seconds to minutes).
-        WebSocket fills provide real-time updates and are the primary source
-        of truth during active trading. This API sync:
-        - Updates from API only if API shows MORE shares than local
-        - Never clears local state (would lose fill-based updates)
-        - Is used primarily for initial state loading and reconciliation
+        The API is the authoritative source of truth for positions.
+        This sync unconditionally overwrites local state with API data:
+        - Updates positions to match API (both increases and decreases)
+        - Clears positions the API no longer reports (sold/closed)
+        - Recalculates collateral_used from synced positions
+
+        Note: The API has some latency (seconds to minutes), so within a
+        single tick we use local state for iterative Kelly optimization.
+        WebSocket fills are logged but don't update portfolio (avoids
+        double-counting from MATCHED/MINED/CONFIRMED callbacks).
 
         Args:
             wallet_address: The wallet address to sync positions for

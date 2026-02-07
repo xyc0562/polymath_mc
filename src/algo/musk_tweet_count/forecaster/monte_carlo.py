@@ -101,7 +101,7 @@ class MonteCarloForecaster:
     Monte Carlo simulation for 7-day sum distribution.
 
     Combines:
-    - Today's count: sampled from log-normal based on nowcast
+    - Today's count: discrete samples from nowcast.predict_samples() (NegBin)
     - Days 1-6: sampled from Negative Binomial based on interday model
     """
 
@@ -353,21 +353,18 @@ class MonteCarloForecaster:
         seed = self.mc_config.random_seed
         rng = np.random.default_rng(seed)
 
-        # Get today's nowcast
+        # Get today's nowcast (keep mean for metadata)
         today_mean, today_std = self.nowcast.predict(events, contract_date, now)
-        cum_so_far = len([e for e in events if e.timestamp < now])
 
-        # Apply today's std inflation if configured
-        # today_std' = today_std * sqrt(s) to inflate variance by factor s
-        today_std_inflation = self.mc_config.today_std_inflation_factor
-        if today_std_inflation > 1.0:
-            today_std = today_std * np.sqrt(today_std_inflation)
+        # Draw discrete NegBin samples for today via predict_samples()
+        today_samples = self.nowcast.predict_samples(
+            events, contract_date, now, n_simulations, rng,
+            std_inflation_factor=self.mc_config.today_std_inflation_factor,
+        )
 
         # For horizon=1, just return today's forecast (no interday component)
         if horizon == 1:
-            sums = np.zeros(n_simulations)
-            for i in range(n_simulations):
-                sums[i] = self._sample_today(today_mean, today_std, cum_so_far, rng)
+            sums = today_samples.astype(float)
 
             # Compute statistics
             mean = float(np.mean(sums))
@@ -415,18 +412,18 @@ class MonteCarloForecaster:
         # Compute regime adjustment from today's partial observation
         # This adjusts future day forecasts based on how today is tracking vs expected
         # The adjustment decays over horizons (day 1 gets full, day 2 gets less, etc.)
+        cum_so_far = len([e for e in events if e.timestamp < now])
         tau = self.contract_utils.get_tau(now, contract_date)
         regime_adjustment = self._compute_regime_adjustment(cum_so_far, tau, contract_date)
 
         # Run simulations
-        sums = np.zeros(n_simulations)
+        sums = today_samples.astype(float)
 
         for i in range(n_simulations):
-            today_sample = self._sample_today(today_mean, today_std, cum_so_far, rng)
             future_samples = self._sample_future_days(
                 contract_date, future_horizons, rng, regime_adjustment
             )
-            sums[i] = today_sample + sum(future_samples)
+            sums[i] += sum(future_samples)
 
         # Apply horizon cap to prevent unrealistic multi-day forecasts
         horizon_caps = self.mc_config.max_horizon_caps
