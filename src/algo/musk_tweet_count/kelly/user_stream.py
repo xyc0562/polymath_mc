@@ -436,6 +436,12 @@ class UserStreamClient:
             if self.on_stale_order:
                 await self.on_stale_order(pending)
 
+            # Always remove from pending tracking after handling.
+            # For FAK orders the unfilled remainder is already killed by the exchange,
+            # so keeping it in _pending_orders just causes infinite stale warnings.
+            async with self._pending_lock:
+                self._pending_orders.pop(pending.order_id, None)
+
     # Callback for stale orders (set by executor)
     on_stale_order: Optional[Callable[["PendingOrder"], Any]] = None
 

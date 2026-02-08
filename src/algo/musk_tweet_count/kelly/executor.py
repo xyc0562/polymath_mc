@@ -837,16 +837,18 @@ class KellyExecutor:
             f"bin={pending.bin_index}, size={pending.size:.2f} @ {pending.price:.4f}"
         )
 
-        # Cancel via order executor
+        # Cancel via order executor (may fail for FAK orders already killed by exchange)
         success = self.order_executor.cancel_order(order_id)
 
         if success:
-            # Remove from our pending tracking
-            if order_id in self._pending_orders:
-                del self._pending_orders[order_id]
             logger.info(f"Stale order {order_id[:16]}... cancelled successfully")
         else:
-            logger.error(f"Failed to cancel stale order {order_id[:16]}...")
+            logger.warning(f"Cancel failed for stale order {order_id[:16]}... (likely already dead FAK)")
+
+        # Always clean up local tracking — for FAK orders the unfilled remainder
+        # is already killed by the exchange, keeping it just causes stale loops
+        if order_id in self._pending_orders:
+            del self._pending_orders[order_id]
 
     def get_pending_count(self) -> int:
         """Get count of pending orders awaiting fill."""

@@ -31,7 +31,7 @@ from .data import EventStore, ContractDayUtils, XTrackerClient as PostsXTrackerC
 from ..musk_tweet_count import XTrackerClient as TrackingsXTrackerClient
 from ..kelly.config import KellyConfig, EventTradingRulesConfig
 from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
-from ..kelly.user_stream import UserStreamClient, FillEvent
+from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +238,9 @@ class MultiEventManager:
                 api_secret=self._api_secret,
                 api_passphrase=self._api_passphrase,
             )
-            # Wire up fill handler to route to correct bot
+            # Wire up fill and stale order handlers to route to correct bot
             self.user_stream.on_fill = self._handle_global_fill
+            self.user_stream.on_stale_order = self._handle_global_stale_order
             logger.info("Global UserStreamClient created for fill confirmations")
         else:
             logger.warning("No API credentials for user stream - fill confirmations disabled")
@@ -525,6 +526,34 @@ class MultiEventManager:
                 )
         except Exception as e:
             logger.error(f"Error routing fill to event {event_id}: {e}", exc_info=True)
+
+    async def _handle_global_stale_order(self, pending: PendingOrder) -> None:
+        """
+        Route stale order from global UserStreamClient to the correct bot.
+
+        Uses token_id to identify which event/bot should handle the cancellation.
+        For FAK orders the unfilled remainder is already killed by the exchange,
+        so this mainly cleans up local tracking in the executor.
+        """
+        token_id = pending.token_id
+
+        event_mapping = self._token_to_event.get(token_id)
+        if not event_mapping:
+            logger.debug(f"Stale order for unknown token {token_id[:16]}...")
+            return
+
+        event_id, bin_index = event_mapping
+
+        active = self._active_events.get(event_id)
+        if not active:
+            logger.warning(f"Stale order for inactive event {event_id} token {token_id[:16]}...")
+            return
+
+        try:
+            if active.bot.kelly_bot and active.bot.kelly_bot.kelly_executor:
+                await active.bot.kelly_bot.kelly_executor.handle_stale_order(pending)
+        except Exception as e:
+            logger.error(f"Error handling stale order for event {event_id}: {e}", exc_info=True)
 
     def _register_event_tokens(self, event_info: EventInfo) -> None:
         """
