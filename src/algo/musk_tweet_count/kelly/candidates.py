@@ -464,6 +464,7 @@ def generate_candidates(
                 reservation_price=reservation_yes,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
+                kelly_only_exit=config.kelly_only_exit,
             )
             if candidate:
                 candidates.append(candidate)
@@ -513,6 +514,7 @@ def generate_candidates(
                 reservation_price=reservation_no,
                 config=config,
                 hours_to_settlement=hours_to_settlement,
+                kelly_only_exit=config.kelly_only_exit,
             )
             if candidate:
                 candidates.append(candidate)
@@ -696,6 +698,7 @@ def _generate_sell_yes_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    kelly_only_exit: bool = False,
 ) -> Optional[TradeCandidate]:
     """
     Generate a SELL YES candidate if profitable.
@@ -773,13 +776,14 @@ def _generate_sell_yes_candidate(
     # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
     exit_threshold = min(model_probability, reservation_price)
 
-    # Only exit if we can get threshold or better
-    if vwap < exit_threshold:
-        logger.debug(
-            f"SELL_YES bin {bin_index}: below exit threshold "
-            f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
-        )
-        return None
+    # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
+    if not kelly_only_exit:
+        if vwap < exit_threshold:
+            logger.debug(
+                f"SELL_YES bin {bin_index}: below exit threshold "
+                f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
+            )
+            return None
 
     # Calculate edge relative to the threshold used
     actual_edge = (vwap - exit_threshold) / exit_threshold if exit_threshold > 0 else 0.0
@@ -949,6 +953,7 @@ def _generate_sell_no_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    kelly_only_exit: bool = False,
 ) -> Optional[TradeCandidate]:
     """
     Generate a SELL NO candidate if profitable.
@@ -1028,13 +1033,14 @@ def _generate_sell_no_candidate(
     # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
     exit_threshold = min(model_probability, reservation_price)
 
-    # Only exit if we can get threshold or better
-    if vwap < exit_threshold:
-        logger.debug(
-            f"SELL_NO bin {bin_index}: below exit threshold "
-            f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
-        )
-        return None
+    # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
+    if not kelly_only_exit:
+        if vwap < exit_threshold:
+            logger.debug(
+                f"SELL_NO bin {bin_index}: below exit threshold "
+                f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
+            )
+            return None
 
     # Calculate edge relative to the threshold used
     actual_edge = (vwap - exit_threshold) / exit_threshold if exit_threshold > 0 else 0.0

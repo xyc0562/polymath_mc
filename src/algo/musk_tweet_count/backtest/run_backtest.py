@@ -460,6 +460,16 @@ def main():
     )
 
     parser.add_argument(
+        "--exit-mode",
+        type=str,
+        default="kelly_only",
+        choices=["kelly_or_fairprice", "kelly_only"],
+        help="Exit mode for closing positions. "
+             "'kelly_or_fairprice' exits when market >= fair value AND utility >= 0. "
+             "'kelly_only' exits based only on utility (skips fair value check).",
+    )
+
+    parser.add_argument(
         "--event-rules",
         type=str,
         default=None,
@@ -529,6 +539,7 @@ def main():
             kappa=args.kappa,
             min_utility=args.min_utility,
             t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
+            kelly_only_exit=(args.exit_mode == "kelly_only"),
             edge_buffer=EdgeBufferConfig(
                 required_roi=args.roi,
                 friction_mid=0.015,
@@ -575,6 +586,8 @@ def main():
         logger.info(f"Using UNIFIED runner (same Kelly logic as production)")
         logger.info(f"Projection model: {args.projection}")
         logger.info(f"Intraday mode: {args.intraday_mode}")
+        if args.exit_mode != "kelly_only":
+            logger.info(f"Exit mode: {args.exit_mode}")
     else:
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(
