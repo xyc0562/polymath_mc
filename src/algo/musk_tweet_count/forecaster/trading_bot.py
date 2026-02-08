@@ -862,7 +862,7 @@ class GASKellyTradingBot:
         if self.kelly_bot and self.kelly_bot.portfolio:
             try:
                 yes_prices, no_prices = self.kelly_bot.portfolio.get_reservation_prices(
-                    self.kelly_config.w_floor
+                    self.kelly_config.w_floor, self.kelly_config.kelly_fraction
                 )
                 for bin_idx in range(len(yes_prices)):
                     kelly_yes_prices[bin_idx] = yes_prices[bin_idx]

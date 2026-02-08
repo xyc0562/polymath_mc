@@ -512,7 +512,7 @@ class KellyTradingBot:
         """Get current Kelly reservation prices."""
         if not self.portfolio:
             return [], []
-        return self.portfolio.get_reservation_prices(self.config.w_floor)
+        return self.portfolio.get_reservation_prices(self.config.w_floor, self.config.kelly_fraction)
 
     async def fetch_positions_from_api(self, wallet_address: str) -> Dict[str, dict]:
         """

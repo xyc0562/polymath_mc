@@ -360,7 +360,7 @@ def generate_candidates(
     )
 
     # Get current reservation prices (multi-bin Kelly)
-    yes_prices, no_prices = portfolio.get_reservation_prices(config.w_floor)
+    yes_prices, no_prices = portfolio.get_reservation_prices(config.w_floor, config.kelly_fraction)
 
     # Log portfolio state and top reservation prices for debugging
     if verbose:
@@ -592,9 +592,6 @@ def _generate_buy_yes_candidate(
         hours_to_settlement,
         config.t_stop_hours,
     )
-
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
 
     # Enforce minimum order value (Polymarket API requirement: $1)
     if delta_usd < MIN_ORDER_VALUE_USD:
@@ -851,9 +848,6 @@ def _generate_buy_no_candidate(
         config.t_stop_hours,
     )
 
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
-
     # Enforce minimum order value (Polymarket API requirement: $1)
     if delta_usd < MIN_ORDER_VALUE_USD:
         reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
@@ -1081,4 +1075,5 @@ def _compute_portfolio_utility_gain(
         terminal_before,
         terminal_after,
         config.w_floor,
+        config.kelly_fraction,
     )

@@ -113,8 +113,8 @@ class AdaptiveDeltaConfig:
     All sizes are in USD - shares are computed as: shares = usd_amount / price
     """
 
-    # Base chunk size in USD (e.g., $50 per trade)
-    base_delta_usd: float = 50.0
+    # Base chunk size in USD (e.g., $12.5 per trade)
+    base_delta_usd: float = 12.5
 
     # Maximum fraction of visible depth to take per trade
     # Set to 1.0 for production (no depth impact limit)
@@ -151,14 +151,18 @@ class KellyConfig:
     # Enable Kelly optimizer
     enabled: bool = True
 
-    # Fractional Kelly multiplier (0.25 = quarter Kelly for safety)
-    kappa: float = 0.25
-
     # Minimum utility gain threshold to execute a trade
     # With small position sizes and many bins, utility gains are naturally small
     # 0.0001 is appropriate for $500-1000 capital with 10-share base delta
     # min_utility: float = 0.0001
     min_utility: float = 0.00005
+
+    # Fractional Kelly parameter α ∈ (0, 1].
+    # Controls risk aversion via CRRA power utility with γ = 1/α.
+    # α = 1.0: full Kelly (log utility)
+    # α = 0.5: half Kelly (γ = 2, more conservative)
+    # α = 0.25: quarter Kelly (γ = 4, very conservative)
+    kelly_fraction: float = 1.0
 
     # Minimum terminal wealth floor (prevents ruin)
     w_floor: float = 1.0
@@ -214,6 +218,9 @@ class KellyConfig:
 
         # Ignore websocket config if present (moved to websocket_client.py)
         data.pop("websocket", None)
+
+        # Backward compatibility: ignore old kappa field (chunk scaling removed)
+        data.pop("kappa", None)
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),

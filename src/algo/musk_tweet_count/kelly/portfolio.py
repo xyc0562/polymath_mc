@@ -256,6 +256,7 @@ class Portfolio:
     def get_reservation_prices(
         self,
         w_floor: float = 1.0,
+        kelly_fraction: float = 1.0,
     ) -> tuple[List[float], List[float]]:
         """
         Compute Kelly reservation prices for all bins.
@@ -268,15 +269,17 @@ class Portfolio:
             self.probabilities,
             terminal_wealths,
             w_floor,
+            kelly_fraction,
         )
 
-    def get_expected_utility(self, w_floor: float = 1.0) -> float:
-        """Compute current expected log utility."""
+    def get_expected_utility(self, w_floor: float = 1.0, kelly_fraction: float = 1.0) -> float:
+        """Compute current expected utility."""
         terminal_wealths = self.get_terminal_wealths(w_floor)
         return compute_expected_log_utility(
             self.probabilities,
             terminal_wealths,
             w_floor,
+            kelly_fraction,
         )
 
     def simulate_buy_yes(
