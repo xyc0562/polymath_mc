@@ -580,8 +580,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use unified Kelly trading logic (required)")
 
     # Kelly parameters
+    parser.add_argument("--kappa", type=float, default=0.25)
     parser.add_argument("--kelly-fraction", type=float, default=1.0)
-    parser.add_argument("--min-utility", type=float, default=0.0001)
+    parser.add_argument("--min-utility", type=float, default=KellyConfig.min_utility)
     parser.add_argument("--t-stop", type=float, default=None)
     parser.add_argument("--c-bin-max-ratio", type=float, default=0.15)
     parser.add_argument("--min-perceived-prob", type=float,
@@ -615,7 +616,7 @@ def build_runner(args) -> UnifiedBacktestRunner:
     max_orders = args.max_orders
     if args.quick:
         if args.base_delta_usd == _adaptive_defaults.base_delta_usd:
-            base_delta_usd = 12.5
+            base_delta_usd = 50.0
         max_orders = 5
         logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
 
@@ -625,6 +626,7 @@ def build_runner(args) -> UnifiedBacktestRunner:
 
     _default_kelly = KellyConfig()
     trading_config = KellyConfig(
+        kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_utility=args.min_utility,
         t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,

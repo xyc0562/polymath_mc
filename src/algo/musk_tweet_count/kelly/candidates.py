@@ -593,6 +593,9 @@ def _generate_buy_yes_candidate(
         config.t_stop_hours,
     )
 
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
+
     # Enforce minimum order value (Polymarket API requirement: $1)
     if delta_usd < MIN_ORDER_VALUE_USD:
         reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
@@ -847,6 +850,9 @@ def _generate_buy_no_candidate(
         hours_to_settlement,
         config.t_stop_hours,
     )
+
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
 
     # Enforce minimum order value (Polymarket API requirement: $1)
     if delta_usd < MIN_ORDER_VALUE_USD:

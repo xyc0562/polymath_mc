@@ -349,6 +349,13 @@ def main():
 
     # Kelly parameters for unified mode
     parser.add_argument(
+        "--kappa",
+        type=float,
+        default=0.25,
+        help="Fractional Kelly multiplier. Default: 0.25 (quarter Kelly)",
+    )
+
+    parser.add_argument(
         "--kelly-fraction",
         type=float,
         default=1.0,
@@ -360,8 +367,8 @@ def main():
     parser.add_argument(
         "--min-utility",
         type=float,
-        default=0.0001,
-        help="Minimum utility gain threshold. Default: 0.0001",
+        default=KellyConfig.min_utility,
+        help=f"Minimum utility gain threshold. Default: {KellyConfig.min_utility}",
     )
 
     parser.add_argument(
@@ -421,7 +428,7 @@ def main():
         "--base-delta-usd",
         type=float,
         default=_adaptive_defaults.base_delta_usd,
-        help=f"Base trade size in USD. Default: ${_adaptive_defaults.base_delta_usd}. "
+        help=f"Base trade size in USD before kappa multiplier. Default: ${_adaptive_defaults.base_delta_usd}. "
              "For faster backtests with fewer trades, use $50-100.",
     )
 
@@ -518,7 +525,7 @@ def main():
     if args.quick:
         # Only override base_delta_usd if user didn't explicitly set it
         if args.base_delta_usd == _adaptive_defaults.base_delta_usd:
-            base_delta_usd = 12.5  # Quick mode default
+            base_delta_usd = 50.0  # Quick mode default
         max_orders = 5  # Fewer orders per tick
         logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
 
@@ -538,6 +545,7 @@ def main():
         # Build KellyConfig with CLI overrides
         _default_kelly = KellyConfig()
         trading_config = KellyConfig(
+            kappa=args.kappa,
             kelly_fraction=args.kelly_fraction,
             min_utility=args.min_utility,
             t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,

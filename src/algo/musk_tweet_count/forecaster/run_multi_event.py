@@ -550,6 +550,12 @@ def parse_args() -> argparse.Namespace:
 
     # Kelly configuration
     parser.add_argument(
+        "--kappa",
+        type=float,
+        default=0.25,
+        help="Fractional Kelly multiplier (default: 0.25)",
+    )
+    parser.add_argument(
         "--kelly-fraction",
         type=float,
         default=1.0,
@@ -731,6 +737,7 @@ async def main() -> None:
     )
 
     kelly_config = KellyConfig(
+        kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_utility=args.min_utility,
         edge_buffer=edge_buffer_config,
