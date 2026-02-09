@@ -81,8 +81,20 @@ class MultiEventConfig:
     training_days: int = 45
     use_gas: bool = True
 
-    # How often to refresh posts data (seconds)
-    # XTracker posts update ~every 5 minutes, so 2.5 min refresh is safe
+    # How often to poll lastSync for XTracker data updates (seconds)
+    sync_poll_interval: float = 5.0
+
+    # Debounce window: after detecting a lastSync change, keep polling for
+    # this many seconds to absorb subsequent updates from the same sync cycle
+    # (XTracker's sync is not atomic — lastSync can update 2+ times per cycle)
+    sync_debounce_seconds: float = 15.0
+
+    # Soft deadline: log warning if sync→trade cycle exceeds this (seconds)
+    # This is NOT a hard cutoff — the cycle always runs to completion
+    sync_trade_deadline_seconds: float = 10.0
+
+    # How often to refresh posts data (seconds) — used as fallback
+    # In sync-driven mode, posts are refreshed on lastSync change instead
     posts_refresh_interval: int = 150  # 2.5 minutes
 
     # Maximum age of data before it's considered stale (seconds)
@@ -216,6 +228,11 @@ class MultiEventManager:
             contract_utils=self.contract_utils,
             xtracker_client=self.posts_xtracker_client,
         )
+
+        # Sync-driven polling: last known XTracker sync timestamp
+        self._last_known_sync: Optional[datetime] = None
+        # Consecutive sync poll error counter (for backoff)
+        self._sync_poll_errors: int = 0
 
         # Track if data has been pre-fetched
         self._data_prefetched = False
@@ -493,6 +510,29 @@ class MultiEventManager:
                 bot.notify_data_refreshed()
             except Exception as e:
                 logger.debug(f"Error notifying bot of fresh data: {e}")
+
+    async def _trigger_immediate_trading(self) -> None:
+        """
+        Trigger immediate recompute + trade on all active bots.
+
+        Unlike _notify_bots_of_fresh_data() which just sets a flag for the next
+        slow tick, this directly calls run_sync_driven_tick() to trade NOW.
+
+        IMPORTANT: Fetches authoritative counts FIRST so bots use the real
+        XTracker count (not just the posts-based count, which can lag).
+        """
+        # Fetch authoritative counts from trackings API before trading.
+        # This ensures effective_count = max(posts, authoritative) is accurate.
+        await self.validate_all_event_counts()
+
+        async with self._events_lock:
+            active_bots = [active.bot for active in self._active_events.values()]
+
+        for bot in active_bots:
+            try:
+                await bot.run_sync_driven_tick()
+            except Exception as e:
+                logger.error(f"Error in sync-driven tick: {e}", exc_info=True)
 
     def _handle_global_fill(self, fill_event: FillEvent) -> None:
         """
@@ -1106,7 +1146,7 @@ class MultiEventManager:
         # Register token_ids for fill routing
         self._register_event_tokens(event_info)
 
-        # Create bot config
+        # Create bot config (sync-driven: bot idles, manager triggers ticks)
         bot_config = TradingBotConfig(
             slow_tick_interval_seconds=self.config.tick_interval_seconds,
             dry_run=self.config.dry_run,
@@ -1116,6 +1156,7 @@ class MultiEventManager:
             use_gas=self.config.use_gas,
             event_name=event_info.short_name,
             projection_model=self.config.projection_model,
+            sync_driven=True,
         )
 
         # Create bot with shared EventStore
@@ -1275,22 +1316,23 @@ class MultiEventManager:
 
     async def run(self) -> None:
         """
-        Run the multi-event manager.
+        Run the multi-event manager with sync-driven trading.
 
-        Manages all active events concurrently and handles event lifecycle.
-        Pre-fetches shared tweet data before starting any events.
+        Instead of refreshing posts on a timer and trading on a separate timer,
+        this loop polls XTracker's lastSync timestamp every ~5 seconds.
+        When lastSync changes (meaning XTracker just synced posts from X/Twitter):
+          1. Immediately refresh posts from XTracker /posts API
+          2. Trigger immediate trading on all bots (recompute MC + Kelly + execute)
 
-        Main loop timing:
-        - posts_refresh_interval (5 min): Refresh posts for intraday modeling
-        - count_validation_interval (15 min): Validate counts against XTracker API
-        - event_scan_interval (1 hour): Check for new events to trade
-        - health_log_interval (1 hour): Log health status
+        Between sync events, the bots are completely idle (no fast ticks).
+
+        Other periodic tasks (count validation, event scan, health) remain timer-based.
         """
         self._running = True
         self._stop_event = asyncio.Event()
         self._start_time = datetime.now(self._tz)
 
-        logger.info("Starting MultiEventManager")
+        logger.info("Starting MultiEventManager (sync-driven mode)")
 
         # Auto-initialize capital from API if total_capital is 0
         if self.capital_pool.needs_initialization:
@@ -1310,23 +1352,14 @@ class MultiEventManager:
         # Start any pending events
         await self._try_start_pending_events()
 
-        # Track last execution times for different periodic tasks
-        last_posts_refresh = datetime.now(self._tz)
+        # Track last execution times for periodic tasks
         last_count_validation = datetime.now(self._tz)
         last_event_scan = datetime.now(self._tz)
         self._last_health_log_time = datetime.now(self._tz)
 
-        # Use shortest interval for loop timing
-        loop_interval = min(
-            self.config.posts_refresh_interval,
-            self.config.count_validation_interval,
-            self.config.event_scan_interval,
-            60,  # At least check every minute
-        )
-
         logger.info(
-            f"Main loop started with intervals: "
-            f"posts_refresh={self.config.posts_refresh_interval}s, "
+            f"Main loop started (sync-driven): "
+            f"sync_poll={self.config.sync_poll_interval}s, "
             f"count_validation={self.config.count_validation_interval}s, "
             f"event_scan={self.config.event_scan_interval}s, "
             f"health_log={self.config.health_log_interval}s"
@@ -1335,47 +1368,115 @@ class MultiEventManager:
         # Log initial health status
         self._log_health()
 
-        # Main loop: monitor events and periodically run tasks
+        # Main loop: poll lastSync + periodic tasks
         while self._running:
             try:
-                # Wait for stop signal or loop interval
+                # --- Sync-driven polling: check lastSync ---
+                try:
+                    current_sync = self.trackings_xtracker_client.get_last_sync()
+                except Exception as e:
+                    current_sync = None
+                    self._sync_poll_errors += 1
+                    if self._sync_poll_errors <= 3 or self._sync_poll_errors % 10 == 0:
+                        logger.warning(
+                            f"Failed to poll lastSync (error #{self._sync_poll_errors}): {e}"
+                        )
+
+                if current_sync is not None:
+                    self._sync_poll_errors = 0  # Reset on success
+
+                    if current_sync != self._last_known_sync:
+                        # Sync changed — but XTracker's sync is not atomic,
+                        # so lastSync may update 2+ times per cycle.
+                        # Debounce: keep polling until lastSync stabilizes.
+                        logger.info(
+                            f"XTracker sync change detected: {current_sync} "
+                            f"(prev: {self._last_known_sync}), debouncing..."
+                        )
+                        self._last_known_sync = current_sync
+                        debounce_start = datetime.now(self._tz)
+
+                        while (datetime.now(self._tz) - debounce_start).total_seconds() < self.config.sync_debounce_seconds:
+                            try:
+                                await asyncio.wait_for(
+                                    self._stop_event.wait(),
+                                    timeout=self.config.sync_poll_interval
+                                )
+                                break  # Stop requested during debounce
+                            except asyncio.TimeoutError:
+                                pass
+
+                            if not self._running:
+                                break
+
+                            try:
+                                latest = self.trackings_xtracker_client.get_last_sync()
+                            except Exception:
+                                latest = None
+
+                            if latest is not None and latest != self._last_known_sync:
+                                logger.info(f"XTracker sync updated during debounce: {latest}")
+                                self._last_known_sync = latest
+
+                        if not self._running:
+                            break
+
+                        # Debounce complete — now act on the final sync value
+                        sync_detected_at = datetime.now(self._tz)
+                        logger.info(
+                            f"XTracker sync settled: {self._last_known_sync} "
+                            f"(debounced {(sync_detected_at - debounce_start).total_seconds():.1f}s)"
+                        )
+
+                        # 1. Refresh posts
+                        await self.refresh_shared_data()
+
+                        # 2. Trigger immediate trading on all bots
+                        await self._trigger_immediate_trading()
+
+                        # 3. Log cycle timing (soft deadline — always completes)
+                        elapsed = (datetime.now(self._tz) - sync_detected_at).total_seconds()
+                        logger.info(f"Sync→trade cycle completed in {elapsed:.1f}s")
+                        if elapsed > self.config.sync_trade_deadline_seconds:
+                            logger.warning(
+                                f"Sync→trade took {elapsed:.1f}s "
+                                f"(soft deadline: {self.config.sync_trade_deadline_seconds}s)"
+                            )
+
+                # --- Periodic tasks (timer-based, unchanged) ---
+                now = datetime.now(self._tz)
+
+                # Count validation (15 min)
+                if (now - last_count_validation).total_seconds() >= self.config.count_validation_interval:
+                    await self.validate_all_event_counts()
+                    last_count_validation = now
+
+                # Event discovery + cleanup (1 hour)
+                if (now - last_event_scan).total_seconds() >= self.config.event_scan_interval:
+                    await self._discover_and_add_events()
+                    await self._try_start_pending_events()
+                    await self._cleanup_old_data()
+                    last_event_scan = now
+
+                # Health logging (1 hour)
+                if (now - self._last_health_log_time).total_seconds() >= self.config.health_log_interval:
+                    self._log_health()
+                    self._last_health_log_time = now
+
+                # Capital values + status (every poll cycle)
+                await self._update_capital_values()
+                self._log_status()
+
+                # --- Sleep until next poll (interruptible by stop_event) ---
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=loop_interval
+                        timeout=self.config.sync_poll_interval
                     )
                     # Stop requested
                     break
                 except asyncio.TimeoutError:
                     pass
-
-                now = datetime.now(self._tz)
-
-                # Task 1: Refresh posts data (most frequent - for intraday modeling)
-                if (now - last_posts_refresh).total_seconds() >= self.config.posts_refresh_interval:
-                    await self.refresh_shared_data()
-                    last_posts_refresh = now
-
-                # Task 2: Validate counts against XTracker API
-                if (now - last_count_validation).total_seconds() >= self.config.count_validation_interval:
-                    await self.validate_all_event_counts()
-                    last_count_validation = now
-
-                # Task 3: Discover new events and start pending (least frequent)
-                if (now - last_event_scan).total_seconds() >= self.config.event_scan_interval:
-                    await self._discover_and_add_events()
-                    await self._try_start_pending_events()
-                    await self._cleanup_old_data()  # Cleanup old data to prevent memory leaks
-                    last_event_scan = now
-
-                # Task 4: Log health status periodically
-                if (now - self._last_health_log_time).total_seconds() >= self.config.health_log_interval:
-                    self._log_health()
-                    self._last_health_log_time = now
-
-                # Always update capital values and log status
-                await self._update_capital_values()
-                self._log_status()
 
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)

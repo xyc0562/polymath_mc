@@ -552,7 +552,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kappa",
         type=float,
-        default=0.25,
+        default=KellyConfig.kappa,
         help="Fractional Kelly multiplier (default: 0.25)",
     )
     parser.add_argument(

@@ -660,6 +660,28 @@ class XTrackerClient:
         logger.warning(f"No tracking found for period {target_start_date} - {target_end_date}")
         return None
 
+    def get_last_sync(self, handle: str = MUSK_XTRACKER_HANDLE) -> Optional[datetime]:
+        """Fetch the lastSync timestamp for a user (lightweight poll).
+
+        This does NOT use the trackings cache - it's a fast, uncached poll
+        to detect when XTracker has synced new data from X/Twitter.
+        """
+        try:
+            response = self.session.get(
+                f"{self.base_url}/users/{handle}",
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("success") and "data" in data:
+                sync_str = data["data"].get("lastSync")
+                if sync_str:
+                    return datetime.fromisoformat(sync_str.replace("Z", "+00:00"))
+        except requests.RequestException as e:
+            logger.warning(f"Failed to fetch lastSync for @{handle}: {e}")
+        return None
+
     def get_current_count(
         self,
         start_date: datetime,

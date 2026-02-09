@@ -86,6 +86,11 @@ class TradingBotConfig:
     # - normal: Approximates with Normal distribution (symmetric)
     projection_model: str = "asymmetric"
 
+    # Sync-driven mode: bot is idle between XTracker sync updates.
+    # When True, run() becomes an idle loop; trading is driven by
+    # manager calling run_sync_driven_tick().
+    sync_driven: bool = False
+
     # Legacy alias for slow_tick_interval_seconds
     @property
     def tick_interval_seconds(self) -> int:
@@ -957,33 +962,77 @@ class GASKellyTradingBot:
         )
         logger.info("")
 
+    async def run_sync_driven_tick(self) -> Optional[TickResult]:
+        """
+        Run a full trading tick triggered by XTracker sync update.
+
+        This is called by MultiEventManager when lastSync changes.
+        Always recomputes Monte Carlo and runs full Kelly optimization.
+        """
+        self._tick_count += 1
+        logger.info(f"=== Sync-Driven Tick {self._tick_count} ===")
+
+        # Always recompute Monte Carlo (we know data is fresh)
+        self._recompute_monte_carlo()
+
+        # Run full trading tick with logging
+        return await self.run_tick(log_header=True)
+
     async def run(self) -> None:
         """
-        Main trading loop with two-pronged approach:
+        Main trading loop.
 
-        1. Slow loop (every slow_tick_interval_seconds, default 5 min):
-           - Recomputes Monte Carlo forecast IF fresh data is available
-           - Updates cached probabilities
-           - Runs Kelly optimization tick
+        In sync-driven mode (sync_driven=True):
+        - Bot is idle, waiting for manager to call run_sync_driven_tick()
+        - Only checks for settlement/stop periodically
 
-        2. Fast loop (every fast_tick_interval_seconds, default 30 sec):
-           - Uses cached probabilities (no Monte Carlo recomputation)
-           - Runs Kelly optimization tick
-           - Catches opportunities between slow ticks
-
-        3. WebSocket callback (on orderbook changes):
-           - Uses cached probabilities
-           - Runs Kelly optimization tick immediately
-
-        When using shared EventStore (from MultiEventManager):
-        - Does NOT fetch data from API (manager handles that)
-        - Waits for notify_data_refreshed() signal before recomputing Monte Carlo
+        In legacy mode (sync_driven=False):
+        - Two-pronged slow/fast tick approach (for backtest/standalone)
         """
         if not self._setup_complete:
             raise RuntimeError("Bot not setup. Call setup() first.")
 
         self._running = True
         self._stop_event = asyncio.Event()
+
+        if self.bot_config.sync_driven:
+            await self._run_sync_driven_loop()
+        else:
+            await self._run_legacy_loop()
+
+        self._running = False
+        logger.info("Trading bot stopped")
+
+    async def _run_sync_driven_loop(self) -> None:
+        """Idle loop for sync-driven mode — trading is triggered externally."""
+        logger.info("Bot started in sync-driven mode (idle until manager triggers tick)")
+
+        # Run initial tick to establish baseline
+        await self.run_sync_driven_tick()
+
+        while self._running:
+            try:
+                hours_elapsed, hours_remaining = self._get_timing()
+                if hours_remaining <= 0:
+                    logger.info("Past settlement time, stopping")
+                    break
+
+                # Idle — just wait for stop signal or periodic check (60s)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=60)
+                    break  # Stop requested
+                except asyncio.TimeoutError:
+                    pass
+
+            except asyncio.CancelledError:
+                logger.info("Sync-driven loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in sync-driven idle loop: {e}")
+                await asyncio.sleep(30)
+
+    async def _run_legacy_loop(self) -> None:
+        """Legacy two-pronged slow/fast tick loop (for backtest/standalone)."""
         slow_interval = self.bot_config.slow_tick_interval_seconds
         fast_interval = self.bot_config.fast_tick_interval_seconds
 
@@ -1044,9 +1093,6 @@ class GASKellyTradingBot:
                     break
                 except asyncio.TimeoutError:
                     pass
-
-        self._running = False
-        logger.info("Trading loop stopped")
 
     async def _run_slow_tick(self) -> Optional[TickResult]:
         """
