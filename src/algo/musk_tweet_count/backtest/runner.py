@@ -109,7 +109,7 @@ class BacktestConfig:
     # Trading parameters - uses shared EdgeBufferConfig from kelly module
     # This ensures backtest uses SAME logic as live trading
     edge_buffer: EdgeBufferConfig = field(default_factory=lambda: EdgeBufferConfig(
-        required_roi=0.10,  # 10% required ROI
+        required_roi=0.0,  # No required ROI (Kelly handles risk sizing)
         friction_mid=0.015,  # 1.5% friction for >= 9% probability
         friction_tail=0.03,  # 3% friction for < 9% probability
         tail_threshold=0.09,  # 9% threshold

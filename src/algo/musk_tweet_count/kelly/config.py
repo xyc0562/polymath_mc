@@ -34,13 +34,13 @@ class EdgeBufferConfig:
     """
 
     # Required ROI on stake (e.g., 0.05 = 5%)
-    required_roi: float = 0.05
+    required_roi: float = 0.0
 
     # Friction in probability points for middle range (10% < p < 90%)
-    friction_mid: float = 0.01  # 1%
+    friction_mid: float = 0.02  # 2%
 
     # Friction in probability points for tails (p <= 10% or p >= 90%)
-    friction_tail: float = 0.02  # 2%
+    friction_tail: float = 0.04  # 4%
 
     # Threshold for tail zone
     tail_threshold: float = 0.10  # 10%
@@ -80,7 +80,7 @@ class RateLimitConfig:
     """
 
     # Maximum orders per optimization tick
-    max_orders_per_tick: int = 10
+    max_orders_per_tick: int = 100
 
     # Minimum delay between orders in seconds (used for dry-run mode)
     min_order_delay_seconds: float = 1.0
@@ -105,23 +105,25 @@ class RateLimitConfig:
 @dataclass
 class AdaptiveDeltaConfig:
     """
-    Configuration for adaptive chunk sizing in USD.
+    Configuration for adaptive chunk sizing.
 
     Adapts trade size based on available liquidity (never take too much of visible depth).
     Trading stops entirely once past T_stop.
 
-    All sizes are in USD - shares are computed as: shares = usd_amount / price
+    Base chunk size is expressed as a ratio of c_event_max, so it scales
+    automatically with the collateral budget.
     """
 
-    # Base chunk size in USD (e.g., $50 per trade)
-    base_delta_usd: float = 50.0
+    # Base chunk size as ratio of c_event_max (e.g., 0.01 = 1% of event budget)
+    # Production: 0.01 × $500 = $5/trade, Backtest: 0.01 × $10k = $100/trade
+    base_delta_ratio: float = 0.01
 
     # Maximum fraction of visible depth to take per trade
     # Set to 1.0 for production (no depth impact limit)
     max_depth_fraction: float = 0.3
 
-    # Minimum chunk size in USD (must be >= $1 for Polymarket)
-    min_delta_usd: float = 5.0
+    # Minimum chunk size in USD (must be >= $1 for Polymarket API)
+    min_delta_usd: float = 1.0
 
 
 @dataclass
@@ -151,8 +153,8 @@ class KellyConfig:
     # Enable Kelly optimizer
     enabled: bool = True
 
-    # Fractional Kelly multiplier (0.25 = quarter Kelly for safety)
-    kappa: float = 0.25
+    # Fractional Kelly multiplier (1.0 = full chunk size)
+    kappa: float = 1.0
 
     # Minimum utility gain threshold to execute a trade
     # Set to 0 because CRRA power utility with kelly_fraction < 1
@@ -194,6 +196,11 @@ class KellyConfig:
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
+    @property
+    def base_delta_usd(self) -> float:
+        """Base chunk size in USD, computed from ratio × c_event_max."""
+        return self.adaptive_delta.base_delta_ratio * self.collateral.c_event_max
+
     @classmethod
     def from_dict(cls, data: dict) -> "KellyConfig":
         """Create config from dictionary (e.g., from YAML)."""
@@ -210,13 +217,15 @@ class KellyConfig:
             if c_event_max > 0:
                 collateral_data["c_bin_max_ratio"] = old_bin_max / c_event_max
 
-        # Backward compatibility: convert old share-based delta to USD-based
-        # Old: base_delta=60 (shares), min_delta=60 (shares)
-        # New: base_delta_usd=15 (USD), min_delta_usd=5 (USD)
-        if "base_delta" in adaptive_delta_data and "base_delta_usd" not in adaptive_delta_data:
-            # Remove old share-based fields, use new defaults
-            adaptive_delta_data.pop("base_delta", None)
-            adaptive_delta_data.pop("min_delta", None)
+        # Backward compatibility: convert old share-based or USD-based delta to ratio
+        adaptive_delta_data.pop("base_delta", None)  # Old share-based field
+        adaptive_delta_data.pop("min_delta", None)  # Old share-based field
+        # Convert old base_delta_usd to base_delta_ratio if present
+        if "base_delta_usd" in adaptive_delta_data and "base_delta_ratio" not in adaptive_delta_data:
+            old_usd = adaptive_delta_data.pop("base_delta_usd")
+            c_event_max = collateral_data.get("c_event_max", 500.0)
+            if c_event_max > 0:
+                adaptive_delta_data["base_delta_ratio"] = old_usd / c_event_max
 
         # Ignore websocket config if present (moved to websocket_client.py)
         data.pop("websocket", None)

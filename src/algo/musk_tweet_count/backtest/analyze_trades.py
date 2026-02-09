@@ -565,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capital", type=float, default=1000.0)
     parser.add_argument("--spread", type=float, default=0.02)
     parser.add_argument("--slippage", type=float, default=0.005)
-    parser.add_argument("--roi", type=float, default=0.10)
+    parser.add_argument("--roi", type=float, default=EdgeBufferConfig.required_roi)
     parser.add_argument("--exit-hours", type=float, default=0.0)
 
     # Paths
@@ -593,12 +593,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-require-two-sided", action="store_true")
 
     _adaptive_defaults = AdaptiveDeltaConfig()
-    parser.add_argument("--base-delta-usd", type=float,
-                        default=_adaptive_defaults.base_delta_usd)
-    parser.add_argument("--max-orders", type=int, default=50)
+    parser.add_argument("--base-delta-ratio", type=float,
+                        default=_adaptive_defaults.base_delta_ratio)
+    parser.add_argument("--max-orders", type=int, default=1000)
 
     parser.add_argument("--quick", action="store_true",
-                        help="Quick mode: base_delta_usd=$50, max_orders=5")
+                        help="Deprecated, no-op.")
 
     parser.add_argument("--projection", type=str, default="asymmetric",
                         choices=["asymmetric", "normal", "skew_normal", "gamma"])
@@ -611,14 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_runner(args) -> UnifiedBacktestRunner:
     """Create a UnifiedBacktestRunner from parsed CLI args."""
-    _adaptive_defaults = AdaptiveDeltaConfig()
-    base_delta_usd = args.base_delta_usd
+    base_delta_ratio = args.base_delta_ratio
     max_orders = args.max_orders
-    if args.quick:
-        if args.base_delta_usd == _adaptive_defaults.base_delta_usd:
-            base_delta_usd = 50.0
-        max_orders = 5
-        logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
 
     event_trading_rules = None
     if args.event_rules:
@@ -641,9 +635,8 @@ def build_runner(args) -> UnifiedBacktestRunner:
             require_two_sided_liquidity=not args.no_require_two_sided,
         ),
         adaptive_delta=AdaptiveDeltaConfig(
-            base_delta_usd=base_delta_usd,
+            base_delta_ratio=base_delta_ratio,
             max_depth_fraction=0.10,
-            min_delta_usd=1.0,
         ),
         rate_limit=RateLimitConfig(
             max_orders_per_tick=max_orders,
@@ -653,7 +646,7 @@ def build_runner(args) -> UnifiedBacktestRunner:
         collateral=CollateralConfig(
             c_bin_max_ratio=args.c_bin_max_ratio,
         ),
-        max_iters_per_tick=50,
+        max_iters_per_tick=1000,
     )
 
     unified_config = UnifiedBacktestConfig(

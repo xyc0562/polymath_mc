@@ -299,6 +299,7 @@ def compute_adaptive_delta_usd(
     available_depth_usd: float,
     hours_to_settlement: float,
     t_stop_hours: float,
+    base_delta_usd: float = 0.0,
 ) -> float:
     """
     Compute adaptive chunk size in USD based on market conditions.
@@ -308,6 +309,7 @@ def compute_adaptive_delta_usd(
         available_depth_usd: Available depth in orderbook (in USD)
         hours_to_settlement: Hours until market settlement
         t_stop_hours: T_stop cutoff hours
+        base_delta_usd: Base chunk size in USD (computed from ratio × c_event_max)
 
     Returns:
         Adaptive chunk size in USD (0 if past T_stop)
@@ -322,7 +324,7 @@ def compute_adaptive_delta_usd(
 
     return max(
         config.min_delta_usd,
-        min(config.base_delta_usd, liquidity_delta_usd),
+        min(base_delta_usd, liquidity_delta_usd),
     )
 
 
@@ -591,6 +593,7 @@ def _generate_buy_yes_candidate(
         depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
+        config.base_delta_usd,
     )
 
     # Scale chunk size by kappa for conservative execution
@@ -735,13 +738,17 @@ def _generate_sell_yes_candidate(
         depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
+        config.base_delta_usd,
     )
+
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
 
     # Convert USD to shares
     delta = delta_usd / best_bid
 
     # Don't sell more than we have
-    # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
+    # Exit full position when edge is gone
     delta = min(delta, position.yes_shares)
 
     # Floor to 2 decimal places to avoid "not enough balance" errors
@@ -849,6 +856,7 @@ def _generate_buy_no_candidate(
         depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
+        config.base_delta_usd,
     )
 
     # Scale chunk size by kappa for conservative execution
@@ -992,13 +1000,17 @@ def _generate_sell_no_candidate(
         depth_usd,
         hours_to_settlement,
         config.t_stop_hours,
+        config.base_delta_usd,
     )
+
+    # Scale chunk size by kappa for conservative execution
+    delta_usd *= config.kappa
 
     # Convert USD to shares
     delta = delta_usd / best_no_price
 
     # Don't sell more than we have
-    # Note: kappa is NOT applied to exits - we want to exit full position when edge is gone
+    # Exit full position when edge is gone
     delta = min(delta, position.no_shares)
 
     # Floor to 2 decimal places to avoid "not enough balance" errors

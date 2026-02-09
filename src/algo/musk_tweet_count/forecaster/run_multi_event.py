@@ -598,13 +598,13 @@ def parse_args() -> argparse.Namespace:
         help="Minimum utility gain threshold (default: 0.0001)",
     )
 
-    # Chunk sizing in USD (defaults from AdaptiveDeltaConfig)
+    # Chunk sizing (defaults from AdaptiveDeltaConfig)
     _adaptive_defaults = AdaptiveDeltaConfig()
     parser.add_argument(
-        "--base-delta-usd",
+        "--base-delta-ratio",
         type=float,
-        default=_adaptive_defaults.base_delta_usd,
-        help=f"Base chunk size in USD per order (default: ${_adaptive_defaults.base_delta_usd})",
+        default=_adaptive_defaults.base_delta_ratio,
+        help=f"Base chunk size as ratio of c_event_max (default: {_adaptive_defaults.base_delta_ratio})",
     )
     parser.add_argument(
         "--min-delta-usd",
@@ -732,7 +732,7 @@ async def main() -> None:
     )
 
     adaptive_delta_config = AdaptiveDeltaConfig(
-        base_delta_usd=args.base_delta_usd,
+        base_delta_ratio=args.base_delta_ratio,
         min_delta_usd=args.min_delta_usd,
     )
 

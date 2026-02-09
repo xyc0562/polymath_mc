@@ -56,8 +56,8 @@ kelly:
   # This creates natural asymmetry based on what you're risking
   edge_buffer:
     required_roi: 0.05            # 5% required ROI on stake
-    friction_mid: 0.01            # 1% friction for 10% < p < 90%
-    friction_tail: 0.02           # 2% friction for p <= 10% or p >= 90%
+    friction_mid: 0.02            # 2% friction for 10% < p < 90%
+    friction_tail: 0.04           # 4% friction for p <= 10% or p >= 90%
     tail_threshold: 0.10          # Threshold for tail zone
 
   # Adaptive chunk sizing

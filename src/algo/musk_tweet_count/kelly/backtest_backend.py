@@ -124,22 +124,11 @@ class BacktestOrderbookProvider(OrderbookProvider):
         Creates synthetic depth levels around the bid/ask prices
         to simulate realistic orderbook structure.
         """
-        # Create synthetic depth levels
-        # In real markets, there's typically more depth at worse prices
-        depth_levels = 5
-        size_per_level = 100.0  # Shares per level
+        # Create synthetic depth: single level with deep liquidity
+        size_per_level = 1_000_000.0  # Effectively unlimited depth
 
-        # YES bids: start at best bid, decrease price for worse levels
-        yes_bids = []
-        for i in range(depth_levels):
-            price = max(0.01, yes_bid - (i * 0.005))  # 0.5% step per level
-            yes_bids.append(OrderbookLevel(price=price, size=size_per_level * (1 + i * 0.5)))
-
-        # YES asks: start at best ask, increase price for worse levels
-        yes_asks = []
-        for i in range(depth_levels):
-            price = min(0.99, yes_ask + (i * 0.005))  # 0.5% step per level
-            yes_asks.append(OrderbookLevel(price=price, size=size_per_level * (1 + i * 0.5)))
+        yes_bids = [OrderbookLevel(price=yes_bid, size=size_per_level)]
+        yes_asks = [OrderbookLevel(price=yes_ask, size=size_per_level)]
 
         return UnifiedOrderbook(
             bin_index=bin_index,

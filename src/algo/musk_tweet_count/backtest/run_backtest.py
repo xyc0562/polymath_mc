@@ -299,8 +299,22 @@ def main():
     parser.add_argument(
         "--roi",
         type=float,
-        default=0.10,
-        help="Required ROI for trades. Default: 0.10 (10%%)",
+        default=EdgeBufferConfig.required_roi,
+        help=f"Required ROI for trades. Default: {EdgeBufferConfig.required_roi}",
+    )
+
+    parser.add_argument(
+        "--friction-mid",
+        type=float,
+        default=EdgeBufferConfig.friction_mid,
+        help=f"Friction for mid-range prices (10%% < p < 90%%). Default: {EdgeBufferConfig.friction_mid}",
+    )
+
+    parser.add_argument(
+        "--friction-tail",
+        type=float,
+        default=EdgeBufferConfig.friction_tail,
+        help=f"Friction for tail prices (p <= 10%% or p >= 90%%). Default: {EdgeBufferConfig.friction_tail}",
     )
 
     parser.add_argument(
@@ -425,25 +439,25 @@ def main():
     # Default from AdaptiveDeltaConfig
     _adaptive_defaults = AdaptiveDeltaConfig()
     parser.add_argument(
-        "--base-delta-usd",
+        "--base-delta-ratio",
         type=float,
-        default=_adaptive_defaults.base_delta_usd,
-        help=f"Base trade size in USD before kappa multiplier. Default: ${_adaptive_defaults.base_delta_usd}. "
-             "For faster backtests with fewer trades, use $50-100.",
+        default=_adaptive_defaults.base_delta_ratio,
+        help=f"Base trade size as ratio of c_event_max (capital). "
+             f"Default: {_adaptive_defaults.base_delta_ratio} ({_adaptive_defaults.base_delta_ratio*100}%%). "
+             "e.g., 0.01 with $10k capital = $100/trade.",
     )
 
     parser.add_argument(
         "--max-orders",
         type=int,
-        default=50,
-        help="Maximum orders per tick. Default: 50. Use 1-5 for faster backtests.",
+        default=1000,
+        help="Maximum orders per tick. Default: 1000.",
     )
 
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Quick backtest mode: base_delta_usd=$50 (unless overridden), max_orders=5. "
-             "Use this for faster iteration. Combine with --base-delta-usd to customize.",
+        help="Deprecated, no-op. Kept for backward compatibility.",
     )
 
     parser.add_argument(
@@ -518,16 +532,8 @@ def main():
             logger.error(f"Invalid end date: {args.end_date}")
             return
 
-    # Apply --quick mode overrides
-    # Quick mode sets defaults for faster backtests, but user can override
-    base_delta_usd = args.base_delta_usd
+    base_delta_ratio = args.base_delta_ratio
     max_orders = args.max_orders
-    if args.quick:
-        # Only override base_delta_usd if user didn't explicitly set it
-        if args.base_delta_usd == _adaptive_defaults.base_delta_usd:
-            base_delta_usd = 50.0  # Quick mode default
-        max_orders = 5  # Fewer orders per tick
-        logger.info(f"Quick mode: base_delta_usd=${base_delta_usd}, max_orders={max_orders}")
 
     # Load event trading rules if specified
     event_trading_rules = None
@@ -552,8 +558,8 @@ def main():
             kelly_only_exit=(args.exit_mode == "kelly_only"),
             edge_buffer=EdgeBufferConfig(
                 required_roi=args.roi,
-                friction_mid=0.015,
-                friction_tail=0.03,
+                friction_mid=args.friction_mid,
+                friction_tail=args.friction_tail,
                 tail_threshold=0.09,
                 min_perceived_prob=args.min_perceived_prob,
                 min_market_price=args.min_market_price,
@@ -561,9 +567,8 @@ def main():
                 require_two_sided_liquidity=not args.no_require_two_sided,
             ),
             adaptive_delta=AdaptiveDeltaConfig(
-                base_delta_usd=base_delta_usd,
+                base_delta_ratio=base_delta_ratio,
                 max_depth_fraction=0.10,
-                min_delta_usd=1.0,
             ),
             rate_limit=RateLimitConfig(
                 max_orders_per_tick=max_orders,
@@ -574,7 +579,7 @@ def main():
                 c_event_max=args.capital,
                 c_bin_max_ratio=args.c_bin_max_ratio,
             ),
-            max_iters_per_tick=50,
+            max_iters_per_tick=1000,
         )
 
         unified_config = UnifiedBacktestConfig(
@@ -603,8 +608,8 @@ def main():
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(
             required_roi=args.roi,
-            friction_mid=0.015,  # 1.5% for >= 9% probability
-            friction_tail=0.03,  # 3% for < 9% probability
+            friction_mid=args.friction_mid,
+            friction_tail=args.friction_tail,
             tail_threshold=0.09,  # 9% threshold
             min_perceived_prob=args.min_perceived_prob,
             min_market_price=args.min_market_price,
