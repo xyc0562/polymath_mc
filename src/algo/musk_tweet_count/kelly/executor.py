@@ -125,10 +125,15 @@ class OrderExecutor:
             rounded_price = round(price, 2)
             rounded_size = math.floor(size)  # Integer to ensure maker_amount precision
 
-            # Ensure minimum values
-            if rounded_price <= 0 or rounded_price >= 1:
+            # Ensure valid price range [0.01, 0.99]
+            if rounded_price <= 0:
                 logger.warning(f"Invalid price after rounding: {rounded_price}")
                 return None
+            if rounded_price >= 1:
+                # For sells near price 1.0 (e.g. NO sell when YES ask is 0.001),
+                # round(0.999, 2) = 1.0. Cap at 0.99 to keep the order valid.
+                rounded_price = 0.99
+                logger.info(f"Capped price to 0.99 (raw: {price:.4f})")
             if side == "SELL":
                 # Sells: relaxed minimum of 1 share, no USD value requirement
                 if rounded_size < 1:
@@ -712,8 +717,9 @@ class KellyExecutor:
                         f"Balance error for bin {best.bin_index}, adding to cooldown"
                     )
                     continue
-                # For other errors, break the loop
-                break
+                # For other errors, add to cooldown and continue to next candidate
+                self._record_fak_failure(best.bin_index)
+                continue
 
             # Refresh orderbooks for next iteration
             orderbooks = self._get_orderbooks()
