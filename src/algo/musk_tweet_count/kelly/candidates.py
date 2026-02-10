@@ -599,17 +599,12 @@ def _generate_buy_yes_candidate(
     # Scale chunk size by kappa for conservative execution
     delta_usd *= config.kappa
 
-    # Enforce minimum order value (Polymarket API requirement: $1)
-    if delta_usd < MIN_ORDER_VALUE_USD:
-        reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
-        return None
-
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_ask
 
-    # Enforce minimum size (Polymarket 15 shares minimum)
-    if delta < MIN_ORDER_SIZE:
-        reject(f"size {delta:.1f} below minimum {MIN_ORDER_SIZE}")
+    # Polymarket minimum: $1 value OR 15 shares (reject only if BOTH below)
+    if delta_usd < MIN_ORDER_VALUE_USD and delta < MIN_ORDER_SIZE:
+        reject(f"below minimum (${delta_usd:.2f} < ${MIN_ORDER_VALUE_USD} and {delta:.1f} < {MIN_ORDER_SIZE} shares)")
         return None
 
     # Check we have capital
@@ -755,22 +750,15 @@ def _generate_sell_yes_candidate(
     # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
 
-    # PREVENTION: Don't leave stranded positions (below minimum size or value)
-    # If partial sell would leave < MIN_ORDER_SIZE shares, either sell all or don't sell
+    # PREVENTION: Don't leave stranded positions
+    # If partial sell would leave < 1 share (unsellable), sell all instead
     remaining_shares = position.yes_shares - delta
-    if remaining_shares > 0:
-        remaining_value = remaining_shares * best_bid
-        if remaining_shares < MIN_ORDER_SIZE or remaining_value < MIN_ORDER_VALUE_USD:
-            # Would create stranded position - sell all instead
-            delta = position.yes_shares
-            delta = math.floor(delta * 100) / 100
+    if 0 < remaining_shares < 1:
+        delta = position.yes_shares
+        delta = math.floor(delta * 100) / 100
 
-    # For exits, enforce minimum value (Polymarket $1 minimum)
-    if delta * best_bid < MIN_ORDER_VALUE_USD:
-        return None
-
-    # Enforce minimum size (Polymarket 15 shares minimum)
-    if delta < MIN_ORDER_SIZE:
+    # For exits, only enforce 1 share minimum (no USD value requirement)
+    if delta < 1:
         return None
 
     vwap, filled = compute_vwap_sell_yes(orderbook, delta)
@@ -862,17 +850,12 @@ def _generate_buy_no_candidate(
     # Scale chunk size by kappa for conservative execution
     delta_usd *= config.kappa
 
-    # Enforce minimum order value (Polymarket API requirement: $1)
-    if delta_usd < MIN_ORDER_VALUE_USD:
-        reject(f"value ${delta_usd:.2f} below minimum ${MIN_ORDER_VALUE_USD}")
-        return None
-
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_no_price
 
-    # Enforce minimum size (Polymarket 15 shares minimum)
-    if delta < MIN_ORDER_SIZE:
-        reject(f"size {delta:.1f} below minimum {MIN_ORDER_SIZE}")
+    # Polymarket minimum: $1 value OR 15 shares (reject only if BOTH below)
+    if delta_usd < MIN_ORDER_VALUE_USD and delta < MIN_ORDER_SIZE:
+        reject(f"below minimum (${delta_usd:.2f} < ${MIN_ORDER_VALUE_USD} and {delta:.1f} < {MIN_ORDER_SIZE} shares)")
         return None
 
     if portfolio.available_capital < delta_usd:
@@ -1017,22 +1000,15 @@ def _generate_sell_no_candidate(
     # due to floating point precision (e.g., trying to sell 30.9428 when we have 30.9427)
     delta = math.floor(delta * 100) / 100
 
-    # PREVENTION: Don't leave stranded positions (below minimum size or value)
-    # If partial sell would leave < MIN_ORDER_SIZE shares, either sell all or don't sell
+    # PREVENTION: Don't leave stranded positions
+    # If partial sell would leave < 1 share (unsellable), sell all instead
     remaining_shares = position.no_shares - delta
-    if remaining_shares > 0:
-        remaining_value = remaining_shares * best_no_price
-        if remaining_shares < MIN_ORDER_SIZE or remaining_value < MIN_ORDER_VALUE_USD:
-            # Would create stranded position - sell all instead
-            delta = position.no_shares
-            delta = math.floor(delta * 100) / 100
+    if 0 < remaining_shares < 1:
+        delta = position.no_shares
+        delta = math.floor(delta * 100) / 100
 
-    # For exits, enforce minimum value (Polymarket $1 minimum)
-    if delta * best_no_price < MIN_ORDER_VALUE_USD:
-        return None
-
-    # Enforce minimum size (Polymarket 15 shares minimum)
-    if delta < MIN_ORDER_SIZE:
+    # For exits, only enforce 1 share minimum (no USD value requirement)
+    if delta < 1:
         return None
 
     vwap, filled = compute_vwap_sell_no(orderbook, delta)

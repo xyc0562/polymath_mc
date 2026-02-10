@@ -32,6 +32,7 @@ from .candidates import (
     TradeAction,
     generate_candidates,
     MIN_ORDER_SIZE,
+    MIN_ORDER_VALUE_USD,
 )
 from .websocket_client import OrderbookManager
 
@@ -128,9 +129,16 @@ class OrderExecutor:
             if rounded_price <= 0 or rounded_price >= 1:
                 logger.warning(f"Invalid price after rounding: {rounded_price}")
                 return None
-            if rounded_size < MIN_ORDER_SIZE:
-                logger.warning(f"Size {rounded_size} below minimum {MIN_ORDER_SIZE}")
-                return None
+            if side == "SELL":
+                # Sells: relaxed minimum of 1 share, no USD value requirement
+                if rounded_size < 1:
+                    logger.warning(f"Sell size {rounded_size} below minimum 1 share")
+                    return None
+            else:
+                # Buys: $1 value OR 15 shares (reject only if BOTH below)
+                if rounded_size < MIN_ORDER_SIZE and rounded_size * rounded_price < MIN_ORDER_VALUE_USD:
+                    logger.warning(f"Buy size {rounded_size} below {MIN_ORDER_SIZE} shares and value ${rounded_size * rounded_price:.2f} below ${MIN_ORDER_VALUE_USD}")
+                    return None
 
             maker_amount = rounded_size * rounded_price
             logger.info(
