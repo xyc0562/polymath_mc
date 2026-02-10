@@ -513,13 +513,19 @@ class MultiEventManager:
 
     async def _trigger_immediate_trading(self) -> None:
         """
-        Trigger immediate recompute + trade on all active bots.
+        Trigger immediate recompute + trade on all active bots IN PARALLEL.
 
         Unlike _notify_bots_of_fresh_data() which just sets a flag for the next
         slow tick, this directly calls run_sync_driven_tick() to trade NOW.
 
         IMPORTANT: Fetches authoritative counts FIRST so bots use the real
         XTracker count (not just the posts-based count, which can lag).
+
+        Safety: asyncio.gather is safe here because:
+        - Single-threaded asyncio: no true data races, coroutines interleave only at await points
+        - Each bot has its own _tick_lock preventing overlapping ticks
+        - Each event has its own capital pool allocation (no shared mutable state)
+        - Shared clob_client uses synchronous HTTP (one request at a time per await)
         """
         # Fetch authoritative counts from trackings API before trading.
         # This ensures effective_count = max(posts, authoritative) is accurate.
@@ -528,11 +534,16 @@ class MultiEventManager:
         async with self._events_lock:
             active_bots = [active.bot for active in self._active_events.values()]
 
-        for bot in active_bots:
+        async def _run_bot_tick(bot):
+            bot_name = getattr(bot.bot_config, 'event_name', None) or 'unknown'
             try:
-                await bot.run_sync_driven_tick()
+                await asyncio.wait_for(bot.run_sync_driven_tick(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{bot_name}] Sync-driven tick timed out (120s hard limit)")
             except Exception as e:
-                logger.error(f"Error in sync-driven tick: {e}", exc_info=True)
+                logger.error(f"[{bot_name}] Error in sync-driven tick: {e}", exc_info=True)
+
+        await asyncio.gather(*[_run_bot_tick(bot) for bot in active_bots])
 
     def _handle_global_fill(self, fill_event: FillEvent) -> None:
         """

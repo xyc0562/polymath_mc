@@ -79,6 +79,7 @@ class OrderExecutor:
         self,
         clob_client: ClobClient,
         dry_run: bool = False,
+        event_name: Optional[str] = None,
     ):
         """
         Initialize order executor.
@@ -86,10 +87,14 @@ class OrderExecutor:
         Args:
             clob_client: Authenticated ClobClient
             dry_run: If True, simulate trades without execution
+            event_name: Optional event name for logging context
         """
         self.client = clob_client
         self.dry_run = dry_run
+        self.event_name = event_name or "unknown"
         self._last_error: Optional[str] = None  # Store last error message for cooldown logic
+        # Bin ranges for logging (set by KellyExecutor before each tick)
+        self.bin_ranges: Dict[int, str] = {}
 
     def place_limit_order(
         self,
@@ -147,7 +152,7 @@ class OrderExecutor:
 
             maker_amount = rounded_size * rounded_price
             logger.info(
-                f"[ORDER PARAMS] {side} size={rounded_size:.0f} @ {rounded_price:.2f} "
+                f"[{self.event_name}][ORDER PARAMS] {side} size={rounded_size:.0f} @ {rounded_price:.2f} "
                 f"maker_amt={maker_amount:.2f} (raw: {size:.4f} @ {price:.4f})"
             )
 
@@ -262,8 +267,10 @@ class OrderExecutor:
             )
 
         # Log order details before placement (note: size will be floored to 2 decimals in place_limit_order)
+        bin_range = self.bin_ranges.get(candidate.bin_index, "")
+        bin_info = f"bin={candidate.bin_index} ({bin_range})" if bin_range else f"bin={candidate.bin_index}"
         logger.info(
-            f"Placing order: {action.value} bin={candidate.bin_index} | "
+            f"[{self.event_name}] Placing order: {action.value} {bin_info} | "
             f"{side} {size:.2f} @ {order_price:.2f} | "
             f"fair={candidate.reservation_price:.4f} edge={candidate.edge:+.2%} util={candidate.utility_gain:.4f} | "
             f"token={token_id[:16]}..."
@@ -487,7 +494,16 @@ class KellyExecutor:
             # Check per-tick order limit
             if orders_this_tick >= rate_config.max_orders_per_tick:
                 logger.info(
-                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
+                    f"[{self.event_name}] Reached max orders per tick ({rate_config.max_orders_per_tick})"
+                )
+                break
+
+            # Check tick timeout
+            elapsed = time.time() - start_time
+            if elapsed > rate_config.tick_timeout_seconds:
+                logger.warning(
+                    f"[{self.event_name}] Tick timeout ({rate_config.tick_timeout_seconds}s) "
+                    f"after {orders_this_tick} orders"
                 )
                 break
 
@@ -545,9 +561,13 @@ class KellyExecutor:
                 # Build summary for all candidates
                 parts = []
                 for c in sell_candidates:
-                    parts.append(f"bin{c.bin_index} SELL_{c.action.value.split('_')[1]}={c.utility_gain:.4f}")
+                    br = self._bin_range(c.bin_index)
+                    bin_label = f"bin{c.bin_index}({br})" if br else f"bin{c.bin_index}"
+                    parts.append(f"{bin_label} SELL_{c.action.value.split('_')[1]}={c.utility_gain:.4f}")
                 for c in buy_sorted:
-                    parts.append(f"bin{c.bin_index} {c.action.value.split('_')[1]}={c.utility_gain:.4f}")
+                    br = self._bin_range(c.bin_index)
+                    bin_label = f"bin{c.bin_index}({br})" if br else f"bin{c.bin_index}"
+                    parts.append(f"{bin_label} {c.action.value.split('_')[1]}={c.utility_gain:.4f}")
 
                 summary = " | ".join(parts)
                 logger.info(f"[{self.event_name}][KELLY iter={iteration}] All {len(candidates)} candidates: {summary}")
@@ -617,15 +637,19 @@ class KellyExecutor:
                         filled_size=best.size,
                         filled_price=best.price,
                     )
+                    br = self._bin_range(best.bin_index)
+                    bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
                     logger.info(
-                        f"[ORDER PLACED - DRY RUN] {best.action.value} bin={best.bin_index} | "
+                        f"[{self.event_name}][ORDER PLACED - DRY RUN] {best.action.value} {bin_info} | "
                         f"size={best.size:.1f} @ {best.price:.3f} | "
                         f"Portfolio updated optimistically"
                     )
                 else:
                     # In live mode, portfolio updates happen via WebSocket fill confirmations
+                    br = self._bin_range(best.bin_index)
+                    bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
                     logger.info(
-                        f"[ORDER PLACED] {best.action.value} bin={best.bin_index} | "
+                        f"[{self.event_name}][ORDER PLACED] {best.action.value} {bin_info} | "
                         f"size={best.size:.1f} @ {best.price:.3f} | "
                         f"Will sync from API before next decision"
                     )
@@ -686,8 +710,8 @@ class KellyExecutor:
 
                             # Wait for API data propagation before syncing
                             # Block confirmation doesn't mean the data API has updated yet
-                            logger.debug("Waiting 2s for API data propagation...")
-                            await asyncio.sleep(2.0)
+                            logger.debug("Waiting 1s for API data propagation...")
+                            await asyncio.sleep(1.0)
 
                             # Sync from API after confirmation (or timeout) to get updated state
                             if self.sync_portfolio:
@@ -905,6 +929,13 @@ class KellyExecutor:
             "forecast_mean": forecast_mean,
             "forecast_std": forecast_std,
         }
+        # Propagate bin_ranges to order executor for log context
+        if hasattr(self.order_executor, 'bin_ranges'):
+            self.order_executor.bin_ranges = bin_ranges or {}
+
+    def _bin_range(self, bin_index: int) -> str:
+        """Get bin range string for logging (e.g., '340-359')."""
+        return self._log_context.get("bin_ranges", {}).get(bin_index, "")
 
     def _log_trade_placed(self, candidate: TradeCandidate, token_id: str, order_id: str) -> None:
         """
@@ -960,7 +991,7 @@ class KellyExecutor:
 
         # Log the trade
         logger.info(
-            f"[TRADE #{self._trade_count}] {now} | T-{hours_left:.1f}h | {action} bin={bin_idx} ({bin_range})"
+            f"[{self.event_name}][TRADE #{self._trade_count}] {now} | T-{hours_left:.1f}h | {action} bin={bin_idx} ({bin_range})"
         )
         logger.info(
             f"  → {size:.1f} shares @ {price:.3f} = ${collateral:.2f} | "

@@ -80,13 +80,13 @@ class RateLimitConfig:
     """
 
     # Maximum orders per optimization tick
-    max_orders_per_tick: int = 100
+    max_orders_per_tick: int = 20
 
     # Minimum delay between orders in seconds (used for dry-run mode)
-    min_order_delay_seconds: float = 1.0
+    min_order_delay_seconds: float = 0.5
 
     # Maximum orders per minute (hard cap)
-    max_orders_per_minute: int = 30
+    max_orders_per_minute: int = 60
 
     # Cooldown after hitting rate limit (seconds)
     rate_limit_cooldown_seconds: float = 60.0
@@ -94,7 +94,11 @@ class RateLimitConfig:
     # Timeout for waiting for block confirmation (seconds)
     # In live mode, we wait for MINED/CONFIRMED status before next order
     # Polygon block time is ~2 seconds, but confirmation can take 6-20 seconds
-    block_confirmation_timeout_seconds: float = 30.0
+    block_confirmation_timeout_seconds: float = 15.0
+
+    # Maximum time for a single tick (seconds)
+    # If a tick exceeds this, stop placing orders to avoid stale state
+    tick_timeout_seconds: float = 120.0
 
     # Cooldown after FAK order failure for a specific bin (seconds)
     # When a FAK order fails due to no liquidity, don't retry that bin for this duration
@@ -114,9 +118,9 @@ class AdaptiveDeltaConfig:
     automatically with the collateral budget.
     """
 
-    # Base chunk size as ratio of c_event_max (e.g., 0.01 = 1% of event budget)
-    # Production: 0.01 × $500 = $5/trade, Backtest: 0.01 × $10k = $100/trade
-    base_delta_ratio: float = 0.01
+    # Base chunk size as ratio of c_event_max (e.g., 0.02 = 2% of event budget)
+    # Production: 0.02 × $500 = $10/trade, Backtest: 0.02 × $10k = $200/trade
+    base_delta_ratio: float = 0.02
 
     # Maximum fraction of visible depth to take per trade
     # Set to 1.0 for production (no depth impact limit)

@@ -163,6 +163,7 @@ class KellyTradingBot:
         self.order_executor = OrderExecutor(
             clob_client=self.clob_client,
             dry_run=self.dry_run,
+            event_name=self.event_name,
         )
 
         # Initialize user stream for fill confirmations (only for live trading)
