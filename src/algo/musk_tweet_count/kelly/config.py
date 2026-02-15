@@ -382,8 +382,8 @@ class EventTradingRulesConfig:
                     duration_min_days=4,
                     duration_max_days=9,
                     require_counting_started=False,
-                    max_hours_before_counting=72.0,
-                    min_hours_before_settlement=3.0,
+                    max_hours_before_counting=96.0,
+                    min_hours_before_settlement=1.0,
                 ),
                 # Monthly events (9+ days): wait until 7 days remain
                 EventCategoryRules(
