@@ -123,42 +123,32 @@ class OrderExecutor:
             return {"order_id": "dry_run_order", "status": "simulated"}
 
         try:
-            # Round to Polymarket precision requirements:
-            # - Price: 2 decimals (tick_size=0.01)
-            # - Maker amount (size * price) must be 2 decimals max
-            # Using integer size guarantees maker_amount has at most 2 decimals
-            rounded_price = round(price, 2)
-            rounded_size = math.floor(size)  # Integer to ensure maker_amount precision
+            # Let py-clob-client handle price rounding based on market tick size.
+            # The library fetches tick_size per token (0.01, 0.001, or 0.0001)
+            # and rounds price/amounts accordingly in create_order().
+            rounded_size = math.floor(size)  # Integer shares
 
-            # Ensure valid price range [0.01, 0.99]
-            if rounded_price <= 0:
-                logger.warning(f"Invalid price after rounding: {rounded_price}")
+            # Basic price validation (library also validates against tick_size range)
+            if price <= 0 or price >= 1:
+                logger.warning(f"Invalid price: {price:.4f}")
                 return None
-            if rounded_price >= 1:
-                # For sells near price 1.0 (e.g. NO sell when YES ask is 0.001),
-                # round(0.999, 2) = 1.0. Cap at 0.99 to keep the order valid.
-                rounded_price = 0.99
-                logger.info(f"Capped price to 0.99 (raw: {price:.4f})")
             if side == "SELL":
-                # Sells: relaxed minimum of 1 share, no USD value requirement
                 if rounded_size < 1:
                     logger.warning(f"Sell size {rounded_size} below minimum 1 share")
                     return None
             else:
-                # Buys: $1 value OR 15 shares (reject only if BOTH below)
-                if rounded_size < MIN_ORDER_SIZE and rounded_size * rounded_price < MIN_ORDER_VALUE_USD:
-                    logger.warning(f"Buy size {rounded_size} below {MIN_ORDER_SIZE} shares and value ${rounded_size * rounded_price:.2f} below ${MIN_ORDER_VALUE_USD}")
+                if rounded_size < MIN_ORDER_SIZE and rounded_size * price < MIN_ORDER_VALUE_USD:
+                    logger.warning(f"Buy size {rounded_size} below {MIN_ORDER_SIZE} shares and value ${rounded_size * price:.2f} below ${MIN_ORDER_VALUE_USD}")
                     return None
 
-            maker_amount = rounded_size * rounded_price
             logger.info(
-                f"[{self.event_name}][ORDER PARAMS] {side} size={rounded_size:.0f} @ {rounded_price:.2f} "
-                f"maker_amt={maker_amount:.2f} (raw: {size:.4f} @ {price:.4f})"
+                f"[{self.event_name}][ORDER PARAMS] {side} size={rounded_size:.0f} @ {price:.4f} "
+                f"maker_amt={rounded_size * price:.4f} (raw_size: {size:.4f})"
             )
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=rounded_price,
+                price=price,
                 size=rounded_size,
                 side=side,
             )
@@ -170,7 +160,7 @@ class OrderExecutor:
             response = self.client.post_order(signed_order, orderType=OrderType.FAK)
 
             logger.info(
-                f"Order placed: {side} {rounded_size:.2f} @ {rounded_price:.2f}, "
+                f"Order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
                 f"order_id={response.get('orderID', 'unknown')}"
             )
             return response
