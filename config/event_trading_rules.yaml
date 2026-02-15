@@ -39,7 +39,8 @@ event_categories:
       max_days_before_settlement: 7.0  # Only trade when <= 7 days left
       min_hours_before_settlement: 1.0
 
-# Default rules if event doesn't match any category
+# Default rules if event doesn't match any category (same as weekly)
 default_rules:
-  require_counting_started: true
+  require_counting_started: false
+  max_hours_before_counting: 96.0
   min_hours_before_settlement: 1.0

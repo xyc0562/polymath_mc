@@ -239,11 +239,6 @@ def parse_counting_dates_from_title(title: str) -> Tuple[Optional[date], Optiona
         start_date = date(year, start_month, start_day)
         end_date = date(year, end_month, end_day)
 
-        # Validate 7-day period
-        if (end_date - start_date).days != 7:
-            logger.debug(f"Skipping non-7-day event: {title}")
-            return None, None
-
         return start_date, end_date
 
     except (ValueError, AttributeError) as e:

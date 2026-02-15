@@ -1098,6 +1098,12 @@ class MultiEventManager:
                 logger.info(f"Event {event_id} expired, removing from pending")
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
+                # Return any restored capital allocation (e.g., from reconstruct_state_from_api)
+                # Without this, concluded events with positions leave orphaned allocations
+                allocation = await self.capital_pool.get_allocation(event_id)
+                if allocation:
+                    await self.capital_pool.return_capital(event_id, allocation.current_value)
+                    logger.info(f"Returned ${allocation.current_value:.2f} from expired event {event_id}")
                 continue
 
             # Get event trading rules for this event's duration

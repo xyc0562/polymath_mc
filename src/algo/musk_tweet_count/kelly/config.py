@@ -296,9 +296,10 @@ class EventTradingRulesConfig:
     # List of category rules, checked in order
     categories: List[EventCategoryRules] = field(default_factory=list)
 
-    # Default rules if no category matches
-    default_require_counting_started: bool = True
-    default_min_hours_before_settlement: float = 3.0
+    # Default rules if no category matches (weekly-style defaults)
+    default_require_counting_started: bool = False
+    default_max_hours_before_counting: Optional[float] = 96.0
+    default_min_hours_before_settlement: float = 1.0
 
     def get_rules_for_event(self, event_duration_days: int) -> EventCategoryRules:
         """
@@ -314,12 +315,13 @@ class EventTradingRulesConfig:
             if category.matches_duration(event_duration_days):
                 return category
 
-        # Return default rules
+        # Return default rules (weekly-style)
         return EventCategoryRules(
             name="default",
             duration_min_days=0,
             duration_max_days=9999,
             require_counting_started=self.default_require_counting_started,
+            max_hours_before_counting=self.default_max_hours_before_counting,
             min_hours_before_settlement=self.default_min_hours_before_settlement,
         )
 
@@ -359,8 +361,9 @@ class EventTradingRulesConfig:
 
         return cls(
             categories=categories,
-            default_require_counting_started=default_rules.get("require_counting_started", True),
-            default_min_hours_before_settlement=default_rules.get("min_hours_before_settlement", 3.0),
+            default_require_counting_started=default_rules.get("require_counting_started", False),
+            default_max_hours_before_counting=default_rules.get("max_hours_before_counting", 96.0),
+            default_min_hours_before_settlement=default_rules.get("min_hours_before_settlement", 1.0),
         )
 
     @classmethod
@@ -395,6 +398,7 @@ class EventTradingRulesConfig:
                     min_hours_before_settlement=6.0,
                 ),
             ],
-            default_require_counting_started=True,
-            default_min_hours_before_settlement=3.0,
+            default_require_counting_started=False,
+            default_max_hours_before_counting=96.0,
+            default_min_hours_before_settlement=1.0,
         )
