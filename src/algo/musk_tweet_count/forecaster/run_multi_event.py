@@ -536,6 +536,19 @@ def parse_args() -> argparse.Namespace:
         help="Event IDs to trade (comma-separated) or 'auto' for discovery",
     )
     parser.add_argument(
+        "--min-event-days",
+        type=int,
+        default=7,
+        help="Minimum event duration in days to auto-discover (inclusive, default: 7)",
+    )
+    parser.add_argument(
+        "--max-event-days",
+        type=int,
+        default=7,
+        help="Maximum event duration in days to auto-discover (inclusive, default: 7). "
+             "Events with existing positions are always included regardless of this filter.",
+    )
+    parser.add_argument(
         "--event-rules",
         type=str,
         default="config/event_trading_rules.yaml",
@@ -779,7 +792,10 @@ async def main() -> None:
         dry_run=dry_run,
         event_trading_rules=event_trading_rules,
         projection_model=args.projection,
+        min_event_duration_days=args.min_event_days,
+        max_event_duration_days=args.max_event_days,
     )
+    logger.info(f"Event duration filter: {args.min_event_days}-{args.max_event_days} days (inclusive)")
 
     # Get wallet address for position fetching
     # IMPORTANT: Use proxy wallet if configured (positions are held there)

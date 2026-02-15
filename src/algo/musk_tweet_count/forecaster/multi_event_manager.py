@@ -122,6 +122,12 @@ class MultiEventConfig:
     # If None, uses EventTradingRulesConfig.default()
     event_trading_rules: Optional[EventTradingRulesConfig] = None
 
+    # Event duration filter (inclusive, in days)
+    # Only auto-discover events within this range
+    # Events with existing positions bypass this filter
+    min_event_duration_days: int = 7
+    max_event_duration_days: int = 7
+
     # Maximum completed events to keep in history (for memory management)
     max_completed_events: int = 100
 
@@ -1045,9 +1051,16 @@ class MultiEventManager:
 
         return True
 
+    def _event_passes_duration_filter(self, event_info: EventInfo) -> bool:
+        """Check if event duration is within configured min/max range (inclusive)."""
+        duration = (event_info.settlement_date - event_info.market_start_date).days
+        return self.config.min_event_duration_days <= duration <= self.config.max_event_duration_days
+
     async def _discover_and_add_events(self) -> int:
         """
         Discover new events using the discovery callback and add them.
+
+        Only adds events that pass the duration filter (min/max_event_duration_days).
 
         Returns:
             Number of new events added to pending queue
@@ -1065,6 +1078,15 @@ class MultiEventManager:
 
             added_count = 0
             for event_info in discovered_events:
+                # Filter by duration
+                duration = (event_info.settlement_date - event_info.market_start_date).days
+                if not self._event_passes_duration_filter(event_info):
+                    logger.debug(
+                        f"Skipping {event_info.short_name} ({duration}d) - "
+                        f"outside duration filter [{self.config.min_event_duration_days}, {self.config.max_event_duration_days}]"
+                    )
+                    continue
+
                 # add_event() handles duplicate checking
                 if await self.add_event(event_info):
                     added_count += 1
@@ -1980,7 +2002,15 @@ class MultiEventManager:
             logger.info(f"[PRIORITY] Restored event {event_info.short_name} with ${event_values[event_id]:.2f} position value")
 
         # Second: Add events WITHOUT positions (they need new allocations)
+        # Apply duration filter — only auto-start events within configured range
         for event_info in events_without_positions:
+            duration = (event_info.settlement_date - event_info.market_start_date).days
+            if not self._event_passes_duration_filter(event_info):
+                logger.info(
+                    f"Skipping {event_info.short_name} ({duration}d, no positions) - "
+                    f"outside duration filter [{self.config.min_event_duration_days}, {self.config.max_event_duration_days}]"
+                )
+                continue
             await self.add_event(event_info)
             logger.info(f"Added event {event_info.short_name} (no existing positions)")
 
