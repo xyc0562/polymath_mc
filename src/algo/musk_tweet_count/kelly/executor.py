@@ -732,6 +732,30 @@ class KellyExecutor:
                 self._last_tick_time = time.time()
                 return tick_result
 
+            # Merge orders for same (token_id, side, price)
+            merged_specs = []
+            merged_trade_pairs = []  # Each entry is a list of (trade, token_id)
+            merge_key_to_idx = {}
+            for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
+                key = (spec["token_id"], spec["side"], spec["price"])
+                if key in merge_key_to_idx:
+                    idx = merge_key_to_idx[key]
+                    merged_specs[idx]["size"] += spec["size"]
+                    merged_trade_pairs[idx].append((trade, token_id))
+                    logger.info(
+                        f"[{self.event_name}] Merged order for bin={trade.bin_index}: "
+                        f"+{spec['size']:.0f} -> total {merged_specs[idx]['size']:.0f} shares"
+                    )
+                else:
+                    merge_key_to_idx[key] = len(merged_specs)
+                    merged_specs.append(dict(spec))
+                    merged_trade_pairs.append([(trade, token_id)])
+
+            order_specs = merged_specs
+            # Flatten trade_token_pairs for response tracking (one entry per merged order)
+            # We'll use the first trade from each group as representative
+            trade_token_pairs = [pairs[0] for pairs in merged_trade_pairs]
+
             # Batch submit
             batch_response = self.order_executor.place_batch_orders(order_specs)
 
@@ -1083,6 +1107,8 @@ class KellyExecutor:
             return is_buy  # Buys: overshot; Sells: fully exited, fine
 
         if is_buy:
+            # Overshoot = this bin is no longer the best buy after the fill.
+            # The simulation loop handles alternating between bins.
             buy_candidates = [
                 c for c in new_candidates
                 if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
@@ -1156,24 +1182,15 @@ class KellyExecutor:
 
         # Minimum tradeable size
         if is_buy:
-            # FAK orders require maker_amount (size * price) >= $1.00 AND <= 2dp
             if price > 0:
-                raw_min = math.ceil(MIN_ORDER_VALUE_USD / price)
-                # Round up to valid FAK step so maker_amount has <= 2dp
-                min_size = float(_round_to_fak_size(raw_min, price, round_up=True))
+                min_size = max(1.0, math.ceil(MIN_ORDER_VALUE_USD / price))
             else:
                 return 0.0
         else:
             min_size = 1.0
 
         if full_size <= min_size:
-            return full_size if full_size >= min_size else 0.0
-
-        # Round full_size down to valid FAK step
-        if is_buy:
-            full_size = float(_round_to_fak_size(int(full_size), price, round_up=False))
-            if full_size < min_size:
-                return 0.0
+            return full_size if full_size >= 1.0 else 0.0
 
         # Quick check: does full chunk overshoot?
         if not self._check_overshoots_on(portfolio, candidate, full_size, orderbooks, hours_to_settlement):
@@ -1202,12 +1219,6 @@ class KellyExecutor:
                 lo = mid
 
         optimal = max(1.0, math.floor(best_valid))
-
-        # Round down to valid FAK step for buys
-        if is_buy:
-            optimal = float(_round_to_fak_size(int(optimal), price, round_up=False))
-            if optimal < min_size:
-                optimal = 0.0
 
         logger.info(
             f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
