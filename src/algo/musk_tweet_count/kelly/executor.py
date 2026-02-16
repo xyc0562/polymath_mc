@@ -282,8 +282,12 @@ class OrderExecutor:
             return results
 
         # Validate and sign each order
+        # Returns one result per input order (aligned 1:1 with input list)
+        SKIP_RESULT = {"orderID": None, "errorMsg": "", "_skipped": True}
+        results = [dict(SKIP_RESULT) for _ in orders]  # Default: all skipped
         signed_args = []
-        order_map = []  # Track which original orders mapped to signed orders
+        signed_indices = []  # Which input indices have signed orders
+
         for i, order in enumerate(orders):
             rounded_size = math.floor(order["size"])
             price = order["price"]
@@ -337,14 +341,14 @@ class OrderExecutor:
                 )
                 signed = self.client.create_order(order_args)
                 signed_args.append(PostOrdersArgs(order=signed, orderType=OrderType.FAK))
-                order_map.append(i)
+                signed_indices.append(i)
             except Exception as e:
                 logger.error(f"[BATCH] Failed to sign order {i}: {e}")
                 continue
 
         if not signed_args:
             logger.warning(f"[{self.event_name}][BATCH] No valid orders to submit")
-            return []
+            return results
 
         try:
             logger.info(
@@ -352,11 +356,20 @@ class OrderExecutor:
             )
             response = self.client.post_orders(signed_args)
             logger.info(f"[{self.event_name}][BATCH] Response: {response}")
-            return response if isinstance(response, list) else [response]
+
+            # Map API responses back to original order indices
+            api_results = response if isinstance(response, list) else [response]
+            for j, idx in enumerate(signed_indices):
+                if j < len(api_results):
+                    results[idx] = api_results[j] if isinstance(api_results[j], dict) else {}
+                else:
+                    results[idx] = {"orderID": None, "errorMsg": "No response from API"}
+
+            return results
         except Exception as e:
             logger.error(f"[{self.event_name}][BATCH] Batch order submission failed: {e}")
             self._last_error = str(e)
-            return []
+            return results
 
     def execute_candidate(
         self,
@@ -753,41 +766,32 @@ class KellyExecutor:
 
             order_specs = merged_specs
             # Flatten trade_token_pairs for response tracking (one entry per merged order)
-            # We'll use the first trade from each group as representative
-            trade_token_pairs = [pairs[0] for pairs in merged_trade_pairs]
+            # Use the first trade from each group as representative, with merged size
+            trade_token_pairs = []
+            for spec, pairs in zip(merged_specs, merged_trade_pairs):
+                trade, token_id = pairs[0]
+                trade.size = spec["size"]  # Update to merged total
+                trade_token_pairs.append((trade, token_id))
 
             # Batch submit
             batch_response = self.order_executor.place_batch_orders(order_specs)
 
-            # Process batch response — extract order IDs and track pending orders
-            # Batch API returns list of dicts with orderID, errorMsg, success fields
-            order_results = []  # List of (order_id_or_None, error_msg_or_None)
-            if isinstance(batch_response, dict):
-                # Single response object with orderIDs list
-                oids = batch_response.get("orderIDs", [])
-                error = batch_response.get("errorMsg", "")
-                order_results = [(oid if oid else None, error) for oid in oids]
-            elif isinstance(batch_response, list):
-                for resp in batch_response:
-                    if isinstance(resp, dict):
-                        oid = resp.get("orderID")
-                        if not oid:
-                            oids = resp.get("orderIDs", [])
-                            oid = oids[0] if oids else None
-                        error = resp.get("errorMsg", "")
-                        # Empty string orderID means failure despite success=True
-                        if oid == "":
-                            oid = None
-                        order_results.append((oid, error))
-                    else:
-                        order_results.append((None, ""))
-
-            # Track each order
+            # Process batch response — 1:1 aligned with order_specs/trade_token_pairs
+            # Each entry is a dict with orderID, errorMsg, _skipped fields
             for i, (trade, token_id) in enumerate(trade_token_pairs):
-                order_id = order_results[i][0] if i < len(order_results) else None
-                error_msg = order_results[i][1] if i < len(order_results) else ""
+                resp = batch_response[i] if i < len(batch_response) else {}
+                if resp.get("_skipped"):
+                    # Skipped during validation (FAK size too small, etc.) — not a failure
+                    order_id = None
+                    error_msg = ""
+                else:
+                    oid = resp.get("orderID")
+                    if oid == "":
+                        oid = None
+                    order_id = oid
+                    error_msg = resp.get("errorMsg", "")
 
-                # If there's an error, record FAK failure to prevent infinite retry
+                # API rejection (not validation skip) — record FAK failure
                 if not order_id and error_msg:
                     logger.warning(
                         f"[{self.event_name}] Batch order for bin={trade.bin_index} "
@@ -860,23 +864,23 @@ class KellyExecutor:
             # Log batch resolution
             confirmed = total_submitted - len(self._confirmation_events)
             timed_out = len(self._confirmation_events)
-            failed = len(order_specs) - total_submitted  # orders that got no order_id
+            # Count skipped (validation) vs rejected (API error) separately
+            skipped = sum(
+                1 for r in batch_response
+                if isinstance(r, dict) and r.get("_skipped")
+            )
+            api_rejected = len(order_specs) - total_submitted - skipped
             self._confirmation_events.clear()
 
             logger.info(
                 f"[{self.event_name}] BATCH COMPLETE: "
-                f"{len(order_specs)} sent, {confirmed} confirmed, "
-                f"{timed_out} timed out, {failed} rejected | "
+                f"{len(order_specs)} planned, {total_submitted} submitted, "
+                f"{confirmed} confirmed, {timed_out} timed out, "
+                f"{skipped} skipped, {api_rejected} rejected | "
                 f"elapsed={time.time() - start_time:.1f}s"
             )
 
-        # Log tick summary
-        logger.info(
-            f"Tick result: candidates={tick_result.num_candidates}, "
-            f"executed={tick_result.num_executed}, "
-            f"utility_gain={tick_result.total_utility_gain:.6f}, "
-            f"elapsed={time.time() - start_time:.2f}s"
-        )
+        # Tick summary logged by caller (_log_tick_result in trading_bot.py)
 
         tick_result.elapsed_seconds = time.time() - start_time
         self._last_tick_time = time.time()
