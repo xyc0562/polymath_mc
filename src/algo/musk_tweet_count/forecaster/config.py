@@ -143,7 +143,7 @@ class MonteCarloConfig:
     """Configuration for Monte Carlo simulation."""
 
     # Number of simulations
-    n_simulations: int = 10000
+    n_simulations: int = 25000
 
     # Random seed (None for random)
     random_seed: int = None
