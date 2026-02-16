@@ -153,7 +153,7 @@ class UnifiedOrderbook:
 def compute_vwap(
     levels: List[OrderbookLevel],
     target_size: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Compute volume-weighted average price for a target size.
 
@@ -164,14 +164,16 @@ def compute_vwap(
         target_size: Target number of shares to fill
 
     Returns:
-        Tuple of (vwap_price, filled_size)
-        If not enough liquidity, filled_size < target_size
+        Tuple of (vwap_price, filled_size, worst_price)
+        worst_price is the price of the last level consumed (deepest fill).
+        If not enough liquidity, filled_size < target_size.
     """
     if not levels or target_size <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     total_cost = 0.0
     filled = 0.0
+    worst_price = 0.0
 
     for level in levels:
         remaining = target_size - filled
@@ -181,24 +183,25 @@ def compute_vwap(
         fill_at_level = min(level.size, remaining)
         total_cost += fill_at_level * level.price
         filled += fill_at_level
+        worst_price = level.price
 
     if filled <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
-    return total_cost / filled, filled
+    return total_cost / filled, filled, worst_price
 
 
 def compute_vwap_buy_yes(
     orderbook: UnifiedOrderbook,
     target_size: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Compute VWAP for buying YES tokens.
 
     Walks through ask side (we lift asks to buy).
 
     Returns:
-        Tuple of (vwap_price, filled_size)
+        Tuple of (vwap_price, filled_size, worst_price)
     """
     return compute_vwap(orderbook.yes_asks, target_size)
 
@@ -206,14 +209,14 @@ def compute_vwap_buy_yes(
 def compute_vwap_sell_yes(
     orderbook: UnifiedOrderbook,
     target_size: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Compute VWAP for selling YES tokens.
 
     Walks through bid side (we hit bids to sell).
 
     Returns:
-        Tuple of (vwap_price, filled_size)
+        Tuple of (vwap_price, filled_size, worst_price)
     """
     return compute_vwap(orderbook.yes_bids, target_size)
 
@@ -221,7 +224,7 @@ def compute_vwap_sell_yes(
 def compute_vwap_buy_no(
     orderbook: UnifiedOrderbook,
     target_size: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Compute VWAP for buying NO tokens.
 
@@ -229,14 +232,15 @@ def compute_vwap_buy_no(
     So we hit YES bids and invert prices.
 
     Returns:
-        Tuple of (vwap_price, filled_size) in NO terms
+        Tuple of (vwap_price, filled_size, worst_price) in NO terms
     """
     # Walk YES bids, but invert prices for NO
     if not orderbook.yes_bids or target_size <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     total_cost = 0.0
     filled = 0.0
+    worst_no_price = 0.0
 
     for level in orderbook.yes_bids:
         remaining = target_size - filled
@@ -248,17 +252,18 @@ def compute_vwap_buy_no(
         no_price = 1.0 - level.price
         total_cost += fill_at_level * no_price
         filled += fill_at_level
+        worst_no_price = no_price
 
     if filled <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
-    return total_cost / filled, filled
+    return total_cost / filled, filled, worst_no_price
 
 
 def compute_vwap_sell_no(
     orderbook: UnifiedOrderbook,
     target_size: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Compute VWAP for selling NO tokens.
 
@@ -266,14 +271,15 @@ def compute_vwap_sell_no(
     So we lift YES asks and invert prices.
 
     Returns:
-        Tuple of (vwap_price, filled_size) in NO terms
+        Tuple of (vwap_price, filled_size, worst_price) in NO terms
     """
     # Walk YES asks, but invert prices for NO
     if not orderbook.yes_asks or target_size <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     total_cost = 0.0
     filled = 0.0
+    worst_no_price = 0.0
 
     for level in orderbook.yes_asks:
         remaining = target_size - filled
@@ -285,11 +291,12 @@ def compute_vwap_sell_no(
         no_price = 1.0 - level.price
         total_cost += fill_at_level * no_price
         filled += fill_at_level
+        worst_no_price = no_price
 
     if filled <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
-    return total_cost / filled, filled
+    return total_cost / filled, filled, worst_no_price
 
 
 def estimate_slippage(
@@ -311,22 +318,22 @@ def estimate_slippage(
         Estimated slippage (positive = worse execution)
     """
     if action == "BUY_YES":
-        vwap, _ = compute_vwap_buy_yes(orderbook, size)
+        vwap, _, _ = compute_vwap_buy_yes(orderbook, size)
         best = orderbook.best_yes_ask
         if vwap and best:
             return vwap - best
     elif action == "SELL_YES":
-        vwap, _ = compute_vwap_sell_yes(orderbook, size)
+        vwap, _, _ = compute_vwap_sell_yes(orderbook, size)
         best = orderbook.best_yes_bid
         if vwap and best:
             return best - vwap  # Inverted because selling
     elif action == "BUY_NO":
-        vwap, _ = compute_vwap_buy_no(orderbook, size)
+        vwap, _, _ = compute_vwap_buy_no(orderbook, size)
         best = orderbook.best_no_ask
         if vwap and best:
             return vwap - best
     elif action == "SELL_NO":
-        vwap, _ = compute_vwap_sell_no(orderbook, size)
+        vwap, _, _ = compute_vwap_sell_no(orderbook, size)
         best = orderbook.best_no_bid
         if vwap and best:
             return best - vwap

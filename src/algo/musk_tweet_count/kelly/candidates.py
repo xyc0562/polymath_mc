@@ -94,6 +94,7 @@ class TradeCandidate:
     utility_gain: float  # Expected utility improvement
     reservation_price: float  # Kelly fair price
     edge: float  # Edge = |market - reservation| / reservation
+    limit_price: float = 0.0  # Worst orderbook level consumed (actual tick price for FAK)
 
     @property
     def cost(self) -> float:
@@ -631,7 +632,7 @@ def _generate_buy_yes_candidate(
             return None
 
     # Get VWAP for this chunk
-    vwap, filled = compute_vwap_buy_yes(orderbook, delta)
+    vwap, filled, worst_price = compute_vwap_buy_yes(orderbook, delta)
     if filled <= 0:
         reject(f"no fill at delta={delta:.2f}")
         return None
@@ -685,6 +686,7 @@ def _generate_buy_yes_candidate(
         utility_gain=utility_gain,
         reservation_price=reservation_price,
         edge=actual_edge,
+        limit_price=worst_price,
     )
 
 
@@ -761,7 +763,7 @@ def _generate_sell_yes_candidate(
     if delta < 1:
         return None
 
-    vwap, filled = compute_vwap_sell_yes(orderbook, delta)
+    vwap, filled, worst_price = compute_vwap_sell_yes(orderbook, delta)
     if filled <= 0:
         return None
 
@@ -802,6 +804,7 @@ def _generate_sell_yes_candidate(
         utility_gain=utility_gain,
         reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
+        limit_price=worst_price,
     )
 
 
@@ -880,7 +883,7 @@ def _generate_buy_no_candidate(
             reject(f"event collateral limit (${total_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
             return None
 
-    vwap, filled = compute_vwap_buy_no(orderbook, delta)
+    vwap, filled, worst_price = compute_vwap_buy_no(orderbook, delta)
     if filled <= 0:
         reject(f"no fill at delta={delta:.2f}")
         return None
@@ -933,6 +936,7 @@ def _generate_buy_no_candidate(
         utility_gain=utility_gain,
         reservation_price=reservation_price,
         edge=actual_edge,
+        limit_price=worst_price,
     )
 
 
@@ -1011,7 +1015,7 @@ def _generate_sell_no_candidate(
     if delta < 1:
         return None
 
-    vwap, filled = compute_vwap_sell_no(orderbook, delta)
+    vwap, filled, worst_price = compute_vwap_sell_no(orderbook, delta)
     if filled <= 0:
         return None
 
@@ -1052,6 +1056,7 @@ def _generate_sell_no_candidate(
         utility_gain=utility_gain,
         reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
+        limit_price=worst_price,
     )
 
 

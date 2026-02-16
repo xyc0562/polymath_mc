@@ -52,29 +52,55 @@ def _fak_size_step(price: float) -> int:
     Compute the minimum size step for FAK orders at a given price.
 
     FAK orders require maker_amount (size * price) to have <= 2 decimal places.
-    In USDC microdollars (6 decimals), this means size * price_micros must be
-    divisible by 10000 (since $0.01 = 10000 microdollars).
+    Since Polymarket prices are multiples of 0.0001 (tick size), we work in
+    tick units: price_ticks = price / 0.0001. Then size * price_ticks must be
+    divisible by 100 (since $0.01 = 100 ticks).
 
-    Returns the minimum size increment that satisfies this constraint.
+    Uses tick-based math (price * 10000) instead of microdollar math
+    (price * 1_000_000) to avoid floating point precision issues.
     """
-    price_micros = round(price * 1_000_000)
-    g = math.gcd(price_micros, 10_000)
-    return 10_000 // g
+    price_ticks = round(price * 10_000)
+    g = math.gcd(price_ticks, 100)
+    return 100 // g
 
 
-def _round_to_fak_size(size: int, price: float, round_up: bool = False) -> int:
+def _best_fak_price(price: float, size: int, side: str, max_tick_bump: int = 5) -> tuple[float, int]:
     """
-    Round a size to the nearest valid FAK size (where size * price has <= 2dp).
+    Find the best FAK-compatible (price, adjusted_size) near the target price.
 
-    If round_up=True, rounds up; otherwise rounds down.
+    For BUY: tries bumping price UP by 1-5 ticks to find a step that wastes
+    fewer shares. FAK fills at best available price, so overpaying by a few
+    ticks is negligible.
+
+    For SELL: tries bumping price DOWN by 1-5 ticks.
+
+    Returns (adjusted_price, adjusted_size). If no improvement found, returns
+    the original price with size rounded to the original step.
     """
-    step = _fak_size_step(price)
-    if step <= 1:
-        return size
-    if round_up:
-        return math.ceil(size / step) * step
-    else:
-        return (size // step) * step
+    base_step = _fak_size_step(price)
+    if base_step <= 1:
+        return price, size
+
+    best_size = (size // base_step) * base_step
+    best_price = price
+
+    for bump in range(1, max_tick_bump + 1):
+        tick = 0.0001
+        if side == "BUY":
+            candidate_price = round(price + bump * tick, 4)
+        else:
+            candidate_price = round(price - bump * tick, 4)
+            if candidate_price <= 0:
+                continue
+
+        step = _fak_size_step(candidate_price)
+        adjusted = (size // step) * step if step > 1 else size
+        if adjusted > best_size:
+            best_size = adjusted
+            best_price = candidate_price
+
+    return best_price, best_size
+
 
 
 @dataclass
@@ -315,18 +341,28 @@ class OrderExecutor:
             if order["side"] == "BUY":
                 maker_amount = rounded_size * price
                 if _has_more_than_2dp(maker_amount):
-                    adjusted_size = _round_to_fak_size(rounded_size, price, round_up=False)
-                    if adjusted_size < 1 or adjusted_size * price < MIN_ORDER_VALUE_USD:
+                    # Try nearby prices for a better step (FAK fills at best price anyway)
+                    adj_price, adjusted_size = _best_fak_price(price, rounded_size, "BUY")
+                    if adjusted_size < 1 or adjusted_size * adj_price < MIN_ORDER_VALUE_USD:
                         logger.warning(
                             f"[BATCH] No valid FAK size at or below {rounded_size} "
                             f"(price={price:.4f}, step={_fak_size_step(price)}), skipping order {i}"
                         )
                         continue
-                    logger.info(
-                        f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
-                        f"for 2dp maker_amount (${adjusted_size * price:.4f})"
-                    )
+                    if adj_price != price:
+                        logger.info(
+                            f"[BATCH] Adjusted price {price:.4f} -> {adj_price:.4f} "
+                            f"(+{round((adj_price - price) * 10000):.0f} ticks) "
+                            f"and size {rounded_size} -> {adjusted_size} "
+                            f"for 2dp maker_amount (${adjusted_size * adj_price:.4f})"
+                        )
+                    else:
+                        logger.info(
+                            f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
+                            f"for 2dp maker_amount (${adjusted_size * price:.4f})"
+                        )
                     rounded_size = adjusted_size
+                    price = adj_price
 
             logger.info(
                 f"[{self.event_name}][BATCH ORDER {i}] {order['side']} "
@@ -723,10 +759,16 @@ class KellyExecutor:
                     continue
 
                 side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+                # Use limit_price (worst orderbook level consumed) for FAK order,
+                # not VWAP which isn't an actual price on the orderbook.
+                # For BUY: limit_price is the deepest (highest) ask consumed.
+                # For SELL: limit_price is the deepest (lowest) bid consumed.
+                # Fallback to VWAP if limit_price not set (e.g., from simulation loop).
+                fak_price = trade.limit_price if trade.limit_price > 0 else trade.price
                 order_specs.append({
                     "token_id": token_id,
                     "side": side,
-                    "price": trade.price,
+                    "price": fak_price,
                     "size": trade.size,
                 })
                 trade_token_pairs.append((trade, token_id))
@@ -736,7 +778,7 @@ class KellyExecutor:
                 bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
                 logger.info(
                     f"[{self.event_name}] Placing order: {trade.action.value} {bin_info} | "
-                    f"{side} {trade.size:.2f} @ {trade.price:.4f} | "
+                    f"{side} {trade.size:.2f} @ {fak_price:.4f} (vwap={trade.price:.4f}) | "
                     f"fair={trade.reservation_price:.4f} edge={trade.edge:+.2%} "
                     f"util={trade.utility_gain:.4f} | token={token_id[:16]}..."
                 )
