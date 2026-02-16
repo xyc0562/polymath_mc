@@ -637,26 +637,10 @@ class XTrackerClient:
                 logger.debug(f"Error parsing tracking dates: {e}")
                 continue
 
-        # If exact match not found, try to find a tracking that contains the period
-        for tracking in trackings:
-            try:
-                t_start_str = tracking.get("startDate", "")
-                t_end_str = tracking.get("endDate", "")
-
-                if not t_start_str or not t_end_str:
-                    continue
-
-                t_start = datetime.fromisoformat(t_start_str.replace("Z", "+00:00"))
-                t_end = datetime.fromisoformat(t_end_str.replace("Z", "+00:00"))
-
-                # Check if target period falls within tracking period
-                if t_start.date() <= target_start_date and t_end.date() >= target_end_date:
-                    logger.debug(f"Found containing tracking: {tracking.get('id')}")
-                    return tracking
-
-            except (ValueError, TypeError) as e:
-                continue
-
+        # NOTE: Previously had a fallback that matched "containing" tracking periods
+        # (e.g., Feb 13-20 would match a query for Feb 16-18). This was WRONG because
+        # it returns the count for the full larger period, not the sub-period.
+        # If no exact match, return None and let the system use the computed count.
         logger.warning(f"No tracking found for period {target_start_date} - {target_end_date}")
         return None
 
