@@ -311,21 +311,22 @@ class OrderExecutor:
                     continue
 
             # Ensure maker_amount has <= 2 decimal places (FAK requirement)
-            # Only round DOWN to avoid overshooting utility-optimal size
-            maker_amount = rounded_size * price
-            if _has_more_than_2dp(maker_amount):
-                adjusted_size = _round_to_fak_size(rounded_size, price, round_up=False)
-                if adjusted_size < 1 or (order["side"] == "BUY" and adjusted_size * price < MIN_ORDER_VALUE_USD):
-                    logger.warning(
-                        f"[BATCH] No valid FAK size at or below {rounded_size} "
-                        f"(price={price:.4f}, step={_fak_size_step(price)}), skipping order {i}"
+            # Only applies to BUY orders — SELL maker_amount is the share count (integer)
+            if order["side"] == "BUY":
+                maker_amount = rounded_size * price
+                if _has_more_than_2dp(maker_amount):
+                    adjusted_size = _round_to_fak_size(rounded_size, price, round_up=False)
+                    if adjusted_size < 1 or adjusted_size * price < MIN_ORDER_VALUE_USD:
+                        logger.warning(
+                            f"[BATCH] No valid FAK size at or below {rounded_size} "
+                            f"(price={price:.4f}, step={_fak_size_step(price)}), skipping order {i}"
+                        )
+                        continue
+                    logger.info(
+                        f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
+                        f"for 2dp maker_amount (${adjusted_size * price:.4f})"
                     )
-                    continue
-                logger.info(
-                    f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
-                    f"for 2dp maker_amount (${adjusted_size * price:.4f})"
-                )
-                rounded_size = adjusted_size
+                    rounded_size = adjusted_size
 
             logger.info(
                 f"[{self.event_name}][BATCH ORDER {i}] {order['side']} "
@@ -781,17 +782,17 @@ class KellyExecutor:
             for i, (trade, token_id) in enumerate(trade_token_pairs):
                 resp = batch_response[i] if i < len(batch_response) else {}
                 if resp.get("_skipped"):
-                    # Skipped during validation (FAK size too small, etc.) — not a failure
-                    order_id = None
-                    error_msg = ""
-                else:
-                    oid = resp.get("orderID")
-                    if oid == "":
-                        oid = None
-                    order_id = oid
-                    error_msg = resp.get("errorMsg", "")
+                    # Skipped during validation (FAK size constraint, etc.)
+                    # Don't add to executions or trigger on_trade — not a real failure
+                    continue
 
-                # API rejection (not validation skip) — record FAK failure
+                oid = resp.get("orderID")
+                if oid == "":
+                    oid = None
+                order_id = oid
+                error_msg = resp.get("errorMsg", "")
+
+                # API rejection — record FAK failure
                 if not order_id and error_msg:
                     logger.warning(
                         f"[{self.event_name}] Batch order for bin={trade.bin_index} "
@@ -833,7 +834,7 @@ class KellyExecutor:
                     result = ExecutionResult(
                         success=False,
                         candidate=trade,
-                        error="No order_id in batch response",
+                        error=error_msg or "No order_id in batch response",
                         is_pending=False,
                     )
 

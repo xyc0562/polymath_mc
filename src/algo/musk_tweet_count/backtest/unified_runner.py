@@ -755,7 +755,7 @@ class UnifiedBacktestRunner:
         from zoneinfo import ZoneInfo
 
         # Use fixed seed for reproducible backtests
-        mc_config = MonteCarloConfig(random_seed=42)
+        mc_config = MonteCarloConfig(n_simulations=10000, random_seed=42)
         config = ForecasterConfig(
             monte_carlo=mc_config,
             intraday_mode=self.config.intraday_mode,
