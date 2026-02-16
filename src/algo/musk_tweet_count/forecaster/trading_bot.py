@@ -392,6 +392,11 @@ class GASKellyTradingBot:
         if self._tick_in_progress:
             return
 
+        # In sync-driven mode, trading is triggered by the manager (run_sync_driven_tick),
+        # not by orderbook updates. Skip WS-triggered ticks entirely.
+        if self.bot_config.sync_driven:
+            return
+
         # Flag that we should run a tick
         self._pending_ws_tick = True
 
