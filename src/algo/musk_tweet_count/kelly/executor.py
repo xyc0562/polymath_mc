@@ -724,6 +724,10 @@ class KellyExecutor:
 
             tick_result.num_candidates += len(planned_trades)
 
+            # Collect results for this iteration's summary
+            iter_results: list[tuple[TradeCandidate, str]] = []  # (trade, status)
+            num_submitted_this_iter = 0
+
             if self.order_executor.dry_run:
                 # Dry run: simulate all fills optimistically on LIVE portfolio
                 for trade in planned_trades:
@@ -736,14 +740,6 @@ class KellyExecutor:
                         token_id=token_id,
                         filled_size=trade.size,
                         filled_price=trade.price,
-                    )
-
-                    br = self._bin_range(trade.bin_index)
-                    bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
-                    logger.info(
-                        f"[{self.event_name}][ORDER PLACED - DRY RUN] iter={iteration} "
-                        f"{trade.action.value} {bin_info} | "
-                        f"size={trade.size:.1f} @ {trade.price:.3f}"
                     )
 
                     self._log_trade_placed(trade, token_id, f"dry_run_{self._trade_count}")
@@ -760,10 +756,10 @@ class KellyExecutor:
                     tick_result.executions.append(result)
                     tick_result.num_executed += 1
                     tick_result.total_utility_gain += trade.utility_gain
+                    iter_results.append((trade, "OK (dry)"))
 
                     if self.on_trade:
                         self.on_trade(result)
-                # Dry run doesn't need to wait for confirmations
             else:
                 # Live mode: build and submit batch
                 order_specs = []
@@ -783,15 +779,6 @@ class KellyExecutor:
                     })
                     trade_token_pairs.append((trade, token_id))
 
-                    br = self._bin_range(trade.bin_index)
-                    bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
-                    logger.info(
-                        f"[{self.event_name}] iter={iteration} Placing: {trade.action.value} {bin_info} | "
-                        f"{side} {trade.size:.2f} @ {fak_price:.4f} (vwap={trade.price:.4f}) | "
-                        f"fair={trade.reservation_price:.4f} edge={trade.edge:+.2%} "
-                        f"util={trade.utility_gain:.4f} | token={token_id[:16]}..."
-                    )
-
                 if not order_specs:
                     break
 
@@ -805,10 +792,6 @@ class KellyExecutor:
                         idx = merge_key_to_idx[key]
                         merged_specs[idx]["size"] += spec["size"]
                         merged_trade_pairs[idx].append((trade, token_id))
-                        logger.info(
-                            f"[{self.event_name}] Merged order for bin={trade.bin_index}: "
-                            f"+{spec['size']:.0f} -> total {merged_specs[idx]['size']:.0f} shares"
-                        )
                     else:
                         merge_key_to_idx[key] = len(merged_specs)
                         merged_specs.append(dict(spec))
@@ -825,10 +808,10 @@ class KellyExecutor:
                 batch_response = self.order_executor.place_batch_orders(order_specs)
 
                 # Process batch response
-                num_submitted_this_iter = 0
                 for i, (trade, token_id) in enumerate(trade_token_pairs):
                     resp = batch_response[i] if i < len(batch_response) else {}
                     if resp.get("_skipped"):
+                        iter_results.append((trade, "SKIPPED"))
                         continue
 
                     oid = resp.get("orderID")
@@ -838,10 +821,6 @@ class KellyExecutor:
                     error_msg = resp.get("errorMsg", "")
 
                     if not order_id and error_msg:
-                        logger.warning(
-                            f"[{self.event_name}] Batch order for bin={trade.bin_index} "
-                            f"failed: {error_msg}"
-                        )
                         self._record_fak_failure(trade.bin_index)
 
                     if order_id:
@@ -864,6 +843,7 @@ class KellyExecutor:
                         self._log_trade_placed(trade, token_id, order_id)
                         self._record_order()
                         num_submitted_this_iter += 1
+                        iter_results.append((trade, "SUBMITTED"))
 
                         result = ExecutionResult(
                             success=True,
@@ -872,6 +852,7 @@ class KellyExecutor:
                             is_pending=True,
                         )
                     else:
+                        iter_results.append((trade, f"FAILED: {error_msg}"))
                         result = ExecutionResult(
                             success=False,
                             candidate=trade,
@@ -891,41 +872,36 @@ class KellyExecutor:
                 if self._confirmation_events:
                     remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
                     if remaining_timeout > 0:
-                        logger.info(
-                            f"[{self.event_name}] iter={iteration}: waiting for "
-                            f"{num_submitted_this_iter} confirmations (timeout: {remaining_timeout:.0f}s)..."
-                        )
                         try:
                             await asyncio.wait_for(
                                 self._wait_all_confirmations(),
                                 timeout=remaining_timeout,
                             )
-                            confirmed = num_submitted_this_iter - len(self._confirmation_events)
-                            timed_out = len(self._confirmation_events)
-                            logger.info(
-                                f"[{self.event_name}] iter={iteration}: "
-                                f"{confirmed} confirmed, {timed_out} timed out"
-                            )
+                            # Update statuses for confirmed orders
+                            for j, (t, s) in enumerate(iter_results):
+                                if s == "SUBMITTED":
+                                    iter_results[j] = (t, "CONFIRMED")
                         except asyncio.TimeoutError:
-                            timed_out = len(self._confirmation_events)
-                            logger.warning(
-                                f"[{self.event_name}] iter={iteration}: tick timeout, "
-                                f"{timed_out} orders still unconfirmed"
-                            )
+                            for j, (t, s) in enumerate(iter_results):
+                                if s == "SUBMITTED":
+                                    iter_results[j] = (t, "TIMEOUT")
                             self._confirmation_events.clear()
-                            break  # Tick timeout — stop iterating
+                            # Log summary then stop — tick timeout
+                            iter_elapsed = time.time() - start_time
+                            self._log_iter_summary(iteration, iter_elapsed, iter_results)
+                            break
 
-                    # Post-confirmation delay for API propagation
-                    remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
-                    if remaining_timeout > self._post_confirm_delay:
-                        logger.info(
-                            f"[{self.event_name}] iter={iteration}: waiting "
-                            f"{self._post_confirm_delay:.0f}s for API propagation..."
-                        )
-                        await asyncio.sleep(self._post_confirm_delay)
-                    else:
-                        # Not enough time left for delay + next iteration
-                        break
+
+            # Log iteration summary
+            self._log_iter_summary(iteration, time.time() - start_time, iter_results)
+
+            # Post-confirmation delay for API propagation before next iteration
+            if not self.order_executor.dry_run and num_submitted_this_iter > 0:
+                remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+                if remaining_timeout > self._post_confirm_delay:
+                    await asyncio.sleep(self._post_confirm_delay)
+                else:
+                    break
 
         # Tick summary
         logger.info(
@@ -1596,6 +1572,27 @@ class KellyExecutor:
     def _bin_range(self, bin_index: int) -> str:
         """Get bin range string for logging (e.g., '340-359')."""
         return self._log_context.get("bin_ranges", {}).get(bin_index, "")
+
+    def _log_iter_summary(
+        self,
+        iteration: int,
+        elapsed: float,
+        results: list,  # list of (TradeCandidate, status_str)
+    ) -> None:
+        """Log a clear summary at the end of each iteration."""
+        logger.info(
+            f"[{self.event_name}] --- Iteration {iteration} ({elapsed:.1f}s) ---"
+        )
+        for trade, status in results:
+            br = self._bin_range(trade.bin_index)
+            bin_label = f"bin {trade.bin_index} ({br})" if br else f"bin {trade.bin_index}"
+            side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+            token_type = "YES" if trade.action in (TradeAction.BUY_YES, TradeAction.SELL_YES) else "NO"
+            logger.info(
+                f"  {side} {token_type} {bin_label} | "
+                f"{trade.size:.0f} @ {trade.price:.4f} = ${trade.size * trade.price:.2f} | "
+                f"edge={trade.edge:+.1%} | {status}"
+            )
 
     def _log_trade_placed(self, candidate: TradeCandidate, token_id: str, order_id: str) -> None:
         """
