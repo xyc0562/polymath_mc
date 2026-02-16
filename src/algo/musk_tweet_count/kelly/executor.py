@@ -595,6 +595,17 @@ class KellyExecutor:
                     logger.debug(f"Next best (bin {best.bin_index}) also in cooldown, stopping iteration")
                     break
 
+            # Binary search for optimal chunk size
+            # Prevents overshooting Kelly-optimal position by checking if
+            # the same trade would still be best after a simulated fill
+            # For buys: checks if same buy is still best buy
+            # For sells: checks if opposing buy appears (would cause cycling)
+            optimal_size = self._find_optimal_size(
+                best, orderbooks, hours_to_settlement
+            )
+            if optimal_size != best.size:
+                best.size = optimal_size
+
             # Execute trade - use YES token for YES actions, NO token for NO actions
             if best.action in (TradeAction.BUY_NO, TradeAction.SELL_NO):
                 token_id = self.no_token_ids.get(best.bin_index)
@@ -742,6 +753,179 @@ class KellyExecutor:
         self._last_tick_time = time.time()
 
         return tick_result
+
+    def _find_optimal_size(
+        self,
+        candidate: TradeCandidate,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        hours_to_settlement: float,
+        max_iterations: int = 10,
+    ) -> float:
+        """
+        Binary search for optimal chunk size to avoid overshooting Kelly-optimal.
+
+        Tests whether the full chunk overshoots by simulating the fill and checking
+        if the trade is still optimal. If it overshoots, binary searches for the
+        largest size that doesn't.
+
+        For BUY: overshoots if the same (bin, action) is no longer the best buy.
+        For SELL: overshoots if an opposing BUY for the same bin appears (cycling).
+
+        Args:
+            candidate: Best candidate with full chunk size
+            orderbooks: Current orderbooks
+            hours_to_settlement: Hours until settlement
+            max_iterations: Number of binary search iterations
+
+        Returns:
+            Optimal chunk size in shares
+        """
+        full_size = candidate.size
+        price = candidate.price
+        is_buy = candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+
+        # Clamp full_size to what's actually available
+        if is_buy:
+            if price > 0:
+                max_buy_shares = self.portfolio.available_capital / price
+                full_size = min(full_size, max_buy_shares)
+        else:
+            position = self.portfolio.get_position(candidate.bin_index)
+            if position:
+                if candidate.action == TradeAction.SELL_YES:
+                    full_size = min(full_size, position.yes_shares)
+                elif candidate.action == TradeAction.SELL_NO:
+                    full_size = min(full_size, position.no_shares)
+
+        # Compute minimum tradeable size
+        if is_buy:
+            # Need EITHER >= MIN_ORDER_SIZE shares OR >= MIN_ORDER_VALUE_USD worth
+            min_size = MIN_ORDER_SIZE
+            if price > 0:
+                min_value_size = math.ceil(MIN_ORDER_VALUE_USD / price)
+                min_size = min(MIN_ORDER_SIZE, min_value_size)
+            min_size = max(1.0, min_size)
+        else:
+            # For sells/exits, minimum is 1 share
+            min_size = 1.0
+
+        # If full_size is at or below minimum, just use it
+        if full_size <= min_size:
+            return full_size
+
+        # Quick check: does full chunk overshoot?
+        if not self._check_overshoots(candidate, full_size, orderbooks, hours_to_settlement):
+            return full_size
+
+        br = self._bin_range(candidate.bin_index)
+        bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
+        logger.info(
+            f"[{self.event_name}] Full chunk ({full_size:.0f} shares) overshoots for "
+            f"{candidate.action.value} {bin_info}, binary searching..."
+        )
+
+        # Binary search: find largest size that doesn't overshoot
+        lo = min_size
+        hi = full_size
+        best_valid = min_size  # Fallback: use minimum even if it overshoots
+
+        for i in range(max_iterations):
+            mid = (lo + hi) / 2.0
+
+            # Converged (less than 1 share difference)
+            if hi - lo < 1.0:
+                break
+
+            if self._check_overshoots(candidate, mid, orderbooks, hours_to_settlement):
+                hi = mid
+            else:
+                best_valid = mid
+                lo = mid
+
+        # Floor to integer shares
+        optimal = max(1.0, math.floor(best_valid))
+
+        logger.info(
+            f"[{self.event_name}] Optimal size: {optimal:.0f} shares "
+            f"(full was {full_size:.0f}, {optimal / full_size:.0%} of chunk)"
+        )
+
+        return optimal
+
+    def _check_overshoots(
+        self,
+        candidate: TradeCandidate,
+        test_size: float,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        hours_to_settlement: float,
+    ) -> bool:
+        """
+        Check if filling test_size shares would overshoot Kelly-optimal.
+
+        For BUY: Returns True if the same (bin, action) is no longer the best
+        buy candidate after the simulated fill.
+
+        For SELL: Returns True if an opposing BUY for the same bin appears
+        after the simulated fill (would cause immediate re-entry cycling).
+        """
+        action = candidate.action
+        bin_index = candidate.bin_index
+        price = candidate.price
+
+        # Simulate the fill
+        if action == TradeAction.BUY_YES:
+            hyp = self.portfolio.simulate_buy_yes(bin_index, test_size, price)
+        elif action == TradeAction.BUY_NO:
+            hyp = self.portfolio.simulate_buy_no(bin_index, test_size, price)
+        elif action == TradeAction.SELL_YES:
+            hyp = self.portfolio.simulate_sell_yes(bin_index, test_size, price)
+        elif action == TradeAction.SELL_NO:
+            hyp = self.portfolio.simulate_sell_no(bin_index, test_size, price)
+        else:
+            return False
+
+        # Preserve external capital limit
+        hyp.external_capital_limit = self.portfolio.external_capital_limit
+
+        # Regenerate candidates on hypothetical portfolio
+        new_candidates = generate_candidates(
+            portfolio=hyp,
+            orderbooks=orderbooks,
+            config=self.config,
+            hours_to_settlement=hours_to_settlement,
+            verbose=False,
+        )
+
+        is_buy = action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+
+        if not new_candidates:
+            # For buys: no candidates = used up all utility, overshot
+            # For sells: no candidates = fully exited, fine
+            return is_buy
+
+        if is_buy:
+            # Check if same (bin, action) is still the best BUY candidate
+            buy_candidates = [
+                c for c in new_candidates
+                if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+            ]
+
+            if not buy_candidates:
+                return True  # No buy candidates left = overshot
+
+            best_buy = buy_candidates[0]  # Already sorted by utility descending
+            return not (best_buy.bin_index == bin_index and best_buy.action == action)
+        else:
+            # For sells: check if opposing BUY for the same bin appeared
+            # This means we over-exited and would immediately re-enter (cycling)
+            opposing = (
+                TradeAction.BUY_YES if action == TradeAction.SELL_YES
+                else TradeAction.BUY_NO
+            )
+            for c in new_candidates:
+                if c.bin_index == bin_index and c.action == opposing:
+                    return True  # Opposing buy appeared = over-exited
+            return False
 
     def _get_orderbooks(self) -> Dict[int, UnifiedOrderbook]:
         """Get current orderbooks for all bins."""
