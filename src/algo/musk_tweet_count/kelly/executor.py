@@ -42,6 +42,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _has_more_than_2dp(value: float) -> bool:
+    """Check if a float has more than 2 decimal places."""
+    return abs(value - round(value, 2)) > 1e-9
+
+
+def _fak_size_step(price: float) -> int:
+    """
+    Compute the minimum size step for FAK orders at a given price.
+
+    FAK orders require maker_amount (size * price) to have <= 2 decimal places.
+    In USDC microdollars (6 decimals), this means size * price_micros must be
+    divisible by 10000 (since $0.01 = 10000 microdollars).
+
+    Returns the minimum size increment that satisfies this constraint.
+    """
+    price_micros = round(price * 1_000_000)
+    g = math.gcd(price_micros, 10_000)
+    return 10_000 // g
+
+
+def _round_to_fak_size(size: int, price: float, round_up: bool = False) -> int:
+    """
+    Round a size to the nearest valid FAK size (where size * price has <= 2dp).
+
+    If round_up=True, rounds up; otherwise rounds down.
+    """
+    step = _fak_size_step(price)
+    if step <= 1:
+        return size
+    if round_up:
+        return math.ceil(size / step) * step
+    else:
+        return (size // step) * step
+
+
 @dataclass
 class ExecutionResult:
     """Result of a single trade execution (order placement, not fill)."""
@@ -253,7 +288,7 @@ class OrderExecutor:
             rounded_size = math.floor(order["size"])
             price = order["price"]
 
-            # Validation (same checks as place_limit_order)
+            # Validation
             if price <= 0 or price >= 1:
                 logger.warning(f"[BATCH] Invalid price: {price:.4f}, skipping order {i}")
                 continue
@@ -262,11 +297,31 @@ class OrderExecutor:
                     logger.warning(f"[BATCH] Sell size {rounded_size} below 1 share, skipping order {i}")
                     continue
             else:
-                if rounded_size < MIN_ORDER_SIZE and rounded_size * price < MIN_ORDER_VALUE_USD:
+                # FAK orders require maker_amount >= $1.00
+                maker_amount = rounded_size * price
+                if maker_amount < MIN_ORDER_VALUE_USD:
                     logger.warning(
-                        f"[BATCH] Buy size {rounded_size} below minimum, skipping order {i}"
+                        f"[BATCH] Buy maker_amount ${maker_amount:.4f} below "
+                        f"${MIN_ORDER_VALUE_USD}, skipping order {i}"
                     )
                     continue
+
+            # Ensure maker_amount has <= 2 decimal places (FAK requirement)
+            # Only round DOWN to avoid overshooting utility-optimal size
+            maker_amount = rounded_size * price
+            if _has_more_than_2dp(maker_amount):
+                adjusted_size = _round_to_fak_size(rounded_size, price, round_up=False)
+                if adjusted_size < 1 or (order["side"] == "BUY" and adjusted_size * price < MIN_ORDER_VALUE_USD):
+                    logger.warning(
+                        f"[BATCH] No valid FAK size at or below {rounded_size} "
+                        f"(price={price:.4f}, step={_fak_size_step(price)}), skipping order {i}"
+                    )
+                    continue
+                logger.info(
+                    f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
+                    f"for 2dp maker_amount (${adjusted_size * price:.4f})"
+                )
+                rounded_size = adjusted_size
 
             logger.info(
                 f"[{self.event_name}][BATCH ORDER {i}] {order['side']} "
@@ -681,27 +736,40 @@ class KellyExecutor:
             batch_response = self.order_executor.place_batch_orders(order_specs)
 
             # Process batch response — extract order IDs and track pending orders
-            # The batch API returns a response that may contain orderIDs
-            order_ids = []
+            # Batch API returns list of dicts with orderID, errorMsg, success fields
+            order_results = []  # List of (order_id_or_None, error_msg_or_None)
             if isinstance(batch_response, dict):
                 # Single response object with orderIDs list
-                order_ids = batch_response.get("orderIDs", [])
+                oids = batch_response.get("orderIDs", [])
+                error = batch_response.get("errorMsg", "")
+                order_results = [(oid if oid else None, error) for oid in oids]
             elif isinstance(batch_response, list):
-                # List of response objects
                 for resp in batch_response:
                     if isinstance(resp, dict):
                         oid = resp.get("orderID")
                         if not oid:
-                            # Try orderIDs list format
                             oids = resp.get("orderIDs", [])
                             oid = oids[0] if oids else None
-                        order_ids.append(oid)
+                        error = resp.get("errorMsg", "")
+                        # Empty string orderID means failure despite success=True
+                        if oid == "":
+                            oid = None
+                        order_results.append((oid, error))
                     else:
-                        order_ids.append(None)
+                        order_results.append((None, ""))
 
             # Track each order
             for i, (trade, token_id) in enumerate(trade_token_pairs):
-                order_id = order_ids[i] if i < len(order_ids) else None
+                order_id = order_results[i][0] if i < len(order_results) else None
+                error_msg = order_results[i][1] if i < len(order_results) else ""
+
+                # If there's an error, record FAK failure to prevent infinite retry
+                if not order_id and error_msg:
+                    logger.warning(
+                        f"[{self.event_name}] Batch order for bin={trade.bin_index} "
+                        f"failed: {error_msg}"
+                    )
+                    self._record_fak_failure(trade.bin_index)
 
                 if order_id:
                     # Track as pending
@@ -839,12 +907,11 @@ class KellyExecutor:
 
         # Compute minimum tradeable size
         if is_buy:
-            # Need EITHER >= MIN_ORDER_SIZE shares OR >= MIN_ORDER_VALUE_USD worth
-            min_size = MIN_ORDER_SIZE
+            # FAK orders require maker_amount (size * price) >= $1.00
             if price > 0:
-                min_value_size = math.ceil(MIN_ORDER_VALUE_USD / price)
-                min_size = min(MIN_ORDER_SIZE, min_value_size)
-            min_size = max(1.0, min_size)
+                min_size = max(1.0, math.ceil(MIN_ORDER_VALUE_USD / price))
+            else:
+                return 0.0
         else:
             # For sells/exits, minimum is 1 share
             min_size = 1.0
@@ -1089,16 +1156,24 @@ class KellyExecutor:
 
         # Minimum tradeable size
         if is_buy:
-            min_size = MIN_ORDER_SIZE
+            # FAK orders require maker_amount (size * price) >= $1.00 AND <= 2dp
             if price > 0:
-                min_value_size = math.ceil(MIN_ORDER_VALUE_USD / price)
-                min_size = min(MIN_ORDER_SIZE, min_value_size)
-            min_size = max(1.0, min_size)
+                raw_min = math.ceil(MIN_ORDER_VALUE_USD / price)
+                # Round up to valid FAK step so maker_amount has <= 2dp
+                min_size = float(_round_to_fak_size(raw_min, price, round_up=True))
+            else:
+                return 0.0
         else:
             min_size = 1.0
 
         if full_size <= min_size:
-            return full_size if full_size >= 1.0 else 0.0
+            return full_size if full_size >= min_size else 0.0
+
+        # Round full_size down to valid FAK step
+        if is_buy:
+            full_size = float(_round_to_fak_size(int(full_size), price, round_up=False))
+            if full_size < min_size:
+                return 0.0
 
         # Quick check: does full chunk overshoot?
         if not self._check_overshoots_on(portfolio, candidate, full_size, orderbooks, hours_to_settlement):
@@ -1127,6 +1202,12 @@ class KellyExecutor:
                 lo = mid
 
         optimal = max(1.0, math.floor(best_valid))
+
+        # Round down to valid FAK step for buys
+        if is_buy:
+            optimal = float(_round_to_fak_size(int(optimal), price, round_up=False))
+            if optimal < min_size:
+                optimal = 0.0
 
         logger.info(
             f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
