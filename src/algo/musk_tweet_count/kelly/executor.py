@@ -1327,11 +1327,10 @@ class KellyExecutor:
             # Pick best candidate (sells come first, then buys by utility)
             best = candidates[0]
 
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.min_utility:
+            if best.utility_gain < self.config.min_utility:
                 logger.debug(
-                    f"[{self.event_name}][SIM iter={sim_iter}] Best buy utility "
-                    f"{best.utility_gain:.6f} < tau {self.config.min_utility}, stopping"
+                    f"[{self.event_name}][SIM iter={sim_iter}] Best candidate utility "
+                    f"{best.utility_gain:.6f} < {self.config.min_utility}, stopping"
                 )
                 break
 
@@ -1341,8 +1340,7 @@ class KellyExecutor:
                 if not candidates:
                     break
                 best = candidates[0]
-                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                if not is_sell and best.utility_gain < self.config.min_utility:
+                if best.utility_gain < self.config.min_utility:
                     break
                 if self._is_bin_in_fak_cooldown(best.bin_index):
                     break
@@ -1872,12 +1870,10 @@ class UnifiedKellyExecutor:
             # Candidates are ordered: [sells..., buys sorted by utility]
             best = candidates[0]
 
-            # Sells execute unconditionally, only check utility for buys
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.min_utility:
+            if best.utility_gain < self.config.min_utility:
                 logger.debug(
-                    f"Best buy candidate utility {best.utility_gain:.6f} "
-                    f"< tau {self.config.min_utility}, stopping"
+                    f"Best candidate utility {best.utility_gain:.6f} "
+                    f"< {self.config.min_utility}, stopping"
                 )
                 break
 
@@ -1996,9 +1992,7 @@ class UnifiedKellyExecutor:
             # Candidates are ordered: [sells..., buys sorted by utility]
             best = candidates[0]
 
-            # Sells execute unconditionally, only check utility for buys
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.min_utility:
+            if best.utility_gain < self.config.min_utility:
                 break
 
             token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")

@@ -160,10 +160,9 @@ class KellyConfig:
     # Fractional Kelly multiplier (1.0 = full chunk size)
     kappa: float = 1.0
 
-    # Minimum utility gain threshold to execute a trade
-    # Set to 0 because CRRA power utility with kelly_fraction < 1
-    # produces much smaller ΔU values that a fixed threshold would filter out.
-    min_utility: float = 0.0
+    # Minimum utility gain to execute a trade (buys and sells).
+    # Prevents zero-utility cycling (e.g., BUY then SELL same bin).
+    min_utility: float = 0.001
 
     # Fractional Kelly parameter α ∈ (0, 1].
     # Controls risk aversion via CRRA power utility with γ = 1/α.
