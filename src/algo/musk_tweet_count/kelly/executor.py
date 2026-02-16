@@ -64,7 +64,7 @@ def _fak_size_step(price: float) -> int:
     return 100 // g
 
 
-def _best_fak_price(price: float, size: int, side: str, max_tick_bump: int = 5) -> tuple[float, int]:
+def _best_fak_price(price: float, size: int, side: str, max_tick_bump: int = 15) -> tuple[float, int]:
     """
     Find the best FAK-compatible (price, adjusted_size) near the target price.
 
@@ -571,6 +571,10 @@ class KellyExecutor:
         # Used to avoid spamming failed orders when liquidity dries up
         self._fak_failure_times: Dict[int, float] = {}
 
+        # Delay after CONFIRMED before proceeding to next iteration,
+        # giving the API time to propagate the fill to positions endpoint.
+        self._post_confirm_delay: float = 5.0
+
     def _check_rate_limit(self) -> bool:
         """
         Check if we're within rate limits.
@@ -669,259 +673,267 @@ class KellyExecutor:
             logger.info(f"[{self.event_name}] Rate limit reached, skipping tick")
             return tick_result
 
-        # Get current orderbooks
-        orderbooks = self._get_orderbooks()
-
         rate_config = self.config.rate_limit
 
-        # Step 1: Sync portfolio from API (single sync per tick)
-        if self.sync_portfolio:
-            try:
-                await self.sync_portfolio()
-                logger.info(
-                    f"[{self.event_name}][KELLY] Synced from API: "
-                    f"capital=${self.portfolio.capital:.2f}, "
-                    f"invested=${self.portfolio.total_collateral_used:.2f}"
-                )
-            except Exception as e:
-                logger.warning(f"[{self.event_name}] Failed to sync portfolio: {e}")
-                # Continue with existing state if sync fails
-
-        # Step 2: Compute ALL optimal trades in simulation
-        # This runs entirely on a COPY of self.portfolio — never mutates it.
-        planned_trades = self._compute_optimal_trades(
-            orderbooks, hours_to_settlement, verbose
-        )
-
-        if not planned_trades:
-            tick_result.elapsed_seconds = time.time() - start_time
-            self._last_tick_time = time.time()
-            return tick_result
-
-        # Respect per-tick order limit
+        # Iterative loop: sync → compute → execute → wait CONFIRMED + delay → repeat
+        # Each iteration syncs portfolio from API for authoritative state,
+        # computes optimal trades, executes a batch, waits for CONFIRMED,
+        # then pauses briefly for API propagation before the next iteration.
         max_orders = rate_config.max_orders_per_tick
-        if len(planned_trades) > max_orders:
-            logger.info(
-                f"[{self.event_name}] Capping {len(planned_trades)} planned trades "
-                f"to max_orders_per_tick={max_orders}"
-            )
-            planned_trades = planned_trades[:max_orders]
+        iteration = 0
 
-        tick_result.num_candidates = len(planned_trades)
+        while True:
+            iteration += 1
+            remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+            if remaining_timeout <= 0:
+                logger.info(f"[{self.event_name}] Tick timeout reached after {iteration - 1} iterations")
+                break
 
-        # Step 3: Execute orders
-        if self.order_executor.dry_run:
-            # Dry run: simulate all fills optimistically on LIVE portfolio
-            for trade in planned_trades:
-                token_id = self._get_token_id_for_action(trade)
-                if not token_id:
-                    continue
+            if tick_result.num_executed >= max_orders:
+                logger.info(f"[{self.event_name}] Reached max_orders_per_tick={max_orders}")
+                break
 
-                # Update live portfolio optimistically (OK in dry-run)
-                self._update_portfolio(
-                    candidate=trade,
-                    token_id=token_id,
-                    filled_size=trade.size,
-                    filled_price=trade.price,
-                )
-
-                br = self._bin_range(trade.bin_index)
-                bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
-                logger.info(
-                    f"[{self.event_name}][ORDER PLACED - DRY RUN] {trade.action.value} {bin_info} | "
-                    f"size={trade.size:.1f} @ {trade.price:.3f}"
-                )
-
-                self._log_trade_placed(trade, token_id, f"dry_run_{self._trade_count}")
-                self._record_order()
-
-                result = ExecutionResult(
-                    success=True,
-                    candidate=trade,
-                    order_id=f"dry_run_{self._trade_count}",
-                    filled_size=trade.size,
-                    filled_price=trade.price,
-                    is_pending=False,
-                )
-                tick_result.executions.append(result)
-                tick_result.num_executed += 1
-                tick_result.total_utility_gain += trade.utility_gain
-
-                if self.on_trade:
-                    self.on_trade(result)
-        else:
-            # Live mode: batch submit all orders
-            order_specs = []
-            trade_token_pairs = []  # Parallel list for tracking
-            for trade in planned_trades:
-                token_id = self._get_token_id_for_action(trade)
-                if not token_id:
-                    continue
-
-                side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
-                # Use limit_price (worst orderbook level consumed) for FAK order,
-                # not VWAP which isn't an actual price on the orderbook.
-                # For BUY: limit_price is the deepest (highest) ask consumed.
-                # For SELL: limit_price is the deepest (lowest) bid consumed.
-                # Fallback to VWAP if limit_price not set (e.g., from simulation loop).
-                fak_price = trade.limit_price if trade.limit_price > 0 else trade.price
-                order_specs.append({
-                    "token_id": token_id,
-                    "side": side,
-                    "price": fak_price,
-                    "size": trade.size,
-                })
-                trade_token_pairs.append((trade, token_id))
-
-                # Log each planned trade
-                br = self._bin_range(trade.bin_index)
-                bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
-                logger.info(
-                    f"[{self.event_name}] Placing order: {trade.action.value} {bin_info} | "
-                    f"{side} {trade.size:.2f} @ {fak_price:.4f} (vwap={trade.price:.4f}) | "
-                    f"fair={trade.reservation_price:.4f} edge={trade.edge:+.2%} "
-                    f"util={trade.utility_gain:.4f} | token={token_id[:16]}..."
-                )
-
-            if not order_specs:
-                tick_result.elapsed_seconds = time.time() - start_time
-                self._last_tick_time = time.time()
-                return tick_result
-
-            # Merge orders for same (token_id, side, price)
-            merged_specs = []
-            merged_trade_pairs = []  # Each entry is a list of (trade, token_id)
-            merge_key_to_idx = {}
-            for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
-                key = (spec["token_id"], spec["side"], spec["price"])
-                if key in merge_key_to_idx:
-                    idx = merge_key_to_idx[key]
-                    merged_specs[idx]["size"] += spec["size"]
-                    merged_trade_pairs[idx].append((trade, token_id))
+            # Sync portfolio from API for up-to-date state
+            if self.sync_portfolio:
+                try:
+                    await self.sync_portfolio()
                     logger.info(
-                        f"[{self.event_name}] Merged order for bin={trade.bin_index}: "
-                        f"+{spec['size']:.0f} -> total {merged_specs[idx]['size']:.0f} shares"
+                        f"[{self.event_name}][KELLY] iter={iteration} Synced from API: "
+                        f"capital=${self.portfolio.capital:.2f}, "
+                        f"invested=${self.portfolio.total_collateral_used:.2f}"
                     )
-                else:
-                    merge_key_to_idx[key] = len(merged_specs)
-                    merged_specs.append(dict(spec))
-                    merged_trade_pairs.append([(trade, token_id)])
+                except Exception as e:
+                    logger.warning(f"[{self.event_name}] Failed to sync portfolio: {e}")
 
-            order_specs = merged_specs
-            # Flatten trade_token_pairs for response tracking (one entry per merged order)
-            # Use the first trade from each group as representative, with merged size
-            trade_token_pairs = []
-            for spec, pairs in zip(merged_specs, merged_trade_pairs):
-                trade, token_id = pairs[0]
-                trade.size = spec["size"]  # Update to merged total
-                trade_token_pairs.append((trade, token_id))
+            # Refresh orderbooks
+            orderbooks = self._get_orderbooks()
 
-            # Batch submit
-            batch_response = self.order_executor.place_batch_orders(order_specs)
+            # Compute optimal trades on current (freshly synced) portfolio
+            planned_trades = self._compute_optimal_trades(
+                orderbooks, hours_to_settlement, verbose=(verbose and iteration == 1)
+            )
 
-            # Process batch response — 1:1 aligned with order_specs/trade_token_pairs
-            # Each entry is a dict with orderID, errorMsg, _skipped fields
-            for i, (trade, token_id) in enumerate(trade_token_pairs):
-                resp = batch_response[i] if i < len(batch_response) else {}
-                if resp.get("_skipped"):
-                    # Skipped during validation (FAK size constraint, etc.)
-                    # Don't add to executions or trigger on_trade — not a real failure
-                    continue
+            if not planned_trades:
+                logger.info(f"[{self.event_name}] iter={iteration}: no trades to execute")
+                break
 
-                oid = resp.get("orderID")
-                if oid == "":
-                    oid = None
-                order_id = oid
-                error_msg = resp.get("errorMsg", "")
+            # Cap by remaining order budget for this tick
+            orders_remaining = max_orders - tick_result.num_executed
+            if len(planned_trades) > orders_remaining:
+                planned_trades = planned_trades[:orders_remaining]
 
-                # API rejection — record FAK failure
-                if not order_id and error_msg:
-                    logger.warning(
-                        f"[{self.event_name}] Batch order for bin={trade.bin_index} "
-                        f"failed: {error_msg}"
+            tick_result.num_candidates += len(planned_trades)
+
+            if self.order_executor.dry_run:
+                # Dry run: simulate all fills optimistically on LIVE portfolio
+                for trade in planned_trades:
+                    token_id = self._get_token_id_for_action(trade)
+                    if not token_id:
+                        continue
+
+                    self._update_portfolio(
+                        candidate=trade,
+                        token_id=token_id,
+                        filled_size=trade.size,
+                        filled_price=trade.price,
                     )
-                    self._record_fak_failure(trade.bin_index)
 
-                if order_id:
-                    # Track as pending
-                    self._pending_orders[order_id] = (trade, token_id)
+                    br = self._bin_range(trade.bin_index)
+                    bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
+                    logger.info(
+                        f"[{self.event_name}][ORDER PLACED - DRY RUN] iter={iteration} "
+                        f"{trade.action.value} {bin_info} | "
+                        f"size={trade.size:.1f} @ {trade.price:.3f}"
+                    )
 
-                    # Create confirmation event for fill waiting
-                    confirm_event = asyncio.Event()
-                    self._confirmation_events[order_id] = confirm_event
-
-                    # Register with user_stream
-                    if self.user_stream:
-                        from .user_stream import PendingOrder
-                        pending = PendingOrder(
-                            order_id=order_id,
-                            token_id=token_id,
-                            side="BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
-                            price=trade.price,
-                            size=trade.size,
-                            bin_index=trade.bin_index,
-                        )
-                        asyncio.create_task(self.user_stream.add_pending_order(pending))
-
-                    self._log_trade_placed(trade, token_id, order_id)
+                    self._log_trade_placed(trade, token_id, f"dry_run_{self._trade_count}")
                     self._record_order()
 
                     result = ExecutionResult(
                         success=True,
                         candidate=trade,
-                        order_id=order_id,
-                        is_pending=True,
-                    )
-                else:
-                    result = ExecutionResult(
-                        success=False,
-                        candidate=trade,
-                        error=error_msg or "No order_id in batch response",
+                        order_id=f"dry_run_{self._trade_count}",
+                        filled_size=trade.size,
+                        filled_price=trade.price,
                         is_pending=False,
                     )
-
-                tick_result.executions.append(result)
-                if result.success:
+                    tick_result.executions.append(result)
                     tick_result.num_executed += 1
                     tick_result.total_utility_gain += trade.utility_gain
 
-                if self.on_trade:
-                    self.on_trade(result)
+                    if self.on_trade:
+                        self.on_trade(result)
+                # Dry run doesn't need to wait for confirmations
+            else:
+                # Live mode: build and submit batch
+                order_specs = []
+                trade_token_pairs = []
+                for trade in planned_trades:
+                    token_id = self._get_token_id_for_action(trade)
+                    if not token_id:
+                        continue
 
-            # Step 4: Wait for all fills (or tick timeout)
-            total_submitted = len(self._confirmation_events)
-            remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
-            if remaining_timeout > 0 and self._confirmation_events:
-                logger.info(
-                    f"[{self.event_name}] Waiting for {total_submitted} "
-                    f"fill confirmations (timeout: {remaining_timeout:.0f}s)..."
-                )
-                try:
-                    await asyncio.wait_for(
-                        self._wait_all_confirmations(),
-                        timeout=remaining_timeout,
+                    side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+                    fak_price = trade.limit_price if trade.limit_price > 0 else trade.price
+                    order_specs.append({
+                        "token_id": token_id,
+                        "side": side,
+                        "price": fak_price,
+                        "size": trade.size,
+                    })
+                    trade_token_pairs.append((trade, token_id))
+
+                    br = self._bin_range(trade.bin_index)
+                    bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
+                    logger.info(
+                        f"[{self.event_name}] iter={iteration} Placing: {trade.action.value} {bin_info} | "
+                        f"{side} {trade.size:.2f} @ {fak_price:.4f} (vwap={trade.price:.4f}) | "
+                        f"fair={trade.reservation_price:.4f} edge={trade.edge:+.2%} "
+                        f"util={trade.utility_gain:.4f} | token={token_id[:16]}..."
                     )
-                except asyncio.TimeoutError:
-                    pass
 
-            # Log batch resolution
-            confirmed = total_submitted - len(self._confirmation_events)
-            timed_out = len(self._confirmation_events)
-            # Count skipped (validation) vs rejected (API error) separately
-            skipped = sum(
-                1 for r in batch_response
-                if isinstance(r, dict) and r.get("_skipped")
-            )
-            api_rejected = len(order_specs) - total_submitted - skipped
-            self._confirmation_events.clear()
+                if not order_specs:
+                    break
 
-            logger.info(
-                f"[{self.event_name}] BATCH COMPLETE: "
-                f"{len(order_specs)} planned, {total_submitted} submitted, "
-                f"{confirmed} confirmed, {timed_out} timed out, "
-                f"{skipped} skipped, {api_rejected} rejected | "
-                f"elapsed={time.time() - start_time:.1f}s"
-            )
+                # Merge orders for same (token_id, side, price)
+                merged_specs = []
+                merged_trade_pairs = []
+                merge_key_to_idx = {}
+                for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
+                    key = (spec["token_id"], spec["side"], spec["price"])
+                    if key in merge_key_to_idx:
+                        idx = merge_key_to_idx[key]
+                        merged_specs[idx]["size"] += spec["size"]
+                        merged_trade_pairs[idx].append((trade, token_id))
+                        logger.info(
+                            f"[{self.event_name}] Merged order for bin={trade.bin_index}: "
+                            f"+{spec['size']:.0f} -> total {merged_specs[idx]['size']:.0f} shares"
+                        )
+                    else:
+                        merge_key_to_idx[key] = len(merged_specs)
+                        merged_specs.append(dict(spec))
+                        merged_trade_pairs.append([(trade, token_id)])
+
+                order_specs = merged_specs
+                trade_token_pairs = []
+                for spec, pairs in zip(merged_specs, merged_trade_pairs):
+                    trade, token_id = pairs[0]
+                    trade.size = spec["size"]
+                    trade_token_pairs.append((trade, token_id))
+
+                # Batch submit
+                batch_response = self.order_executor.place_batch_orders(order_specs)
+
+                # Process batch response
+                num_submitted_this_iter = 0
+                for i, (trade, token_id) in enumerate(trade_token_pairs):
+                    resp = batch_response[i] if i < len(batch_response) else {}
+                    if resp.get("_skipped"):
+                        continue
+
+                    oid = resp.get("orderID")
+                    if oid == "":
+                        oid = None
+                    order_id = oid
+                    error_msg = resp.get("errorMsg", "")
+
+                    if not order_id and error_msg:
+                        logger.warning(
+                            f"[{self.event_name}] Batch order for bin={trade.bin_index} "
+                            f"failed: {error_msg}"
+                        )
+                        self._record_fak_failure(trade.bin_index)
+
+                    if order_id:
+                        self._pending_orders[order_id] = (trade, token_id)
+                        confirm_event = asyncio.Event()
+                        self._confirmation_events[order_id] = confirm_event
+
+                        if self.user_stream:
+                            from .user_stream import PendingOrder
+                            pending = PendingOrder(
+                                order_id=order_id,
+                                token_id=token_id,
+                                side="BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
+                                price=trade.price,
+                                size=trade.size,
+                                bin_index=trade.bin_index,
+                            )
+                            asyncio.create_task(self.user_stream.add_pending_order(pending))
+
+                        self._log_trade_placed(trade, token_id, order_id)
+                        self._record_order()
+                        num_submitted_this_iter += 1
+
+                        result = ExecutionResult(
+                            success=True,
+                            candidate=trade,
+                            order_id=order_id,
+                            is_pending=True,
+                        )
+                    else:
+                        result = ExecutionResult(
+                            success=False,
+                            candidate=trade,
+                            error=error_msg or "No order_id in batch response",
+                            is_pending=False,
+                        )
+
+                    tick_result.executions.append(result)
+                    if result.success:
+                        tick_result.num_executed += 1
+                        tick_result.total_utility_gain += trade.utility_gain
+
+                    if self.on_trade:
+                        self.on_trade(result)
+
+                # Wait for CONFIRMED on all orders from this iteration (or tick timeout)
+                if self._confirmation_events:
+                    remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+                    if remaining_timeout > 0:
+                        logger.info(
+                            f"[{self.event_name}] iter={iteration}: waiting for "
+                            f"{num_submitted_this_iter} confirmations (timeout: {remaining_timeout:.0f}s)..."
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                self._wait_all_confirmations(),
+                                timeout=remaining_timeout,
+                            )
+                            confirmed = num_submitted_this_iter - len(self._confirmation_events)
+                            timed_out = len(self._confirmation_events)
+                            logger.info(
+                                f"[{self.event_name}] iter={iteration}: "
+                                f"{confirmed} confirmed, {timed_out} timed out"
+                            )
+                        except asyncio.TimeoutError:
+                            timed_out = len(self._confirmation_events)
+                            logger.warning(
+                                f"[{self.event_name}] iter={iteration}: tick timeout, "
+                                f"{timed_out} orders still unconfirmed"
+                            )
+                            self._confirmation_events.clear()
+                            break  # Tick timeout — stop iterating
+
+                    # Post-confirmation delay for API propagation
+                    remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+                    if remaining_timeout > self._post_confirm_delay:
+                        logger.info(
+                            f"[{self.event_name}] iter={iteration}: waiting "
+                            f"{self._post_confirm_delay:.0f}s for API propagation..."
+                        )
+                        await asyncio.sleep(self._post_confirm_delay)
+                    else:
+                        # Not enough time left for delay + next iteration
+                        break
+
+        # Tick summary
+        logger.info(
+            f"[{self.event_name}] TICK COMPLETE: {iteration} iterations, "
+            f"{tick_result.num_executed} executed, "
+            f"{tick_result.num_candidates} candidates | "
+            f"elapsed={time.time() - start_time:.1f}s"
+        )
 
         # Tick summary logged by caller (_log_tick_result in trading_bot.py)
 
@@ -1469,15 +1481,9 @@ class KellyExecutor:
 
         Called by UserStreamClient when a trade fill is confirmed.
 
-        NOTE: We do NOT update portfolio here. Portfolio updates come from
-        API sync before each Kelly decision. This avoids:
-        - Double-counting from multiple callbacks (MATCHED, MINED, CONFIRMED)
-        - Race conditions with manual trades
-        - Stale local state vs authoritative API state
-
-        This handler is only for:
-        - Logging fill events for awareness
-        - Removing completed orders from pending tracking
+        Logs fill events and signals confirmation on CONFIRMED status.
+        Portfolio state is NOT updated here — we rely on API sync before
+        each iteration for authoritative state.
 
         Args:
             fill_event: FillEvent from WebSocket
@@ -1496,7 +1502,6 @@ class KellyExecutor:
 
         candidate, token_id = pending_info
 
-        # Log the fill (but don't update portfolio - that happens via API sync)
         from .user_stream import OrderStatus
         status_str = fill_event.status.name if hasattr(fill_event.status, 'name') else str(fill_event.status)
         logger.info(
@@ -1504,24 +1509,16 @@ class KellyExecutor:
             f"{fill_event.size:.1f} @ {fill_event.price:.4f} = ${fill_event.size * fill_event.price:.2f}"
         )
 
-        # Signal confirmation event on MINED so waiting code can proceed
-        # (This allows the next order to be placed without waiting for full confirmation)
-        if fill_event.status == OrderStatus.MINED:
+        # Signal confirmation on CONFIRMED (final status).
+        # We wait for CONFIRMED (not MINED) so the API has more time
+        # to propagate the fill before we sync portfolio state.
+        if fill_event.status == OrderStatus.CONFIRMED:
             if order_id in self._confirmation_events:
                 self._confirmation_events[order_id].set()
                 del self._confirmation_events[order_id]
-            logger.debug(f"Order {order_id[:16]}... mined, confirmation event signaled")
-
-        # Remove from pending tracking only on CONFIRMED (not MINED)
-        # This prevents "fill for unknown order" warnings when CONFIRMED arrives after MINED
-        if fill_event.status == OrderStatus.CONFIRMED:
             if order_id in self._pending_orders:
                 del self._pending_orders[order_id]
-                logger.debug(f"Order {order_id[:16]}... confirmed and removed from pending")
-            # Also signal confirmation event if not already done (in case MINED was missed)
-            if order_id in self._confirmation_events:
-                self._confirmation_events[order_id].set()
-                del self._confirmation_events[order_id]
+            logger.debug(f"Order {order_id[:16]}... confirmed, signaling and removing from pending")
 
     async def handle_stale_order(self, pending: "PendingOrder") -> None:
         """

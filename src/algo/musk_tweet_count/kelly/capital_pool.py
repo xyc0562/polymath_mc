@@ -7,6 +7,7 @@ Each event requests capital on start and returns it at settlement.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Optional
@@ -74,6 +75,7 @@ class CapitalPool:
         self._lock = asyncio.Lock()
         self._history: list[EventAllocation] = []  # Settled events
         self._initialized_from_api: bool = False
+        self._last_negative_warning_time: float = 0.0  # Rate-limit negative warnings
 
         if config.total_capital > 0:
             logger.info(
@@ -243,10 +245,13 @@ class CapitalPool:
             self._available -= delta
 
             if self._available < 0:
-                logger.warning(
-                    f"Capital pool available went negative: ${self._available:.2f} "
-                    f"(event {event_id} value changed by ${delta:+.2f})"
-                )
+                now = time.time()
+                if now - self._last_negative_warning_time > 60:
+                    self._last_negative_warning_time = now
+                    logger.warning(
+                        f"Capital pool available is negative: ${self._available:.2f} "
+                        f"(allocated exceeds total capital)"
+                    )
 
     async def get_allocation(self, event_id: str) -> Optional[EventAllocation]:
         """Get allocation info for an event."""
