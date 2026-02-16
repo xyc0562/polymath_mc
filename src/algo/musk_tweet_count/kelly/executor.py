@@ -47,37 +47,51 @@ def _has_more_than_2dp(value: float) -> bool:
     return abs(value - round(value, 2)) > 1e-9
 
 
-def _fak_size_step(price: float) -> int:
+def _round_price_to_tick(price: float, tick_size: str) -> float:
+    """Round price the same way py-clob-client does for a given tick_size."""
+    dp = len(tick_size.rstrip("0").split(".")[-1]) if "." in tick_size else 0
+    return round(price * (10**dp)) / (10**dp)
+
+
+def _fak_size_step(price: float, tick_size: str = None) -> int:
     """
     Compute the minimum size step for FAK orders at a given price.
 
     FAK orders require maker_amount (size * price) to have <= 2 decimal places.
-    Since Polymarket prices are multiples of 0.0001 (tick size), we work in
-    tick units: price_ticks = price / 0.0001. Then size * price_ticks must be
-    divisible by 100 (since $0.01 = 100 ticks).
+    We work in tick units: price_ticks = price / 0.0001. Then size * price_ticks
+    must be divisible by 100 (since $0.01 = 100 ticks).
 
-    Uses tick-based math (price * 10000) instead of microdollar math
-    (price * 1_000_000) to avoid floating point precision issues.
+    If tick_size is provided, the price is first rounded to match what
+    py-clob-client will submit (e.g., tick_size="0.001" rounds to 3dp).
+    Without this, the step may be computed for a price that the API never sees.
     """
+    if tick_size:
+        price = _round_price_to_tick(price, tick_size)
     price_ticks = round(price * 10_000)
     g = math.gcd(price_ticks, 100)
     return 100 // g
 
 
-def _best_fak_price(price: float, size: int, side: str, max_tick_bump: int = 15) -> tuple[float, int]:
+def _best_fak_price(
+    price: float, size: int, side: str, max_tick_bump: int = 15, tick_size: str = None,
+) -> tuple[float, int]:
     """
     Find the best FAK-compatible (price, adjusted_size) near the target price.
 
-    For BUY: tries bumping price UP by 1-5 ticks to find a step that wastes
+    For BUY: tries bumping price UP by 1-N ticks to find a step that wastes
     fewer shares. FAK fills at best available price, so overpaying by a few
     ticks is negligible.
 
-    For SELL: tries bumping price DOWN by 1-5 ticks.
+    For SELL: tries bumping price DOWN by 1-N ticks.
+
+    tick_size: market tick size (e.g., "0.01", "0.001"). When provided, prices
+    are rounded to tick precision before computing the step, matching the
+    rounding that py-clob-client applies in create_order().
 
     Returns (adjusted_price, adjusted_size). If no improvement found, returns
     the original price with size rounded to the original step.
     """
-    base_step = _fak_size_step(price)
+    base_step = _fak_size_step(price, tick_size)
     if base_step <= 1:
         return price, size
 
@@ -93,7 +107,7 @@ def _best_fak_price(price: float, size: int, side: str, max_tick_bump: int = 15)
             if candidate_price <= 0:
                 continue
 
-        step = _fak_size_step(candidate_price)
+        step = _fak_size_step(candidate_price, tick_size)
         adjusted = (size // step) * step if step > 1 else size
         if adjusted > best_size:
             best_size = adjusted
@@ -314,9 +328,20 @@ class OrderExecutor:
         signed_args = []
         signed_indices = []  # Which input indices have signed orders
 
+        # Resolve tick_size per token (cached after first call)
+        tick_sizes: Dict[str, str] = {}
+        for order in orders:
+            tid = order["token_id"]
+            if tid not in tick_sizes:
+                try:
+                    tick_sizes[tid] = self.client.get_tick_size(tid)
+                except Exception:
+                    tick_sizes[tid] = "0.01"  # safe default
+
         for i, order in enumerate(orders):
             rounded_size = math.floor(order["size"])
             price = order["price"]
+            ts = tick_sizes.get(order["token_id"])
 
             # Validation
             if price <= 0 or price >= 1:
@@ -337,16 +362,18 @@ class OrderExecutor:
                     continue
 
             # Ensure maker_amount has <= 2 decimal places (FAK requirement)
+            # Must check using the tick-rounded price (what py-clob-client actually submits)
             # Only applies to BUY orders — SELL maker_amount is the share count (integer)
             if order["side"] == "BUY":
-                maker_amount = rounded_size * price
+                rounded_price = _round_price_to_tick(price, ts) if ts else price
+                maker_amount = rounded_size * rounded_price
                 if _has_more_than_2dp(maker_amount):
                     # Try nearby prices for a better step (FAK fills at best price anyway)
-                    adj_price, adjusted_size = _best_fak_price(price, rounded_size, "BUY")
+                    adj_price, adjusted_size = _best_fak_price(price, rounded_size, "BUY", tick_size=ts)
                     if adjusted_size < 1 or adjusted_size * adj_price < MIN_ORDER_VALUE_USD:
                         logger.warning(
                             f"[BATCH] No valid FAK size at or below {rounded_size} "
-                            f"(price={price:.4f}, step={_fak_size_step(price)}), skipping order {i}"
+                            f"(price={price:.4f}, step={_fak_size_step(price, ts)}), skipping order {i}"
                         )
                         continue
                     if adj_price != price:
