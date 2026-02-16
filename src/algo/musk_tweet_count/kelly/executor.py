@@ -842,10 +842,11 @@ class KellyExecutor:
                     self.on_trade(result)
 
             # Step 4: Wait for all fills (or tick timeout)
+            total_submitted = len(self._confirmation_events)
             remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
             if remaining_timeout > 0 and self._confirmation_events:
                 logger.info(
-                    f"[{self.event_name}] Waiting for {len(self._confirmation_events)} "
+                    f"[{self.event_name}] Waiting for {total_submitted} "
                     f"fill confirmations (timeout: {remaining_timeout:.0f}s)..."
                 )
                 try:
@@ -853,17 +854,21 @@ class KellyExecutor:
                         self._wait_all_confirmations(),
                         timeout=remaining_timeout,
                     )
-                    logger.info(
-                        f"[{self.event_name}] All fill confirmations received"
-                    )
                 except asyncio.TimeoutError:
-                    pending_count = len(self._confirmation_events)
-                    logger.warning(
-                        f"[{self.event_name}] Tick timeout waiting for "
-                        f"{pending_count} fill confirmation(s)"
-                    )
-                    # Clean up unresolved confirmation events
-                    self._confirmation_events.clear()
+                    pass
+
+            # Log batch resolution
+            confirmed = total_submitted - len(self._confirmation_events)
+            timed_out = len(self._confirmation_events)
+            failed = len(order_specs) - total_submitted  # orders that got no order_id
+            self._confirmation_events.clear()
+
+            logger.info(
+                f"[{self.event_name}] BATCH COMPLETE: "
+                f"{len(order_specs)} sent, {confirmed} confirmed, "
+                f"{timed_out} timed out, {failed} rejected | "
+                f"elapsed={time.time() - start_time:.1f}s"
+            )
 
         # Log tick summary
         logger.info(
@@ -872,14 +877,6 @@ class KellyExecutor:
             f"utility_gain={tick_result.total_utility_gain:.6f}, "
             f"elapsed={time.time() - start_time:.2f}s"
         )
-        for result in tick_result.executions:
-            if result.success:
-                c = result.candidate
-                status = "pending fill" if result.is_pending else "filled"
-                logger.info(
-                    f"  Order: {c.action.value} bin={c.bin_index} "
-                    f"size={c.size:.1f} @ {c.price:.4f} ({status})"
-                )
 
         tick_result.elapsed_seconds = time.time() - start_time
         self._last_tick_time = time.time()
