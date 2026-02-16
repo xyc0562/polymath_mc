@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
 
 from .config import KellyConfig
 from .orderbook import UnifiedOrderbook
@@ -217,6 +217,91 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"Cancel failed: {e}")
             return False
+
+    def place_batch_orders(
+        self,
+        orders: List[dict],
+    ) -> List[dict]:
+        """
+        Place multiple orders via batch API.
+
+        Each order dict has keys: token_id, side, price, size, plus optional metadata.
+
+        Args:
+            orders: List of dicts with {token_id, side, price, size}.
+
+        Returns:
+            Response from batch API (list of order results), or
+            simulated responses in dry-run mode.
+        """
+        if self.dry_run:
+            results = []
+            for i, order in enumerate(orders):
+                rounded_size = math.floor(order["size"])
+                logger.info(
+                    f"[{self.event_name}][DRY RUN] Would place {order['side']} order: "
+                    f"token={order['token_id'][:16]}..., price={order['price']:.4f}, "
+                    f"size={rounded_size}"
+                )
+                results.append({"orderID": f"dry_run_{i}", "status": "simulated"})
+            return results
+
+        # Validate and sign each order
+        signed_args = []
+        order_map = []  # Track which original orders mapped to signed orders
+        for i, order in enumerate(orders):
+            rounded_size = math.floor(order["size"])
+            price = order["price"]
+
+            # Validation (same checks as place_limit_order)
+            if price <= 0 or price >= 1:
+                logger.warning(f"[BATCH] Invalid price: {price:.4f}, skipping order {i}")
+                continue
+            if order["side"] == "SELL":
+                if rounded_size < 1:
+                    logger.warning(f"[BATCH] Sell size {rounded_size} below 1 share, skipping order {i}")
+                    continue
+            else:
+                if rounded_size < MIN_ORDER_SIZE and rounded_size * price < MIN_ORDER_VALUE_USD:
+                    logger.warning(
+                        f"[BATCH] Buy size {rounded_size} below minimum, skipping order {i}"
+                    )
+                    continue
+
+            logger.info(
+                f"[{self.event_name}][BATCH ORDER {i}] {order['side']} "
+                f"size={rounded_size} @ {price:.4f} maker_amt={rounded_size * price:.4f}"
+            )
+
+            try:
+                order_args = OrderArgs(
+                    token_id=order["token_id"],
+                    price=price,
+                    size=rounded_size,
+                    side=order["side"],
+                )
+                signed = self.client.create_order(order_args)
+                signed_args.append(PostOrdersArgs(order=signed, orderType=OrderType.FAK))
+                order_map.append(i)
+            except Exception as e:
+                logger.error(f"[BATCH] Failed to sign order {i}: {e}")
+                continue
+
+        if not signed_args:
+            logger.warning(f"[{self.event_name}][BATCH] No valid orders to submit")
+            return []
+
+        try:
+            logger.info(
+                f"[{self.event_name}][BATCH] Submitting {len(signed_args)} orders in one API call"
+            )
+            response = self.client.post_orders(signed_args)
+            logger.info(f"[{self.event_name}][BATCH] Response: {response}")
+            return response if isinstance(response, list) else [response]
+        except Exception as e:
+            logger.error(f"[{self.event_name}][BATCH] Batch order submission failed: {e}")
+            self._last_error = str(e)
+            return []
 
     def execute_candidate(
         self,
@@ -474,280 +559,235 @@ class KellyExecutor:
             )
             return tick_result
 
+        # Check global rate limit
+        if not self._check_rate_limit():
+            logger.info(f"[{self.event_name}] Rate limit reached, skipping tick")
+            return tick_result
+
         # Get current orderbooks
         orderbooks = self._get_orderbooks()
 
         rate_config = self.config.rate_limit
-        orders_this_tick = 0
 
-        for iteration in range(self.config.max_iters_per_tick):
-            # Check per-tick order limit
-            if orders_this_tick >= rate_config.max_orders_per_tick:
+        # Step 1: Sync portfolio from API (single sync per tick)
+        if self.sync_portfolio:
+            try:
+                await self.sync_portfolio()
                 logger.info(
-                    f"[{self.event_name}] Reached max orders per tick ({rate_config.max_orders_per_tick})"
-                )
-                break
-
-            # Check tick timeout
-            elapsed = time.time() - start_time
-            if elapsed > rate_config.tick_timeout_seconds:
-                logger.warning(
-                    f"[{self.event_name}] Tick timeout ({rate_config.tick_timeout_seconds}s) "
-                    f"after {orders_this_tick} orders"
-                )
-                break
-
-            # Check global rate limit
-            if not self._check_rate_limit():
-                logger.info("Rate limit reached, stopping tick early")
-                break
-
-            # Sync portfolio from API only on first iteration of tick
-            # Subsequent iterations rely on local state (updated by WebSocket fills)
-            # This avoids issues with Data API latency during active trading
-            if iteration == 0 and self.sync_portfolio:
-                try:
-                    await self.sync_portfolio()
-                    logger.info(
-                        f"[{self.event_name}][KELLY iter={iteration}] Synced from API: "
-                        f"capital=${self.portfolio.capital:.2f}, "
-                        f"invested=${self.portfolio.total_collateral_used:.2f}"
-                    )
-                except Exception as e:
-                    logger.warning(f"[{self.event_name}] Failed to sync portfolio before iteration {iteration}: {e}")
-                    # Continue with existing state if sync fails
-            else:
-                logger.debug(
-                    f"[{self.event_name}][KELLY iter={iteration}] Using local state: "
+                    f"[{self.event_name}][KELLY] Synced from API: "
                     f"capital=${self.portfolio.capital:.2f}, "
                     f"invested=${self.portfolio.total_collateral_used:.2f}"
                 )
+            except Exception as e:
+                logger.warning(f"[{self.event_name}] Failed to sync portfolio: {e}")
+                # Continue with existing state if sync fails
 
-            # Generate candidates (verbose on first iteration to show rejection reasons)
-            candidates = generate_candidates(
-                portfolio=self.portfolio,
-                orderbooks=orderbooks,
-                config=self.config,
-                hours_to_settlement=hours_to_settlement,
-                verbose=(verbose and iteration == 0),
+        # Step 2: Compute ALL optimal trades in simulation
+        # This runs entirely on a COPY of self.portfolio — never mutates it.
+        planned_trades = self._compute_optimal_trades(
+            orderbooks, hours_to_settlement, verbose
+        )
+
+        if not planned_trades:
+            tick_result.elapsed_seconds = time.time() - start_time
+            self._last_tick_time = time.time()
+            return tick_result
+
+        # Respect per-tick order limit
+        max_orders = rate_config.max_orders_per_tick
+        if len(planned_trades) > max_orders:
+            logger.info(
+                f"[{self.event_name}] Capping {len(planned_trades)} planned trades "
+                f"to max_orders_per_tick={max_orders}"
             )
+            planned_trades = planned_trades[:max_orders]
 
-            if iteration == 0:
-                tick_result.num_candidates = len(candidates)
+        tick_result.num_candidates = len(planned_trades)
 
-            if not candidates:
-                logger.debug(f"No candidates at iteration {iteration}")
-                break
-
-            # Log ALL candidates with utility gains for debugging (these all passed edge check)
-            if candidates:
-                # Separate sells and buys
-                sell_candidates = [c for c in candidates if c.action.value.startswith("SELL")]
-                buy_candidates = [c for c in candidates if c.action.value.startswith("BUY")]
-
-                # Sort buys by utility descending
-                buy_sorted = sorted(buy_candidates, key=lambda c: c.utility_gain, reverse=True)
-
-                # Build summary for all candidates
-                parts = []
-                for c in sell_candidates:
-                    br = self._bin_range(c.bin_index)
-                    bin_label = f"bin{c.bin_index}({br})" if br else f"bin{c.bin_index}"
-                    parts.append(f"{bin_label} SELL_{c.action.value.split('_')[1]}={c.utility_gain:.4f}")
-                for c in buy_sorted:
-                    br = self._bin_range(c.bin_index)
-                    bin_label = f"bin{c.bin_index}({br})" if br else f"bin{c.bin_index}"
-                    parts.append(f"{bin_label} {c.action.value.split('_')[1]}={c.utility_gain:.4f}")
-
-                summary = " | ".join(parts)
-                logger.info(f"[{self.event_name}][KELLY iter={iteration}] All {len(candidates)} candidates: {summary}")
-
-            # Get best candidate
-            # Candidates are ordered: [sells..., buys sorted by utility]
-            best = candidates[0]
-
-            # Sells execute unconditionally (they meet fair value threshold by being generated)
-            # Only check utility threshold for buys
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            if not is_sell and best.utility_gain < self.config.min_utility:
-                logger.debug(
-                    f"Best buy candidate utility {best.utility_gain:.6f} "
-                    f"< tau {self.config.min_utility}, stopping"
-                )
-                break
-
-            # Check FAK cooldown for this bin
-            if self._is_bin_in_fak_cooldown(best.bin_index):
-                logger.debug(
-                    f"Bin {best.bin_index} in FAK cooldown, skipping candidate"
-                )
-                # Remove this candidate and try the next one
-                candidates = [c for c in candidates if c.bin_index != best.bin_index]
-                if not candidates:
-                    break
-                best = candidates[0]
-                # Re-check utility threshold for the new best
-                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                if not is_sell and best.utility_gain < self.config.min_utility:
-                    break
-                # Check cooldown for new best as well
-                if self._is_bin_in_fak_cooldown(best.bin_index):
-                    logger.debug(f"Next best (bin {best.bin_index}) also in cooldown, stopping iteration")
-                    break
-
-            # Binary search for optimal chunk size
-            # Prevents overshooting Kelly-optimal position by checking if
-            # the same trade would still be best after a simulated fill
-            # For buys: checks if same buy is still best buy
-            # For sells: checks if opposing buy appears (would cause cycling)
-            optimal_size = self._find_optimal_size(
-                best, orderbooks, hours_to_settlement
-            )
-            if optimal_size != best.size:
-                best.size = optimal_size
-
-            # Execute trade - use YES token for YES actions, NO token for NO actions
-            if best.action in (TradeAction.BUY_NO, TradeAction.SELL_NO):
-                token_id = self.no_token_ids.get(best.bin_index)
+        # Step 3: Execute orders
+        if self.order_executor.dry_run:
+            # Dry run: simulate all fills optimistically on LIVE portfolio
+            for trade in planned_trades:
+                token_id = self._get_token_id_for_action(trade)
                 if not token_id:
-                    logger.warning(f"No NO token_id for bin {best.bin_index}")
-                    continue
-            else:
-                token_id = self.token_ids.get(best.bin_index)
-                if not token_id:
-                    logger.warning(f"No YES token_id for bin {best.bin_index}")
                     continue
 
-            result = self.order_executor.execute_candidate(best, token_id)
-            tick_result.executions.append(result)
+                # Update live portfolio optimistically (OK in dry-run)
+                self._update_portfolio(
+                    candidate=trade,
+                    token_id=token_id,
+                    filled_size=trade.size,
+                    filled_price=trade.price,
+                )
 
-            if result.success:
-                tick_result.num_executed += 1
-                tick_result.total_utility_gain += best.utility_gain
-                orders_this_tick += 1
+                br = self._bin_range(trade.bin_index)
+                bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
+                logger.info(
+                    f"[{self.event_name}][ORDER PLACED - DRY RUN] {trade.action.value} {bin_info} | "
+                    f"size={trade.size:.1f} @ {trade.price:.3f}"
+                )
 
-                # Record for rate limiting
+                self._log_trade_placed(trade, token_id, f"dry_run_{self._trade_count}")
                 self._record_order()
 
-                # In dry-run mode, do optimistic portfolio update since no WebSocket fills
-                # This ensures collateral limits are enforced across iterations
-                if self.order_executor.dry_run:
-                    self._update_portfolio(
-                        candidate=best,
-                        token_id=token_id,
-                        filled_size=best.size,
-                        filled_price=best.price,
-                    )
-                    br = self._bin_range(best.bin_index)
-                    bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
-                    logger.info(
-                        f"[{self.event_name}][ORDER PLACED - DRY RUN] {best.action.value} {bin_info} | "
-                        f"size={best.size:.1f} @ {best.price:.3f} | "
-                        f"Portfolio updated optimistically"
-                    )
-                else:
-                    # In live mode, portfolio updates happen via WebSocket fill confirmations
-                    br = self._bin_range(best.bin_index)
-                    bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
-                    logger.info(
-                        f"[{self.event_name}][ORDER PLACED] {best.action.value} {bin_info} | "
-                        f"size={best.size:.1f} @ {best.price:.3f} | "
-                        f"Will sync from API before next decision"
-                    )
+                result = ExecutionResult(
+                    success=True,
+                    candidate=trade,
+                    order_id=f"dry_run_{self._trade_count}",
+                    filled_size=trade.size,
+                    filled_price=trade.price,
+                    is_pending=False,
+                )
+                tick_result.executions.append(result)
+                tick_result.num_executed += 1
+                tick_result.total_utility_gain += trade.utility_gain
 
-                # Track as pending order for WebSocket confirmation
-                if result.order_id:
-                    self._pending_orders[result.order_id] = (best, token_id)
+                if self.on_trade:
+                    self.on_trade(result)
+        else:
+            # Live mode: batch submit all orders
+            order_specs = []
+            trade_token_pairs = []  # Parallel list for tracking
+            for trade in planned_trades:
+                token_id = self._get_token_id_for_action(trade)
+                if not token_id:
+                    continue
 
-                    # If user_stream is available, register the pending order
+                side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+                order_specs.append({
+                    "token_id": token_id,
+                    "side": side,
+                    "price": trade.price,
+                    "size": trade.size,
+                })
+                trade_token_pairs.append((trade, token_id))
+
+                # Log each planned trade
+                br = self._bin_range(trade.bin_index)
+                bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
+                logger.info(
+                    f"[{self.event_name}] Placing order: {trade.action.value} {bin_info} | "
+                    f"{side} {trade.size:.2f} @ {trade.price:.4f} | "
+                    f"fair={trade.reservation_price:.4f} edge={trade.edge:+.2%} "
+                    f"util={trade.utility_gain:.4f} | token={token_id[:16]}..."
+                )
+
+            if not order_specs:
+                tick_result.elapsed_seconds = time.time() - start_time
+                self._last_tick_time = time.time()
+                return tick_result
+
+            # Batch submit
+            batch_response = self.order_executor.place_batch_orders(order_specs)
+
+            # Process batch response — extract order IDs and track pending orders
+            # The batch API returns a response that may contain orderIDs
+            order_ids = []
+            if isinstance(batch_response, dict):
+                # Single response object with orderIDs list
+                order_ids = batch_response.get("orderIDs", [])
+            elif isinstance(batch_response, list):
+                # List of response objects
+                for resp in batch_response:
+                    if isinstance(resp, dict):
+                        oid = resp.get("orderID")
+                        if not oid:
+                            # Try orderIDs list format
+                            oids = resp.get("orderIDs", [])
+                            oid = oids[0] if oids else None
+                        order_ids.append(oid)
+                    else:
+                        order_ids.append(None)
+
+            # Track each order
+            for i, (trade, token_id) in enumerate(trade_token_pairs):
+                order_id = order_ids[i] if i < len(order_ids) else None
+
+                if order_id:
+                    # Track as pending
+                    self._pending_orders[order_id] = (trade, token_id)
+
+                    # Create confirmation event for fill waiting
+                    confirm_event = asyncio.Event()
+                    self._confirmation_events[order_id] = confirm_event
+
+                    # Register with user_stream
                     if self.user_stream:
                         from .user_stream import PendingOrder
                         pending = PendingOrder(
-                            order_id=result.order_id,
+                            order_id=order_id,
                             token_id=token_id,
-                            side="BUY" if best.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
-                            price=best.price,
-                            size=best.size,
-                            bin_index=best.bin_index,
+                            side="BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
+                            price=trade.price,
+                            size=trade.size,
+                            bin_index=trade.bin_index,
                         )
                         asyncio.create_task(self.user_stream.add_pending_order(pending))
 
-                # Log detailed trade info
-                self._log_trade_placed(best, token_id, result.order_id or "unknown")
+                    self._log_trade_placed(trade, token_id, order_id)
+                    self._record_order()
 
-                # Callback
+                    result = ExecutionResult(
+                        success=True,
+                        candidate=trade,
+                        order_id=order_id,
+                        is_pending=True,
+                    )
+                else:
+                    result = ExecutionResult(
+                        success=False,
+                        candidate=trade,
+                        error="No order_id in batch response",
+                        is_pending=False,
+                    )
+
+                tick_result.executions.append(result)
+                if result.success:
+                    tick_result.num_executed += 1
+                    tick_result.total_utility_gain += trade.utility_gain
+
                 if self.on_trade:
                     self.on_trade(result)
 
-                # Wait before next order (if more iterations expected)
-                if iteration < self.config.max_iters_per_tick - 1:
-                    if self.order_executor.dry_run:
-                        # Dry-run: just a short delay
-                        await asyncio.sleep(rate_config.min_order_delay_seconds)
-                    else:
-                        # Live mode: wait for block confirmation before next order
-                        # This ensures API has the updated position before we decide on next trade
-                        order_id = result.order_id
-                        if order_id and order_id != "dry_run_order":
-                            # Create confirmation event
-                            confirm_event = asyncio.Event()
-                            self._confirmation_events[order_id] = confirm_event
-
-                            # Wait for confirmation with timeout
-                            confirmation_timeout = rate_config.block_confirmation_timeout_seconds
-                            logger.info(f"Waiting for block confirmation (timeout: {confirmation_timeout}s)...")
-
-                            try:
-                                await asyncio.wait_for(confirm_event.wait(), timeout=confirmation_timeout)
-                                logger.info(f"Block confirmation received for order {order_id[:16]}...")
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    f"Block confirmation timeout after {confirmation_timeout}s for order {order_id[:16]}... "
-                                    "Proceeding with API sync."
-                                )
-                                # Clean up the event
-                                if order_id in self._confirmation_events:
-                                    del self._confirmation_events[order_id]
-
-                            # Wait for API data propagation before syncing
-                            # Block confirmation doesn't mean the data API has updated yet
-                            logger.debug("Waiting 1s for API data propagation...")
-                            await asyncio.sleep(1.0)
-
-                            # Sync from API after confirmation (or timeout) to get updated state
-                            if self.sync_portfolio:
-                                try:
-                                    await self.sync_portfolio()
-                                    logger.info(
-                                        f"[POST-CONFIRM SYNC] capital=${self.portfolio.capital:.2f}, "
-                                        f"invested=${self.portfolio.total_collateral_used:.2f}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"Failed to sync after confirmation: {e}")
-                        else:
-                            # No order_id, just use minimum delay
-                            await asyncio.sleep(rate_config.min_order_delay_seconds)
-            else:
-                logger.warning(f"Execution failed: {result.error}")
-                # Check if this is a FAK failure (no liquidity at target price)
-                if result.error and "no orders found to match" in result.error.lower():
-                    self._record_fak_failure(best.bin_index)
-                    # Continue to next iteration instead of breaking
-                    # The bin will be filtered out by cooldown
-                    continue
-                # Check if this is a balance/allowance error (e.g., rounding issues on SELL)
-                if result.error and "not enough balance" in result.error.lower():
-                    self._record_fak_failure(best.bin_index)
-                    logger.warning(
-                        f"Balance error for bin {best.bin_index}, adding to cooldown"
+            # Step 4: Wait for all fills (or tick timeout)
+            remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+            if remaining_timeout > 0 and self._confirmation_events:
+                logger.info(
+                    f"[{self.event_name}] Waiting for {len(self._confirmation_events)} "
+                    f"fill confirmations (timeout: {remaining_timeout:.0f}s)..."
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._wait_all_confirmations(),
+                        timeout=remaining_timeout,
                     )
-                    continue
-                # For other errors, add to cooldown and continue to next candidate
-                self._record_fak_failure(best.bin_index)
-                continue
+                    logger.info(
+                        f"[{self.event_name}] All fill confirmations received"
+                    )
+                except asyncio.TimeoutError:
+                    pending_count = len(self._confirmation_events)
+                    logger.warning(
+                        f"[{self.event_name}] Tick timeout waiting for "
+                        f"{pending_count} fill confirmation(s)"
+                    )
+                    # Clean up unresolved confirmation events
+                    self._confirmation_events.clear()
 
-            # Refresh orderbooks for next iteration
-            orderbooks = self._get_orderbooks()
+        # Log tick summary
+        logger.info(
+            f"Tick result: candidates={tick_result.num_candidates}, "
+            f"executed={tick_result.num_executed}, "
+            f"utility_gain={tick_result.total_utility_gain:.6f}, "
+            f"elapsed={time.time() - start_time:.2f}s"
+        )
+        for result in tick_result.executions:
+            if result.success:
+                c = result.candidate
+                status = "pending fill" if result.is_pending else "filled"
+                logger.info(
+                    f"  Order: {c.action.value} bin={c.bin_index} "
+                    f"size={c.size:.1f} @ {c.price:.4f} ({status})"
+                )
 
         tick_result.elapsed_seconds = time.time() - start_time
         self._last_tick_time = time.time()
@@ -926,6 +966,321 @@ class KellyExecutor:
                 if c.bin_index == bin_index and c.action == opposing:
                     return True  # Opposing buy appeared = over-exited
             return False
+
+    def _check_overshoots_on(
+        self,
+        portfolio: Portfolio,
+        candidate: TradeCandidate,
+        test_size: float,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        hours_to_settlement: float,
+    ) -> bool:
+        """
+        Check if filling test_size shares would overshoot Kelly-optimal.
+
+        Same logic as _check_overshoots but operates on an arbitrary portfolio
+        instead of self.portfolio. Used by the simulation loop to avoid
+        contaminating the live portfolio.
+        """
+        action = candidate.action
+        bin_index = candidate.bin_index
+        price = candidate.price
+
+        # Simulate the fill on the given portfolio (returns a new copy)
+        if action == TradeAction.BUY_YES:
+            hyp = portfolio.simulate_buy_yes(bin_index, test_size, price)
+        elif action == TradeAction.BUY_NO:
+            hyp = portfolio.simulate_buy_no(bin_index, test_size, price)
+        elif action == TradeAction.SELL_YES:
+            hyp = portfolio.simulate_sell_yes(bin_index, test_size, price)
+        elif action == TradeAction.SELL_NO:
+            hyp = portfolio.simulate_sell_no(bin_index, test_size, price)
+        else:
+            return False
+
+        # Preserve external capital limit
+        hyp.external_capital_limit = portfolio.external_capital_limit
+
+        # Regenerate candidates on hypothetical portfolio
+        new_candidates = generate_candidates(
+            portfolio=hyp,
+            orderbooks=orderbooks,
+            config=self.config,
+            hours_to_settlement=hours_to_settlement,
+            verbose=False,
+        )
+
+        is_buy = action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+
+        if not new_candidates:
+            return is_buy  # Buys: overshot; Sells: fully exited, fine
+
+        if is_buy:
+            buy_candidates = [
+                c for c in new_candidates
+                if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+            ]
+            if not buy_candidates:
+                return True
+            best_buy = buy_candidates[0]
+            return not (best_buy.bin_index == bin_index and best_buy.action == action)
+        else:
+            opposing = (
+                TradeAction.BUY_YES if action == TradeAction.SELL_YES
+                else TradeAction.BUY_NO
+            )
+            for c in new_candidates:
+                if c.bin_index == bin_index and c.action == opposing:
+                    return True
+            return False
+
+    def _find_optimal_size_on(
+        self,
+        portfolio: Portfolio,
+        candidate: TradeCandidate,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        hours_to_settlement: float,
+        max_iterations: int = 10,
+    ) -> float:
+        """
+        Binary search for optimal chunk size against a given portfolio.
+
+        Like _find_optimal_size but:
+        - Operates on an arbitrary portfolio (not self.portfolio) to avoid
+          contaminating the live portfolio during simulation.
+        - Uses c_bin_max as the upper bound for buys (not delta_ratio chunk).
+          This allows reaching optimal position in fewer iterations.
+
+        For SELL: upper bound is the full position in the bin.
+        """
+        from .orderbook import get_available_depth
+
+        price = candidate.price
+        is_buy = candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+
+        if is_buy:
+            # Upper bound: c_bin_max worth of shares, minus existing position in this bin
+            position = portfolio.get_position(candidate.bin_index)
+            existing_collateral = position.collateral_used if position else 0.0
+            remaining_bin_budget = max(0.0, self.config.collateral.c_bin_max - existing_collateral)
+
+            if price > 0:
+                full_size = remaining_bin_budget / price
+                # Also cap by available capital
+                full_size = min(full_size, portfolio.available_capital / price)
+            else:
+                return 0.0
+        else:
+            # For sells: full position
+            position = portfolio.get_position(candidate.bin_index)
+            if not position:
+                return 0.0
+            if candidate.action == TradeAction.SELL_YES:
+                full_size = position.yes_shares
+            else:
+                full_size = position.no_shares
+
+        # Cap by available orderbook depth
+        ob = orderbooks.get(candidate.bin_index)
+        if ob:
+            depth = get_available_depth(ob, candidate.action.value)
+            if depth > 0:
+                full_size = min(full_size, depth)
+
+        # Minimum tradeable size
+        if is_buy:
+            min_size = MIN_ORDER_SIZE
+            if price > 0:
+                min_value_size = math.ceil(MIN_ORDER_VALUE_USD / price)
+                min_size = min(MIN_ORDER_SIZE, min_value_size)
+            min_size = max(1.0, min_size)
+        else:
+            min_size = 1.0
+
+        if full_size <= min_size:
+            return full_size if full_size >= 1.0 else 0.0
+
+        # Quick check: does full chunk overshoot?
+        if not self._check_overshoots_on(portfolio, candidate, full_size, orderbooks, hours_to_settlement):
+            return full_size
+
+        br = self._bin_range(candidate.bin_index)
+        bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
+        logger.debug(
+            f"[{self.event_name}] Full chunk ({full_size:.0f} shares) overshoots for "
+            f"{candidate.action.value} {bin_info}, binary searching..."
+        )
+
+        # Binary search: find largest size that doesn't overshoot
+        lo = min_size
+        hi = full_size
+        best_valid = min_size  # Fallback
+
+        for _ in range(max_iterations):
+            if hi - lo < 1.0:
+                break
+            mid = (lo + hi) / 2.0
+            if self._check_overshoots_on(portfolio, candidate, mid, orderbooks, hours_to_settlement):
+                hi = mid
+            else:
+                best_valid = mid
+                lo = mid
+
+        optimal = max(1.0, math.floor(best_valid))
+
+        logger.info(
+            f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
+            f"{optimal:.0f} shares (max was {full_size:.0f})"
+        )
+
+        return optimal
+
+    def _compute_optimal_trades(
+        self,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        hours_to_settlement: float,
+        verbose: bool = False,
+    ) -> List[TradeCandidate]:
+        """
+        Compute all optimal trades via greedy simulation on a HYPOTHETICAL portfolio.
+
+        Creates a deep copy of self.portfolio and runs a simulation loop:
+        1. Generate candidates on hypothetical portfolio
+        2. Pick best (sells first, then buys by utility)
+        3. Binary search for optimal size (upper bound = c_bin_max for buys)
+        4. Simulate trade on hypothetical portfolio (never touches self.portfolio)
+        5. Accumulate in planned_trades
+        6. Repeat until no positive-utility trades remain
+
+        IMPORTANT: self.portfolio is NEVER modified. All simulation happens on copies.
+
+        Returns:
+            List of TradeCandidate with optimized sizes, ready for batch execution.
+        """
+        # Deep copy the portfolio for simulation — self.portfolio stays untouched
+        hyp = self.portfolio._copy()
+        hyp.external_capital_limit = self.portfolio.external_capital_limit
+        planned_trades = []
+
+        for sim_iter in range(self.config.max_iters_per_tick):
+            # Generate candidates on hypothetical portfolio
+            candidates = generate_candidates(
+                portfolio=hyp,
+                orderbooks=orderbooks,
+                config=self.config,
+                hours_to_settlement=hours_to_settlement,
+                verbose=(verbose and sim_iter == 0),
+            )
+
+            if not candidates:
+                logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
+                break
+
+            # Pick best candidate (sells come first, then buys by utility)
+            best = candidates[0]
+
+            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+            if not is_sell and best.utility_gain < self.config.min_utility:
+                logger.debug(
+                    f"[{self.event_name}][SIM iter={sim_iter}] Best buy utility "
+                    f"{best.utility_gain:.6f} < tau {self.config.min_utility}, stopping"
+                )
+                break
+
+            # Skip bins in FAK cooldown
+            if self._is_bin_in_fak_cooldown(best.bin_index):
+                candidates = [c for c in candidates if c.bin_index != best.bin_index]
+                if not candidates:
+                    break
+                best = candidates[0]
+                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                if not is_sell and best.utility_gain < self.config.min_utility:
+                    break
+                if self._is_bin_in_fak_cooldown(best.bin_index):
+                    break
+
+            # Binary search for optimal size on the HYPOTHETICAL portfolio
+            optimal_size = self._find_optimal_size_on(
+                hyp, best, orderbooks, hours_to_settlement
+            )
+
+            if optimal_size < 1.0:
+                logger.debug(
+                    f"[{self.event_name}][SIM iter={sim_iter}] Optimal size < 1 for "
+                    f"{best.action.value} bin={best.bin_index}, stopping"
+                )
+                break
+
+            best.size = optimal_size
+
+            # Simulate trade on hypothetical portfolio (returns NEW copy)
+            hyp = self._simulate_trade(hyp, best)
+
+            planned_trades.append(best)
+
+            # Log
+            br = self._bin_range(best.bin_index)
+            bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
+            logger.info(
+                f"[{self.event_name}][SIM iter={sim_iter}] {best.action.value} {bin_info} "
+                f"size={optimal_size:.0f} @ {best.price:.4f} util={best.utility_gain:.6f}"
+            )
+
+        if planned_trades:
+            logger.info(
+                f"[{self.event_name}] Simulation complete: {len(planned_trades)} trades planned"
+            )
+        else:
+            logger.debug(f"[{self.event_name}] Simulation complete: no trades needed")
+
+        return planned_trades
+
+    def _simulate_trade(self, portfolio: Portfolio, candidate: TradeCandidate) -> Portfolio:
+        """
+        Apply a simulated trade to a portfolio copy and return the new state.
+
+        IMPORTANT: This never mutates the input portfolio. All simulate_*
+        methods on Portfolio call _copy() internally and return a new object.
+        """
+        action = candidate.action
+        bi = candidate.bin_index
+        size = candidate.size
+        price = candidate.price
+
+        if action == TradeAction.BUY_YES:
+            new_p = portfolio.simulate_buy_yes(bi, size, price)
+        elif action == TradeAction.SELL_YES:
+            new_p = portfolio.simulate_sell_yes(bi, size, price)
+        elif action == TradeAction.BUY_NO:
+            new_p = portfolio.simulate_buy_no(bi, size, price)
+        elif action == TradeAction.SELL_NO:
+            new_p = portfolio.simulate_sell_no(bi, size, price)
+        else:
+            return portfolio
+
+        # Preserve external capital limit on the copy
+        new_p.external_capital_limit = portfolio.external_capital_limit
+        return new_p
+
+    def _get_token_id_for_action(self, candidate: TradeCandidate) -> Optional[str]:
+        """Get the token_id for a candidate's action (YES or NO token)."""
+        if candidate.action in (TradeAction.BUY_NO, TradeAction.SELL_NO):
+            token_id = self.no_token_ids.get(candidate.bin_index)
+            if not token_id:
+                logger.warning(f"No NO token_id for bin {candidate.bin_index}")
+            return token_id
+        else:
+            token_id = self.token_ids.get(candidate.bin_index)
+            if not token_id:
+                logger.warning(f"No YES token_id for bin {candidate.bin_index}")
+            return token_id
+
+    async def _wait_all_confirmations(self) -> None:
+        """Wait for all pending confirmation events to fire."""
+        if not self._confirmation_events:
+            return
+        events = list(self._confirmation_events.values())
+        await asyncio.gather(*[e.wait() for e in events])
 
     def _get_orderbooks(self) -> Dict[int, UnifiedOrderbook]:
         """Get current orderbooks for all bins."""
