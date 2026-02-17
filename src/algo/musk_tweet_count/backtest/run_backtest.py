@@ -379,10 +379,16 @@ def main():
     )
 
     parser.add_argument(
-        "--min-utility",
+        "--min-buy-utility",
         type=float,
-        default=KellyConfig.min_utility,
-        help=f"Minimum utility gain threshold. Default: {KellyConfig.min_utility}",
+        default=KellyConfig.min_buy_utility,
+        help=f"Minimum utility gain for buys. Default: {KellyConfig.min_buy_utility}",
+    )
+    parser.add_argument(
+        "--min-sell-utility",
+        type=float,
+        default=KellyConfig.min_sell_utility,
+        help=f"Minimum utility gain for sells. Default: {KellyConfig.min_sell_utility}",
     )
 
     parser.add_argument(
@@ -553,7 +559,8 @@ def main():
         trading_config = KellyConfig(
             kappa=args.kappa,
             kelly_fraction=args.kelly_fraction,
-            min_utility=args.min_utility,
+            min_buy_utility=args.min_buy_utility,
+            min_sell_utility=args.min_sell_utility,
             t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
             kelly_only_exit=(args.exit_mode == "kelly_only"),
             edge_buffer=EdgeBufferConfig(

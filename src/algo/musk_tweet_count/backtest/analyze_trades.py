@@ -582,7 +582,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Kelly parameters
     parser.add_argument("--kappa", type=float, default=0.25)
     parser.add_argument("--kelly-fraction", type=float, default=1.0)
-    parser.add_argument("--min-utility", type=float, default=KellyConfig.min_utility)
+    parser.add_argument("--min-buy-utility", type=float, default=KellyConfig.min_buy_utility)
+    parser.add_argument("--min-sell-utility", type=float, default=KellyConfig.min_sell_utility)
     parser.add_argument("--t-stop", type=float, default=None)
     parser.add_argument("--c-bin-max-ratio", type=float, default=0.15)
     parser.add_argument("--min-perceived-prob", type=float,
@@ -622,7 +623,8 @@ def build_runner(args) -> UnifiedBacktestRunner:
     trading_config = KellyConfig(
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
-        min_utility=args.min_utility,
+        min_buy_utility=args.min_buy_utility,
+        min_sell_utility=args.min_sell_utility,
         t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
         edge_buffer=EdgeBufferConfig(
             required_roi=args.roi,

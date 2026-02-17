@@ -674,8 +674,8 @@ def _generate_buy_yes_candidate(
     new_portfolio = portfolio.simulate_buy_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.min_utility:
-        reject(f"utility too low ({utility_gain:.6f} < {config.min_utility:.6f})")
+    if utility_gain < config.min_buy_utility:
+        reject(f"utility too low ({utility_gain:.6f} < {config.min_buy_utility:.6f})")
         return None
 
     return TradeCandidate(
@@ -767,6 +767,16 @@ def _generate_sell_yes_candidate(
     if filled <= 0:
         return None
 
+    # Sell friction: require market price meaningfully above Kelly fair value
+    # This applies even in kelly_only_exit mode to prevent cycling
+    sell_friction = config.edge_buffer.sell_friction
+    if sell_friction > 0 and vwap < reservation_price + sell_friction:
+        logger.debug(
+            f"SELL_YES bin {bin_index}: sell friction "
+            f"(vwap={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
+        )
+        return None
+
     # For EXITS: use the LOWER of model probability and Kelly reservation price
     # This allows exit when EITHER condition is met:
     # 1. Market >= model fair value (edge disappeared)
@@ -788,11 +798,10 @@ def _generate_sell_yes_candidate(
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # For exits, allow utility >= 0 (selling at or above fair value)
-    # Block negative utility (selling below fair value is always bad)
-    if utility_gain < 0:
+    # Sells require min_sell_utility (higher bar than buys to prevent cycling)
+    if utility_gain < config.min_sell_utility:
         logger.debug(
-            f"SELL_YES bin {bin_index}: negative utility ({utility_gain:.6f}), skipping"
+            f"SELL_YES bin {bin_index}: utility too low ({utility_gain:.6f} < {config.min_sell_utility:.6f}), skipping"
         )
         return None
 
@@ -924,8 +933,8 @@ def _generate_buy_no_candidate(
     new_portfolio = portfolio.simulate_buy_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.min_utility:
-        reject(f"utility too low ({utility_gain:.6f} < {config.min_utility:.6f})")
+    if utility_gain < config.min_buy_utility:
+        reject(f"utility too low ({utility_gain:.6f} < {config.min_buy_utility:.6f})")
         return None
 
     return TradeCandidate(
@@ -1019,6 +1028,16 @@ def _generate_sell_no_candidate(
     if filled <= 0:
         return None
 
+    # Sell friction: require market price meaningfully above Kelly fair value
+    # This applies even in kelly_only_exit mode to prevent cycling
+    sell_friction = config.edge_buffer.sell_friction
+    if sell_friction > 0 and vwap < reservation_price + sell_friction:
+        logger.debug(
+            f"SELL_NO bin {bin_index}: sell friction "
+            f"(vwap={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
+        )
+        return None
+
     # For EXITS: use the LOWER of model probability and Kelly reservation price
     # This allows exit when EITHER condition is met:
     # 1. Market >= model fair value (edge disappeared)
@@ -1040,11 +1059,10 @@ def _generate_sell_no_candidate(
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # For exits, allow utility >= 0 (selling at or above fair value)
-    # Block negative utility (selling below fair value is always bad)
-    if utility_gain < 0:
+    # Sells require min_sell_utility (higher bar than buys to prevent cycling)
+    if utility_gain < config.min_sell_utility:
         logger.debug(
-            f"SELL_NO bin {bin_index}: negative utility ({utility_gain:.6f}), skipping"
+            f"SELL_NO bin {bin_index}: utility too low ({utility_gain:.6f} < {config.min_sell_utility:.6f}), skipping"
         )
         return None
 

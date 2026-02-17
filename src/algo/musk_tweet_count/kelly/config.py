@@ -65,6 +65,11 @@ class EdgeBufferConfig:
     # Set to 0 to disable.
     max_spread_ratio: float = 2.0
 
+    # Sell-side friction in probability points.
+    # Sells require market price >= fair_value + sell_friction.
+    # Creates hysteresis: harder to exit than to enter, preventing cycling.
+    sell_friction: float = 0.02  # 2pp, same as buy friction_mid
+
 
 @dataclass
 class RateLimitConfig:
@@ -160,9 +165,13 @@ class KellyConfig:
     # Fractional Kelly multiplier (1.0 = full chunk size)
     kappa: float = 1.0
 
-    # Minimum utility gain to execute a trade (buys and sells).
-    # Prevents zero-utility cycling (e.g., BUY then SELL same bin).
-    min_utility: float = 0.001
+    # Minimum utility gain to execute a buy trade.
+    # Prevents low-utility entries that get reversed next tick.
+    min_buy_utility: float = 0.003
+
+    # Minimum utility gain to execute a sell trade.
+    # Higher than buy to create hysteresis and prevent cycling.
+    min_sell_utility: float = 0.006
 
     # Fractional Kelly parameter α ∈ (0, 1].
     # Controls risk aversion via CRRA power utility with γ = 1/α.
@@ -232,6 +241,12 @@ class KellyConfig:
 
         # Ignore websocket config if present (moved to websocket_client.py)
         data.pop("websocket", None)
+
+        # Backward compatibility: map old min_utility to split buy/sell thresholds
+        if "min_utility" in data and "min_buy_utility" not in data:
+            old_min_utility = data.pop("min_utility")
+            data["min_buy_utility"] = old_min_utility
+            data["min_sell_utility"] = 2 * old_min_utility
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),

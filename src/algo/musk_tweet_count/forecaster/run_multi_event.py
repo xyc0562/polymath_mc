@@ -600,10 +600,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
     )
     parser.add_argument(
-        "--min-utility",
+        "--min-buy-utility",
         type=float,
-        default=0.0001,
-        help="Minimum utility gain threshold (default: 0.0001)",
+        default=0.003,
+        help="Minimum utility gain for buys (default: 0.003)",
+    )
+    parser.add_argument(
+        "--min-sell-utility",
+        type=float,
+        default=0.006,
+        help="Minimum utility gain for sells (default: 0.006)",
     )
 
     # Chunk sizing (defaults from AdaptiveDeltaConfig)
@@ -747,7 +753,8 @@ async def main() -> None:
     kelly_config = KellyConfig(
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
-        min_utility=args.min_utility,
+        min_buy_utility=args.min_buy_utility,
+        min_sell_utility=args.min_sell_utility,
         edge_buffer=edge_buffer_config,
         adaptive_delta=adaptive_delta_config,
     )
