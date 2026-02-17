@@ -205,6 +205,11 @@ class KellyConfig:
     # Collateral limits
     collateral: CollateralConfig = field(default_factory=CollateralConfig)
 
+    # EMA smoothing factor for model probabilities across ticks.
+    # Lower α = more smoothing. α=0.3 ≈ half-life of 2 ticks (~10 min).
+    # Set to 1.0 to disable smoothing (use raw probabilities).
+    prob_ema_alpha: float = 0.3
+
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 

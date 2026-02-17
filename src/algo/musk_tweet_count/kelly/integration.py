@@ -111,6 +111,7 @@ class KellyTradingBot:
         self._running = False
         self._setup_complete = False
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
+        self._ema_probabilities: Optional[List[float]] = None
 
         # Lock for thread-safe tick execution
         self._tick_lock = asyncio.Lock()
@@ -302,6 +303,7 @@ class KellyTradingBot:
             if dead_bins:
                 logger.info(f"Dead bins (count={current_count}): {dead_bins}")
             self._last_logged_dead_bins = dead_bins
+            self._ema_probabilities = None  # Reset EMA on dead bin change
 
         # Get raw probabilities from model
         raw_probabilities = self.probability_model(
@@ -313,6 +315,19 @@ class KellyTradingBot:
             probabilities = renormalize_probabilities(raw_probabilities, dead_bins)
         else:
             probabilities = raw_probabilities
+
+        # EMA smooth probabilities to dampen Monte Carlo noise
+        alpha = self.config.prob_ema_alpha
+        if alpha < 1.0 and self._ema_probabilities is not None:
+            probabilities = [
+                alpha * p_new + (1 - alpha) * p_old
+                for p_new, p_old in zip(probabilities, self._ema_probabilities)
+            ]
+            # Re-normalize after blending (EMA can drift slightly from sum=1)
+            total = sum(probabilities)
+            if total > 0:
+                probabilities = [p / total for p in probabilities]
+        self._ema_probabilities = probabilities
 
         # Update portfolio
         self.portfolio.update_probabilities(probabilities, renormalize=False)
