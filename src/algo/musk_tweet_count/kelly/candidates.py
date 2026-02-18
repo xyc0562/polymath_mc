@@ -13,7 +13,7 @@ from typing import List, Optional
 import logging
 import math
 
-from .config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig
+from .config import KellyConfig, EdgeBufferConfig
 from .orderbook import (
     UnifiedOrderbook,
     compute_vwap_buy_yes,
@@ -34,6 +34,11 @@ MIN_ORDER_VALUE_USD = 1.0
 # Polymarket minimum order size (shares)
 # Orders below this will be rejected by the API
 MIN_ORDER_SIZE = 15
+
+# Screening chunk size for candidate generation (USD).
+# Just above the $1 API minimum; actual position sizing is done by
+# the binary search in _find_optimal_size_on.
+SCREENING_CHUNK_USD = 2.0
 
 
 def check_orderbook_liquidity(
@@ -295,40 +300,6 @@ def should_trade(
         return market_price >= no_threshold, actual_edge
 
 
-def compute_adaptive_delta_usd(
-    config: AdaptiveDeltaConfig,
-    available_depth_usd: float,
-    hours_to_settlement: float,
-    t_stop_hours: float,
-    base_delta_usd: float = 0.0,
-) -> float:
-    """
-    Compute adaptive chunk size in USD based on market conditions.
-
-    Args:
-        config: Adaptive delta configuration
-        available_depth_usd: Available depth in orderbook (in USD)
-        hours_to_settlement: Hours until market settlement
-        t_stop_hours: T_stop cutoff hours
-        base_delta_usd: Base chunk size in USD (computed from ratio × c_event_max)
-
-    Returns:
-        Adaptive chunk size in USD (0 if past T_stop)
-    """
-    # Stop trading if past T_stop
-    hours_until_stop = hours_to_settlement - t_stop_hours
-    if hours_until_stop <= 0:
-        return 0.0
-
-    # Liquidity constraint: never take >X% of visible depth (in USD)
-    liquidity_delta_usd = available_depth_usd * config.max_depth_fraction
-
-    return max(
-        config.min_delta_usd,
-        min(base_delta_usd, liquidity_delta_usd),
-    )
-
-
 def generate_candidates(
     portfolio: Portfolio,
     orderbooks: dict[int, UnifiedOrderbook],
@@ -585,20 +556,9 @@ def _generate_buy_yes_candidate(
         reject("no ask price")
         return None
 
-    # Convert depth to USD for adaptive delta calculation
-    depth_usd = depth_shares * best_ask
-
-    # Compute adaptive chunk size in USD
-    delta_usd = compute_adaptive_delta_usd(
-        config.adaptive_delta,
-        depth_usd,
-        hours_to_settlement,
-        config.t_stop_hours,
-        config.base_delta_usd,
-    )
-
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
+    # Screening chunk: just enough to test if a trade opportunity exists.
+    # Actual sizing is done by the binary search in _find_optimal_size_on.
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_ask
@@ -726,20 +686,8 @@ def _generate_sell_yes_candidate(
     if not best_bid or best_bid <= 0:
         return None
 
-    # Convert depth to USD
-    depth_usd = depth_shares * best_bid
-
-    # Compute adaptive chunk size in USD
-    delta_usd = compute_adaptive_delta_usd(
-        config.adaptive_delta,
-        depth_usd,
-        hours_to_settlement,
-        config.t_stop_hours,
-        config.base_delta_usd,
-    )
-
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
+    # Screening chunk for candidate generation
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
     delta = delta_usd / best_bid
@@ -847,20 +795,8 @@ def _generate_buy_no_candidate(
         return None
     best_no_price = 1.0 - best_yes_bid
 
-    # Convert depth to USD for adaptive delta calculation
-    depth_usd = depth_shares * best_no_price
-
-    # Compute adaptive chunk size in USD
-    delta_usd = compute_adaptive_delta_usd(
-        config.adaptive_delta,
-        depth_usd,
-        hours_to_settlement,
-        config.t_stop_hours,
-        config.base_delta_usd,
-    )
-
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
+    # Screening chunk for candidate generation
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_no_price
@@ -987,20 +923,8 @@ def _generate_sell_no_candidate(
         return None
     best_no_price = 1.0 - best_yes_ask
 
-    # Convert depth to USD
-    depth_usd = depth_shares * best_no_price
-
-    # Compute adaptive chunk size in USD
-    delta_usd = compute_adaptive_delta_usd(
-        config.adaptive_delta,
-        depth_usd,
-        hours_to_settlement,
-        config.t_stop_hours,
-        config.base_delta_usd,
-    )
-
-    # Scale chunk size by kappa for conservative execution
-    delta_usd *= config.kappa
+    # Screening chunk for candidate generation
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
     delta = delta_usd / best_no_price

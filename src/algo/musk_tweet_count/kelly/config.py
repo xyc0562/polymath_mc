@@ -112,30 +112,6 @@ class RateLimitConfig:
 
 
 @dataclass
-class AdaptiveDeltaConfig:
-    """
-    Configuration for adaptive chunk sizing.
-
-    Adapts trade size based on available liquidity (never take too much of visible depth).
-    Trading stops entirely once past T_stop.
-
-    Base chunk size is expressed as a ratio of c_event_max, so it scales
-    automatically with the collateral budget.
-    """
-
-    # Base chunk size as ratio of c_event_max (e.g., 0.02 = 2% of event budget)
-    # Production: 0.02 × $500 = $10/trade, Backtest: 0.02 × $10k = $200/trade
-    base_delta_ratio: float = 0.02
-
-    # Maximum fraction of visible depth to take per trade
-    # Set to 1.0 for production (no depth impact limit)
-    max_depth_fraction: float = 0.3
-
-    # Minimum chunk size in USD (must be >= $1 for Polymarket API)
-    min_delta_usd: float = 1.0
-
-
-@dataclass
 class CollateralConfig:
     """Configuration for collateral limits."""
 
@@ -199,9 +175,6 @@ class KellyConfig:
     # Edge buffer configuration
     edge_buffer: EdgeBufferConfig = field(default_factory=EdgeBufferConfig)
 
-    # Adaptive delta configuration
-    adaptive_delta: AdaptiveDeltaConfig = field(default_factory=AdaptiveDeltaConfig)
-
     # Collateral limits
     collateral: CollateralConfig = field(default_factory=CollateralConfig)
 
@@ -213,17 +186,12 @@ class KellyConfig:
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
-    @property
-    def base_delta_usd(self) -> float:
-        """Base chunk size in USD, computed from ratio × c_event_max."""
-        return self.adaptive_delta.base_delta_ratio * self.collateral.c_event_max
-
     @classmethod
     def from_dict(cls, data: dict) -> "KellyConfig":
         """Create config from dictionary (e.g., from YAML)."""
         # Extract nested configs
         edge_buffer_data = data.pop("edge_buffer", {})
-        adaptive_delta_data = data.pop("adaptive_delta", {})
+        data.pop("adaptive_delta", None)  # Legacy field, ignored
         collateral_data = data.pop("collateral", {})
         rate_limit_data = data.pop("rate_limit", {})
 
@@ -233,16 +201,6 @@ class KellyConfig:
             c_event_max = collateral_data.get("c_event_max", 500.0)
             if c_event_max > 0:
                 collateral_data["c_bin_max_ratio"] = old_bin_max / c_event_max
-
-        # Backward compatibility: convert old share-based or USD-based delta to ratio
-        adaptive_delta_data.pop("base_delta", None)  # Old share-based field
-        adaptive_delta_data.pop("min_delta", None)  # Old share-based field
-        # Convert old base_delta_usd to base_delta_ratio if present
-        if "base_delta_usd" in adaptive_delta_data and "base_delta_ratio" not in adaptive_delta_data:
-            old_usd = adaptive_delta_data.pop("base_delta_usd")
-            c_event_max = collateral_data.get("c_event_max", 500.0)
-            if c_event_max > 0:
-                adaptive_delta_data["base_delta_ratio"] = old_usd / c_event_max
 
         # Ignore websocket config if present (moved to websocket_client.py)
         data.pop("websocket", None)
@@ -255,7 +213,6 @@ class KellyConfig:
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),
-            adaptive_delta=AdaptiveDeltaConfig(**adaptive_delta_data),
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
             **data,

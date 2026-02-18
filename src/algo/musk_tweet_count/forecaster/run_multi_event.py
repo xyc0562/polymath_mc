@@ -40,7 +40,7 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventConfig,
     EventInfo,
 )
-from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, EventTradingRulesConfig
+from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, EventTradingRulesConfig
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
@@ -100,14 +100,6 @@ def log_config_summary(
     w(f"    Min market price:        {eb.min_market_price:.2%}")
     w(f"    Require 2-sided liq:     {eb.require_two_sided_liquidity}")
     w(f"    Max spread ratio:        {eb.max_spread_ratio}")
-    w("")
-
-    # Adaptive delta
-    ad = kelly_config.adaptive_delta
-    w("  ADAPTIVE DELTA")
-    w(f"    Base delta ratio:        {ad.base_delta_ratio:.3f}  (=${kelly_config.base_delta_usd:.2f})")
-    w(f"    Max depth fraction:      {ad.max_depth_fraction}")
-    w(f"    Min delta USD:           ${ad.min_delta_usd:.2f}")
     w("")
 
     # Rate limit
@@ -725,21 +717,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum utility gain for sells (default: 0.006)",
     )
 
-    # Chunk sizing (defaults from AdaptiveDeltaConfig)
-    _adaptive_defaults = AdaptiveDeltaConfig()
-    parser.add_argument(
-        "--base-delta-ratio",
-        type=float,
-        default=_adaptive_defaults.base_delta_ratio,
-        help=f"Base chunk size as ratio of c_event_max (default: {_adaptive_defaults.base_delta_ratio})",
-    )
-    parser.add_argument(
-        "--min-delta-usd",
-        type=float,
-        default=_adaptive_defaults.min_delta_usd,
-        help=f"Minimum chunk size in USD (default: ${_adaptive_defaults.min_delta_usd})",
-    )
-
     # Projection model
     parser.add_argument(
         "--projection",
@@ -858,18 +835,12 @@ async def main() -> None:
         require_two_sided_liquidity=not args.no_require_two_sided,
     )
 
-    adaptive_delta_config = AdaptiveDeltaConfig(
-        base_delta_ratio=args.base_delta_ratio,
-        min_delta_usd=args.min_delta_usd,
-    )
-
     kelly_config = KellyConfig(
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_buy_utility=args.min_buy_utility,
         min_sell_utility=args.min_sell_utility,
         edge_buffer=edge_buffer_config,
-        adaptive_delta=adaptive_delta_config,
     )
 
     # max_per_event: CLI override or kelly_config default

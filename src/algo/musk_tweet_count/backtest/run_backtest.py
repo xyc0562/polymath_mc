@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .runner import BacktestRunner, BacktestConfig, BacktestResult
-from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, CollateralConfig, EventTradingRulesConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, CollateralConfig, EventTradingRulesConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
 import sys
@@ -442,17 +442,6 @@ def main():
         help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
     )
 
-    # Default from AdaptiveDeltaConfig
-    _adaptive_defaults = AdaptiveDeltaConfig()
-    parser.add_argument(
-        "--base-delta-ratio",
-        type=float,
-        default=_adaptive_defaults.base_delta_ratio,
-        help=f"Base trade size as ratio of c_event_max (capital). "
-             f"Default: {_adaptive_defaults.base_delta_ratio} ({_adaptive_defaults.base_delta_ratio*100}%%). "
-             "e.g., 0.01 with $10k capital = $100/trade.",
-    )
-
     parser.add_argument(
         "--max-orders",
         type=int,
@@ -538,7 +527,6 @@ def main():
             logger.error(f"Invalid end date: {args.end_date}")
             return
 
-    base_delta_ratio = args.base_delta_ratio
     max_orders = args.max_orders
 
     # Load event trading rules if specified
@@ -572,10 +560,6 @@ def main():
                 min_market_price=args.min_market_price,
                 max_spread_ratio=args.max_spread_ratio,
                 require_two_sided_liquidity=not args.no_require_two_sided,
-            ),
-            adaptive_delta=AdaptiveDeltaConfig(
-                base_delta_ratio=base_delta_ratio,
-                max_depth_fraction=0.10,
             ),
             rate_limit=RateLimitConfig(
                 max_orders_per_tick=max_orders,

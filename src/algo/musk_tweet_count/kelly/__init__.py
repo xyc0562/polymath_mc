@@ -13,7 +13,6 @@ exclusive bin outcomes, with support for:
 from .config import (
     KellyConfig,
     EdgeBufferConfig,
-    AdaptiveDeltaConfig,
     RateLimitConfig,
     CollateralConfig,
 )
@@ -35,7 +34,6 @@ __all__ = [
     # Config
     "KellyConfig",
     "EdgeBufferConfig",
-    "AdaptiveDeltaConfig",
     "WebSocketConfig",
     "RateLimitConfig",
     "CollateralConfig",

@@ -48,7 +48,6 @@ from .run_backtest import (
 from ..kelly.config import (
     KellyConfig,
     EdgeBufferConfig,
-    AdaptiveDeltaConfig,
     RateLimitConfig,
     CollateralConfig,
     EventTradingRulesConfig,
@@ -593,9 +592,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-spread-ratio", type=float, default=2.0)
     parser.add_argument("--no-require-two-sided", action="store_true")
 
-    _adaptive_defaults = AdaptiveDeltaConfig()
-    parser.add_argument("--base-delta-ratio", type=float,
-                        default=_adaptive_defaults.base_delta_ratio)
     parser.add_argument("--max-orders", type=int, default=1000)
 
     parser.add_argument("--quick", action="store_true",
@@ -612,7 +608,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_runner(args) -> UnifiedBacktestRunner:
     """Create a UnifiedBacktestRunner from parsed CLI args."""
-    base_delta_ratio = args.base_delta_ratio
     max_orders = args.max_orders
 
     event_trading_rules = None
@@ -635,10 +630,6 @@ def build_runner(args) -> UnifiedBacktestRunner:
             min_market_price=args.min_market_price,
             max_spread_ratio=args.max_spread_ratio,
             require_two_sided_liquidity=not args.no_require_two_sided,
-        ),
-        adaptive_delta=AdaptiveDeltaConfig(
-            base_delta_ratio=base_delta_ratio,
-            max_depth_fraction=0.10,
         ),
         rate_limit=RateLimitConfig(
             max_orders_per_tick=max_orders,

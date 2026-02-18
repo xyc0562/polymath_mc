@@ -18,7 +18,7 @@ from .data_provider import (
 )
 
 # Import Kelly trading infrastructure
-from ..kelly.config import KellyConfig, EdgeBufferConfig, AdaptiveDeltaConfig, RateLimitConfig, EventTradingRulesConfig
+from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, EventTradingRulesConfig
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import UnifiedKellyExecutor, TickResult
 from ..kelly.backtest_backend import (
