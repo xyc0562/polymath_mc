@@ -17,7 +17,7 @@ event_categories:
     duration_days: [0, 4]  # 0, 1, 2, 3 day events
     trading_rules:
       require_counting_started: true
-      min_hours_before_settlement: 1.0
+      min_hours_before_settlement: 3.0
 
   # Weekly events (4-8 days): Can trade before counting, but limited
   # Rationale: Longer horizon provides some buffer against regime errors,
@@ -27,7 +27,7 @@ event_categories:
     trading_rules:
       require_counting_started: false
       max_hours_before_counting: 96.0  # Can trade up to 3 days before counting
-      min_hours_before_settlement: 1.0
+      min_hours_before_settlement: 3.0
 
   # Monthly events (9+ days): Wait until 7 days remain
   # Rationale: Very long events have high regime uncertainty far out.
@@ -37,10 +37,10 @@ event_categories:
     trading_rules:
       require_counting_started: false
       max_days_before_settlement: 7.0  # Only trade when <= 7 days left
-      min_hours_before_settlement: 1.0
+      min_hours_before_settlement: 3.0
 
 # Default rules if event doesn't match any category (same as weekly)
 default_rules:
   require_counting_started: false
   max_hours_before_counting: 96.0
-  min_hours_before_settlement: 1.0
+  min_hours_before_settlement: 3.0

@@ -45,6 +45,119 @@ from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
 
+
+def log_config_summary(
+    kelly_config: KellyConfig,
+    multi_event_config: "MultiEventConfig",
+    forecaster_config: ForecasterConfig,
+    capital_pool_config: CapitalPoolConfig,
+    dry_run: bool,
+) -> None:
+    """Log a formatted summary of all configurable parameters at startup."""
+    lines = []
+    w = lines.append
+    w("")
+    w("=" * 72)
+    w("  CONFIGURATION SUMMARY")
+    w("=" * 72)
+
+    # Mode
+    mode = "DRY RUN" if dry_run else "LIVE TRADING"
+    w(f"  Mode: {mode}")
+    w("")
+
+    # Capital
+    w("  CAPITAL")
+    w(f"    Total capital:           ${capital_pool_config.total_capital:,.2f}")
+    w(f"    Min allocation:          ${capital_pool_config.min_allocation:,.2f}")
+    w(f"    Max per event:           ${multi_event_config.max_per_event:,.2f}")
+    w(f"    Max per bin:             ${kelly_config.collateral.c_bin_max:,.2f}  ({kelly_config.collateral.c_bin_max_ratio:.0%} of event max)")
+    w("")
+
+    # Kelly
+    w("  KELLY OPTIMIZER")
+    w(f"    Kappa:                   {kelly_config.kappa}")
+    w(f"    Kelly fraction (alpha):  {kelly_config.kelly_fraction}")
+    w(f"    W floor:                 {kelly_config.w_floor}")
+    w(f"    Min buy utility:         {kelly_config.min_buy_utility}")
+    w(f"    Min sell utility:        {kelly_config.min_sell_utility}")
+    w(f"    Kelly-only exit:         {kelly_config.kelly_only_exit}")
+    w(f"    Renormalize probs:       {kelly_config.renormalize_probabilities}")
+    w(f"    Prob EMA alpha:          {kelly_config.prob_ema_alpha}")
+    w(f"    T_stop hours:            {kelly_config.t_stop_hours}")
+    w(f"    Max iters/tick:          {kelly_config.max_iters_per_tick}")
+    w("")
+
+    # Edge buffer
+    eb = kelly_config.edge_buffer
+    w("  EDGE BUFFER")
+    w(f"    Required ROI:            {eb.required_roi:.2%}")
+    w(f"    Friction mid:            {eb.friction_mid:.2%}")
+    w(f"    Friction tail:           {eb.friction_tail:.2%}")
+    w(f"    Tail threshold:          {eb.tail_threshold:.2%}")
+    w(f"    Sell friction:           {eb.sell_friction:.2%}")
+    w(f"    Min perceived prob:      {eb.min_perceived_prob:.2%}")
+    w(f"    Min market price:        {eb.min_market_price:.2%}")
+    w(f"    Require 2-sided liq:     {eb.require_two_sided_liquidity}")
+    w(f"    Max spread ratio:        {eb.max_spread_ratio}")
+    w("")
+
+    # Adaptive delta
+    ad = kelly_config.adaptive_delta
+    w("  ADAPTIVE DELTA")
+    w(f"    Base delta ratio:        {ad.base_delta_ratio:.3f}  (=${kelly_config.base_delta_usd:.2f})")
+    w(f"    Max depth fraction:      {ad.max_depth_fraction}")
+    w(f"    Min delta USD:           ${ad.min_delta_usd:.2f}")
+    w("")
+
+    # Rate limit
+    rl = kelly_config.rate_limit
+    w("  RATE LIMITING")
+    w(f"    Max orders/tick:         {rl.max_orders_per_tick}")
+    w(f"    Max orders/minute:       {rl.max_orders_per_minute}")
+    w(f"    Min order delay:         {rl.min_order_delay_seconds}s")
+    w(f"    Block confirm timeout:   {rl.block_confirmation_timeout_seconds}s")
+    w(f"    Tick timeout:            {rl.tick_timeout_seconds}s")
+    w(f"    FAK failure cooldown:    {rl.fak_failure_cooldown_seconds}s")
+    w("")
+
+    # Multi-event
+    w("  MULTI-EVENT")
+    w(f"    Tick interval:           {multi_event_config.tick_interval_seconds}s")
+    w(f"    Event duration filter:   {multi_event_config.min_event_duration_days}-{multi_event_config.max_event_duration_days} days")
+    w(f"    Projection model:        {multi_event_config.projection_model}")
+    w(f"    Event scan interval:     {multi_event_config.event_scan_interval}s")
+    w(f"    Max data age:            {multi_event_config.max_data_age_seconds}s")
+    w(f"    Count validation:        every {multi_event_config.count_validation_interval}s")
+    w("")
+
+    # Event trading rules
+    etr = multi_event_config.event_trading_rules
+    if etr and etr.categories:
+        w("  EVENT TRADING RULES")
+        for cat in etr.categories:
+            settle_str = f"stop {cat.min_hours_before_settlement}h before settlement"
+            if cat.require_counting_started:
+                w(f"    {cat.name:10s} ({cat.duration_min_days}-{cat.duration_max_days}d): require counting started, {settle_str}")
+            else:
+                before = f"trade {cat.max_hours_before_counting}h before counting" if cat.max_hours_before_counting else ""
+                max_days = f"start {cat.max_days_before_settlement}d before settle" if cat.max_days_before_settlement else ""
+                detail = before or max_days or "no restrictions"
+                w(f"    {cat.name:10s} ({cat.duration_min_days}-{cat.duration_max_days}d): {detail}, {settle_str}")
+        w("")
+
+    # Forecaster
+    w("  FORECASTER")
+    w(f"    Intraday mode:           {forecaster_config.intraday_mode}")
+    w(f"    Timezone:                {forecaster_config.timezone}")
+    w(f"    Contract boundary hr:    {forecaster_config.contract_boundary_hour}")
+
+    w("=" * 72)
+    w("")
+
+    logger.info("\n".join(lines))
+
+
 # API Constants
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 MUSK_TWEET_TAG_ID = 972
@@ -853,6 +966,15 @@ async def main() -> None:
     # This recovers state after a crash/restart
     logger.info("Reconstructing state from Polymarket API...")
     await manager.reconstruct_state_from_api()
+
+    # Log full config summary
+    log_config_summary(
+        kelly_config=kelly_config,
+        multi_event_config=multi_event_config,
+        forecaster_config=forecaster_config,
+        capital_pool_config=capital_pool_config,
+        dry_run=dry_run,
+    )
 
     # Run manager
     async with manager._events_lock:

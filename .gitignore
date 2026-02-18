@@ -138,3 +138,4 @@ config/hidden_files/*
 .encrypted_key
 .env
 data/backtest_cache
+.claude
