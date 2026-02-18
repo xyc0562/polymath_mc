@@ -1031,10 +1031,18 @@ class MultiEventManager:
 
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
 
-            if hours_to_settlement <= self.kelly_config.t_stop_hours:
+            # Use event-specific t_stop from trading rules
+            event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+            if self.config.event_trading_rules:
+                rules = self.config.event_trading_rules.get_rules_for_event(event_duration_days)
+                t_stop = rules.min_hours_before_settlement
+            else:
+                t_stop = self.kelly_config.t_stop_hours
+
+            if hours_to_settlement <= t_stop:
                 logger.info(
                     f"Event {event_id} too close to settlement "
-                    f"({hours_to_settlement:.1f}h remaining)"
+                    f"({hours_to_settlement:.1f}h remaining, t_stop={t_stop}h)"
                 )
                 return False
 
@@ -1116,8 +1124,16 @@ class MultiEventManager:
             )
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
 
-            if hours_to_settlement <= self.kelly_config.t_stop_hours:
-                logger.info(f"Event {event_id} expired, removing from pending")
+            # Use event-specific t_stop from trading rules
+            event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+            if self.config.event_trading_rules:
+                rules = self.config.event_trading_rules.get_rules_for_event(event_duration_days)
+                t_stop = rules.min_hours_before_settlement
+            else:
+                t_stop = self.kelly_config.t_stop_hours
+
+            if hours_to_settlement <= t_stop:
+                logger.info(f"Event {event_id} expired (t_stop={t_stop}h), removing from pending")
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
                 # Return any restored capital allocation (e.g., from reconstruct_state_from_api)
@@ -1198,10 +1214,23 @@ class MultiEventManager:
             sync_driven=True,
         )
 
+        # Create per-event kelly_config with event-specific t_stop_hours
+        # from the event trading rules (min_hours_before_settlement)
+        event_kelly_config = self.kelly_config
+        if self.config.event_trading_rules:
+            event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
+            rules = self.config.event_trading_rules.get_rules_for_event(event_duration_days)
+            from dataclasses import replace
+            event_kelly_config = replace(self.kelly_config, t_stop_hours=rules.min_hours_before_settlement)
+            logger.info(
+                f"Event {event_info.short_name}: t_stop={rules.min_hours_before_settlement}h "
+                f"(from '{rules.name}' rules, {event_duration_days}d event)"
+            )
+
         # Create bot with shared EventStore
         bot = GASKellyTradingBot(
             clob_client=self.clob_client,
-            kelly_config=self.kelly_config,
+            kelly_config=event_kelly_config,
             forecaster_config=self.forecaster_config,
             bot_config=bot_config,
             event_store=self.shared_event_store,

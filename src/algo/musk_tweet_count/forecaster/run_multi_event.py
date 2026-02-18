@@ -84,7 +84,7 @@ def log_config_summary(
     w(f"    Kelly-only exit:         {kelly_config.kelly_only_exit}")
     w(f"    Renormalize probs:       {kelly_config.renormalize_probabilities}")
     w(f"    Prob EMA alpha:          {kelly_config.prob_ema_alpha}")
-    w(f"    T_stop hours:            {kelly_config.t_stop_hours}")
+    w(f"    T_stop hours:            per-event (from trading rules, default={kelly_config.t_stop_hours})")
     w(f"    Max iters/tick:          {kelly_config.max_iters_per_tick}")
     w("")
 
@@ -141,6 +141,7 @@ def log_config_summary(
     # Forecaster
     w("  FORECASTER")
     w(f"    Intraday mode:           {forecaster_config.intraday_mode}")
+    w(f"    Projection model:        {multi_event_config.projection_model}")
     w(f"    Timezone:                {forecaster_config.timezone}")
     w(f"    Contract boundary hr:    {forecaster_config.contract_boundary_hour}")
 
