@@ -787,6 +787,10 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         self._historical_mean: float = 50.0
         self._historical_std: float = 30.0
 
+        # Bayesian impulse: kernel-smoothed rate curve λ(τ) at 1-min resolution
+        self._rate_curve: Optional[np.ndarray] = None  # shape (1440,), tweets/min
+        self._impulse_fitted: bool = False
+
         # Fitted flag
         self._fitted = False
 
@@ -849,6 +853,9 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             f"weekday_days={len(weekday_bucket_counts[0])}, "
             f"weekend_days={len(weekend_bucket_counts[0])}"
         )
+
+        # Fit impulse response from inter-tweet timing
+        self._fit_impulse(historical_events, today)
 
         # Log bucket means for debugging
         if self._weekday_buckets:
@@ -917,19 +924,102 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         return distributions
 
+    def _fit_impulse(
+        self,
+        historical_events: Dict[date, List[TweetEvent]],
+        as_of_date: date,
+    ) -> None:
+        """
+        Build kernel-smoothed rate curve λ(τ) at 1-min resolution.
+
+        For each minute τ ∈ [0, 1440), compute the recency-weighted average
+        tweet rate across training days, then smooth with a Gaussian kernel.
+        """
+        from scipy.ndimage import gaussian_filter1d
+
+        # Collect per-day 1-min count arrays with recency weights
+        day_counts: List[np.ndarray] = []
+        day_weights: List[float] = []
+        total_tweets = 0
+
+        for contract_date, events in historical_events.items():
+            days_ago = (as_of_date - contract_date).days
+            if days_ago > self.config.training_window_days:
+                continue
+
+            # 1-min resolution count array for this day
+            counts = np.zeros(1440)
+            for e in events:
+                tau = self.contract_utils.get_tau(e.timestamp, contract_date)
+                tau = max(0, min(tau, 1439))
+                counts[tau] += 1
+                total_tweets += 1
+
+            # Recency weight (same half_life as bucket fitting)
+            weight = np.exp(-days_ago / self.config.weight_half_life_days * np.log(2))
+            day_counts.append(counts)
+            day_weights.append(weight)
+
+        if total_tweets < self.config.impulse_min_tweets_for_fit:
+            logger.warning(
+                f"Insufficient tweets for rate curve ({total_tweets} < "
+                f"{self.config.impulse_min_tweets_for_fit}). Impulse disabled."
+            )
+            self._impulse_fitted = False
+            return
+
+        # Weighted average across days → raw rate λ_raw(τ)
+        weights_arr = np.array(day_weights)
+        weights_arr /= weights_arr.sum()
+        raw_rate = np.zeros(1440)
+        for counts, w in zip(day_counts, weights_arr):
+            raw_rate += counts * w
+
+        # Smooth with Gaussian kernel (σ = impulse_rate_curve_sigma minutes)
+        sigma = self.config.impulse_rate_curve_sigma
+        self._rate_curve = gaussian_filter1d(raw_rate, sigma=sigma, mode="wrap")
+
+        # Floor at small epsilon to avoid division by zero
+        self._rate_curve = np.maximum(self._rate_curve, 1e-6)
+        self._impulse_fitted = True
+
+        total_rate = float(self._rate_curve.sum())
+        peak_tau = int(np.argmax(self._rate_curve))
+        peak_rate = float(self._rate_curve[peak_tau])
+        logger.info(
+            f"Rate curve fitted: total={total_rate:.1f} tweets/day, "
+            f"peak={peak_rate:.4f} tweets/min at τ={peak_tau}, "
+            f"σ={sigma:.0f}min (from {total_tweets} tweets, {len(day_counts)} days)"
+        )
+
+    def _get_last_tweet_tau(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+    ) -> Optional[int]:
+        """Get τ of the most recent tweet, or None if no tweets today."""
+        past_events = [e for e in events if e.timestamp < now]
+        if not past_events:
+            return None
+        last = max(past_events, key=lambda e: e.timestamp)
+        return self.contract_utils.get_tau(last.timestamp, contract_date)
+
     def predict(
         self,
         events: List[TweetEvent],
         contract_date: date,
         now: datetime,
+        settlement_tau: Optional[int] = None,
     ) -> Tuple[float, float]:
         """
-        Predict final count using bucket-based Monte Carlo.
+        Predict final count using impulse response + bucket Monte Carlo.
 
         Args:
             events: Today's events so far
             contract_date: Today's contract date
             now: Current timestamp
+            settlement_tau: Optional τ of settlement (caps forecast window)
 
         Returns:
             Tuple of (predicted_count, uncertainty_std)
@@ -940,49 +1030,20 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 "Must call fit() with historical data first."
             )
 
-        tau = self.contract_utils.get_tau(now, contract_date)
-        is_weekend = self.contract_utils.is_weekend(contract_date)
-        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
-
-        if not buckets:
-            raise RuntimeError(
-                f"No bucket distributions available for {'weekend' if is_weekend else 'weekday'}. "
-                f"fit() may have failed or data was insufficient."
-            )
-
-        # Count observed events
-        observed = len([e for e in events if e.timestamp < now])
-
-        # Determine current bucket and partial fraction
-        current_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
-        partial_fraction = (tau % self.bucket_size) / self.bucket_size
-
-        # Compute expected count by now (sum of completed bucket means + partial current)
-        expected_so_far = sum(b.mean for b in buckets[:current_bucket_idx])
-        expected_so_far += buckets[current_bucket_idx].mean * partial_fraction
-
-        # Compute regime multiplier
-        if expected_so_far >= self.config.min_expected_for_regime:
-            regime = observed / expected_so_far
-            regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
-        else:
-            regime = 1.0
-
-        # Monte Carlo sampling for remaining buckets
         n_simulations = 1000
-        samples = self._sample_remaining(
-            observed=observed,
-            current_bucket_idx=current_bucket_idx,
-            partial_fraction=partial_fraction,
-            buckets=buckets,
-            regime=regime,
+        samples = self._sample_with_impulse(
+            events=events,
+            contract_date=contract_date,
+            now=now,
             n_simulations=n_simulations,
+            settlement_tau=settlement_tau,
         )
 
         mean = float(np.mean(samples))
         std = float(np.std(samples))
 
         # Ensure prediction is at least observed
+        observed = len([e for e in events if e.timestamp < now])
         mean = max(mean, observed)
 
         return mean, std
@@ -995,17 +1056,54 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         n_samples: int,
         rng: np.random.Generator,
         std_inflation_factor: float = 1.0,
+        settlement_tau: Optional[int] = None,
     ) -> np.ndarray:
         """
-        Draw n_samples of today's final count directly from the bucket model.
+        Draw n_samples of today's final count using impulse + bucket model.
 
-        Reuses the same regime / bucket logic as predict() but returns
-        the raw discrete NegBin samples instead of collapsing to (mean, std).
+        Returns the raw discrete samples.
         """
         if not self._fitted:
             raise RuntimeError(
                 "BucketIntradayForecaster.predict_samples() called before fit()."
             )
+
+        return self._sample_with_impulse(
+            events=events,
+            contract_date=contract_date,
+            now=now,
+            n_simulations=n_samples,
+            rng=rng,
+            std_inflation_factor=std_inflation_factor,
+            settlement_tau=settlement_tau,
+        ).astype(int)
+
+    def _sample_with_impulse(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+        n_simulations: int,
+        rng: Optional[np.random.Generator] = None,
+        std_inflation_factor: float = 1.0,
+        settlement_tau: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Core sampling using Bayesian Gamma-Poisson impulse + bucket model.
+
+        Timeline:
+          [day_start ... last_tweet ... now ... impulse_end ... day_end/settlement]
+                         |--- observation ---|
+                                             |--- predictive (NB) ---|
+                                                                     |--- buckets ---|
+
+        The rate multiplier r ~ Gamma(α₀, β₀) captures whether the current
+        tweeting rate is above (burst) or below (silence) the historical curve.
+        We observe k_obs tweets in [τ_last, τ_now] with expected E_obs under r=1,
+        then draw remaining tweets from the Negative Binomial predictive distribution.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
 
         tau = self.contract_utils.get_tau(now, contract_date)
         is_weekend = self.contract_utils.is_weekend(contract_date)
@@ -1017,82 +1115,123 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             )
 
         observed = len([e for e in events if e.timestamp < now])
-        current_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
-        partial_fraction = (tau % self.bucket_size) / self.bucket_size
+        end_tau = min(settlement_tau, 1440) if settlement_tau is not None else 1440
 
-        # Compute expected count by now
-        expected_so_far = sum(b.mean for b in buckets[:current_bucket_idx])
-        expected_so_far += buckets[current_bucket_idx].mean * partial_fraction
+        samples = np.full(n_simulations, float(observed))
 
-        # Regime multiplier
-        if expected_so_far >= self.config.min_expected_for_regime:
-            regime = observed / expected_so_far
-            regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
-        else:
-            regime = 1.0
+        # --- Bayesian impulse component ---
+        last_tweet_tau = self._get_last_tweet_tau(events, contract_date, now)
+        cutoff = self.config.impulse_cutoff_minutes
 
-        samples = self._sample_remaining(
-            observed=observed,
-            current_bucket_idx=current_bucket_idx,
-            partial_fraction=partial_fraction,
-            buckets=buckets,
-            regime=regime,
-            n_simulations=n_samples,
-            rng=rng,
-            std_inflation_factor=std_inflation_factor,
+        use_impulse = (
+            self._impulse_fitted
+            and self._rate_curve is not None
+            and last_tweet_tau is not None
+            and (tau - last_tweet_tau) < cutoff
         )
 
-        return samples.astype(int)
+        if use_impulse:
+            # 1. Observation window: [τ_last, τ_now]
+            tau_last = int(last_tweet_tau)
+            tau_now = int(tau)
+            tau_last_c = max(0, min(tau_last, 1439))
+            tau_now_c = max(0, min(tau_now, 1440))
 
-    def _sample_remaining(
-        self,
-        observed: int,
-        current_bucket_idx: int,
-        partial_fraction: float,
-        buckets: List[BucketDistribution],
-        regime: float,
-        n_simulations: int,
-        rng: Optional[np.random.Generator] = None,
-        std_inflation_factor: float = 1.0,
-    ) -> np.ndarray:
-        """Sample remaining bucket counts via Monte Carlo."""
-        if rng is None:
-            rng = np.random.default_rng()
-        samples = np.full(n_simulations, observed, dtype=float)
+            # Expected tweets in observation window under r=1
+            E_obs = float(self._rate_curve[tau_last_c:tau_now_c].sum())
 
-        # Sample remaining portion of current bucket
-        if partial_fraction < 1.0:
-            current_bucket = buckets[current_bucket_idx]
-            remaining_mean = current_bucket.mean * (1.0 - partial_fraction) * regime
-            k = current_bucket.dispersion_k
-            if std_inflation_factor > 1.0:
-                k = k / std_inflation_factor
+            # Actual tweets in observation window (tweets after the last tweet, before now)
+            k_obs = 0
+            for e in events:
+                e_tau = self.contract_utils.get_tau(e.timestamp, contract_date)
+                if tau_last < e_tau < tau_now:
+                    k_obs += 1
 
-            if remaining_mean > 0:
-                remaining_samples = self._sample_negative_binomial(
-                    mean=remaining_mean,
-                    k=k,
-                    size=n_simulations,
-                    rng=rng,
-                )
-                samples += remaining_samples
+            # 2. Bayesian update (Gamma-Poisson conjugacy)
+            alpha0 = self.config.impulse_prior_concentration
+            beta0 = alpha0  # Prior mean = α₀/β₀ = 1.0 (normal rate)
+            alpha_post = alpha0 + k_obs
+            beta_post = beta0 + E_obs
 
-        # Sample full remaining buckets
-        for bucket_idx in range(current_bucket_idx + 1, self.n_buckets):
-            bucket = buckets[bucket_idx]
-            bucket_mean = bucket.mean * regime
-            k = bucket.dispersion_k
-            if std_inflation_factor > 1.0:
-                k = k / std_inflation_factor
+            posterior_mean = alpha_post / beta_post if beta_post > 0 else 1.0
 
-            if bucket_mean > 0:
-                bucket_samples = self._sample_negative_binomial(
-                    mean=bucket_mean,
-                    k=k,
-                    size=n_simulations,
-                    rng=rng,
-                )
-                samples += bucket_samples
+            # 3. Predictive sampling for remaining impulse window [τ_now, τ_impulse_end]
+            impulse_end_tau = int(min(tau_last + cutoff, end_tau))
+            impulse_end_tau = max(impulse_end_tau, tau_now)  # Ensure non-negative range
+
+            tau_impulse_end_c = max(0, min(impulse_end_tau, 1440))
+            E_remaining = float(self._rate_curve[tau_now_c:tau_impulse_end_c].sum())
+
+            if E_remaining > 0:
+                # Predictive distribution: Negative Binomial
+                # NB(r=α_post, p=β_post/(β_post + E_remaining))
+                nb_r = alpha_post
+                nb_p = beta_post / (beta_post + E_remaining)
+                nb_p = max(min(nb_p, 0.9999), 0.0001)  # Clamp for numerical safety
+
+                impulse_samples = rng.negative_binomial(nb_r, nb_p, size=n_simulations)
+                samples += impulse_samples
+
+            logger.debug(
+                f"Bayesian impulse: τ_last={tau_last}, τ_now={tau_now}, "
+                f"k_obs={k_obs}, E_obs={E_obs:.2f}, "
+                f"α_post={alpha_post:.2f}, β_post={beta_post:.2f}, "
+                f"posterior_mean={posterior_mean:.3f}, "
+                f"E_remaining={E_remaining:.2f}, impulse_end={impulse_end_tau}"
+            )
+        else:
+            impulse_end_tau = tau
+
+        # --- Bucket component (from impulse_end_tau to end_tau) ---
+        if impulse_end_tau < end_tau:
+            # Compute regime from observed vs expected (using full day context)
+            full_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
+            full_partial = (tau % self.bucket_size) / self.bucket_size
+            expected_so_far = sum(b.mean for b in buckets[:full_bucket_idx])
+            expected_so_far += buckets[full_bucket_idx].mean * full_partial
+
+            if expected_so_far >= self.config.min_expected_for_regime:
+                regime = observed / expected_so_far
+                regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
+            else:
+                regime = 1.0
+
+            # Determine which bucket impulse_end_tau falls in
+            bucket_start_idx = min(
+                int(impulse_end_tau) // self.bucket_size, self.n_buckets - 1
+            )
+            bucket_start_partial = (impulse_end_tau % self.bucket_size) / self.bucket_size
+
+            # Sample remaining portion of the bucket containing impulse_end_tau
+            if bucket_start_partial < 1.0:
+                b = buckets[bucket_start_idx]
+                bucket_end = min(b.end_tau, end_tau)
+                fraction = (bucket_end - impulse_end_tau) / self.bucket_size
+                if fraction > 0:
+                    remaining_mean = b.mean * fraction * regime
+                    k = b.dispersion_k
+                    if std_inflation_factor > 1.0:
+                        k = k / std_inflation_factor
+                    if remaining_mean > 0:
+                        samples += self._sample_negative_binomial(
+                            mean=remaining_mean, k=k, size=n_simulations, rng=rng,
+                        )
+
+            # Sample full remaining buckets
+            for bucket_idx in range(bucket_start_idx + 1, self.n_buckets):
+                b = buckets[bucket_idx]
+                if b.start_tau >= end_tau:
+                    break
+                bucket_end = min(b.end_tau, end_tau)
+                fraction = (bucket_end - b.start_tau) / self.bucket_size
+                bucket_mean = b.mean * fraction * regime
+                k = b.dispersion_k
+                if std_inflation_factor > 1.0:
+                    k = k / std_inflation_factor
+                if bucket_mean > 0:
+                    samples += self._sample_negative_binomial(
+                        mean=bucket_mean, k=k, size=n_simulations, rng=rng,
+                    )
 
         return samples
 

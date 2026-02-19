@@ -35,10 +35,11 @@ MIN_ORDER_VALUE_USD = 1.0
 # Orders below this will be rejected by the API
 MIN_ORDER_SIZE = 15
 
-# Screening chunk size for candidate generation (USD).
-# Just above the $1 API minimum; actual position sizing is done by
-# the binary search in _find_optimal_size_on.
-SCREENING_CHUNK_USD = 2.0
+# Screening chunk size as fraction of c_bin_max for candidate generation.
+# Must be large enough that genuine edge produces utility_gain > min_buy_utility.
+# Old adaptive delta used ~2% of c_event_max × kappa. We use 50% of c_bin_max
+# as a reasonable proxy (actual sizing is done by _find_optimal_size_on).
+SCREENING_CHUNK_RATIO = 0.5
 
 
 def check_orderbook_liquidity(
@@ -558,7 +559,7 @@ def _generate_buy_yes_candidate(
 
     # Screening chunk: just enough to test if a trade opportunity exists.
     # Actual sizing is done by the binary search in _find_optimal_size_on.
-    delta_usd = SCREENING_CHUNK_USD
+    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_ask
@@ -687,7 +688,7 @@ def _generate_sell_yes_candidate(
         return None
 
     # Screening chunk for candidate generation
-    delta_usd = SCREENING_CHUNK_USD
+    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
 
     # Convert USD to shares
     delta = delta_usd / best_bid
@@ -796,7 +797,7 @@ def _generate_buy_no_candidate(
     best_no_price = 1.0 - best_yes_bid
 
     # Screening chunk for candidate generation
-    delta_usd = SCREENING_CHUNK_USD
+    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_no_price
@@ -924,7 +925,7 @@ def _generate_sell_no_candidate(
     best_no_price = 1.0 - best_yes_ask
 
     # Screening chunk for candidate generation
-    delta_usd = SCREENING_CHUNK_USD
+    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
 
     # Convert USD to shares
     delta = delta_usd / best_no_price

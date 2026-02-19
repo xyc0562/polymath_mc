@@ -82,6 +82,14 @@ class BucketNowcastConfig:
     # Minimum dispersion k (floor for Negative Binomial)
     min_dispersion_k: float = 0.5
 
+    # Bayesian impulse response: Gamma-Poisson conjugate model
+    # Uses kernel-smoothed rate curve λ(τ) with Bayesian updating
+    # to detect both tweet bursts AND prolonged silence.
+    impulse_cutoff_minutes: float = 180.0       # Extended window for silence detection
+    impulse_min_tweets_for_fit: int = 200       # Min tweets needed to fit rate curve
+    impulse_rate_curve_sigma: float = 60.0      # Gaussian kernel σ (minutes) for λ(τ)
+    impulse_prior_concentration: float = 2.0    # Gamma prior α₀ (strength of prior)
+
 
 @dataclass
 class RegimeConfig:
