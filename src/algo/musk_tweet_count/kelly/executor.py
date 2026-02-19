@@ -1223,7 +1223,7 @@ class KellyExecutor:
             if not buy_candidates:
                 return True  # No buy candidates left = overshot
 
-            best_buy = buy_candidates[0]  # Already sorted by edge descending
+            best_buy = buy_candidates[0]  # Already sorted by utility descending
             return not (best_buy.bin_index == bin_index and best_buy.action == action)
         else:
             # For sells: check if opposing BUY for the same bin appeared
@@ -1286,14 +1286,16 @@ class KellyExecutor:
             return is_buy  # Buys: overshot; Sells: fully exited, fine
 
         if is_buy:
-            # Overshoot = this bin no longer has positive utility after the fill.
-            # We don't check if it's still the "best" buy — the greedy loop in
-            # _compute_optimal_trades handles switching between competing bins.
-            # Here we only care: have we passed this bin's Kelly-optimal point?
-            for c in new_candidates:
-                if c.bin_index == bin_index and c.action == action:
-                    return False  # Still has positive utility, not overshot
-            return True  # This bin dropped out of candidates entirely
+            # Overshoot = this bin is no longer the best buy after the fill.
+            # The simulation loop handles alternating between bins.
+            buy_candidates = [
+                c for c in new_candidates
+                if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+            ]
+            if not buy_candidates:
+                return True
+            best_buy = buy_candidates[0]
+            return not (best_buy.bin_index == bin_index and best_buy.action == action)
         else:
             opposing = (
                 TradeAction.BUY_YES if action == TradeAction.SELL_YES
@@ -1446,14 +1448,15 @@ class KellyExecutor:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
                 break
 
-            # Pick best candidate (sells come first, then buys by edge)
+            # Pick best candidate (sells come first, then buys by utility)
             best = candidates[0]
 
-            # Screening uses a small $2 chunk so utility is tiny — just require positive
-            if best.utility_gain <= 0:
+            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
+            if best.utility_gain < min_util:
                 logger.debug(
                     f"[{self.event_name}][SIM iter={sim_iter}] Best candidate utility "
-                    f"{best.utility_gain:.6f} <= 0, stopping"
+                    f"{best.utility_gain:.6f} < {min_util}, stopping"
                 )
                 break
 
@@ -1463,7 +1466,9 @@ class KellyExecutor:
                 if not candidates:
                     break
                 best = candidates[0]
-                if best.utility_gain <= 0:
+                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
+                if best.utility_gain < min_util:
                     break
                 if self._is_bin_in_fak_cooldown(best.bin_index):
                     break

@@ -133,6 +133,7 @@ class KellyTradingBot:
         # Store bin metadata
         self.num_bins = len(bins)
         self.bin_upper_bounds = [b["upper_bound"] for b in bins]
+        self.bin_lower_bounds = [b.get("lower_bound", 0) for b in bins]
         self.bin_token_ids = {i: b["token_id"] for i, b in enumerate(bins)}  # YES token IDs
         self.bin_no_token_ids = {i: b.get("no_token_id") for i, b in enumerate(bins)}  # NO token IDs
 
@@ -403,7 +404,7 @@ class KellyTradingBot:
             for bin_idx in range(self.num_bins):
                 if bin_idx < len(self.bin_upper_bounds):
                     upper = self.bin_upper_bounds[bin_idx]
-                    lower = self.bin_upper_bounds[bin_idx - 1] + 1 if bin_idx > 0 else 0
+                    lower = self.bin_lower_bounds[bin_idx] if bin_idx < len(self.bin_lower_bounds) else 0
                     if upper == float('inf'):
                         bin_ranges[bin_idx] = f"{lower}+"
                     else:

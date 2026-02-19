@@ -36,9 +36,8 @@ MIN_ORDER_VALUE_USD = 1.0
 MIN_ORDER_SIZE = 15
 
 # Fixed screening chunk size in USD for candidate generation.
-# Small enough that utility gain is nearly linear (not affected by position),
-# so edge-based ranking is valid. Actual sizing is done by the binary search
-# in _find_optimal_size_on.
+# Small enough that utility gain ≈ marginal utility (good for ranking by utility/$).
+# Edge check (should_trade) filters garbage; actual sizing done by _find_optimal_size_on.
 SCREENING_CHUNK_USD = 2.0
 
 
@@ -522,9 +521,9 @@ def generate_candidates(
     sells = [c for c in candidates if c.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)]
     buys = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
 
-    # Sort buys by edge (descending) — edge is a better proxy for marginal
-    # utility than utility_gain, which depends on the arbitrary screening chunk size.
-    buys.sort(key=lambda c: c.edge, reverse=True)
+    # Sort buys by utility gain per dollar spent (descending).
+    # With a small screening chunk ($2), this approximates marginal utility per dollar.
+    buys.sort(key=lambda c: c.utility_gain / c.cost if c.cost > 0 else 0, reverse=True)
 
     # Sells come first, then buys
     return sells + buys
@@ -558,7 +557,7 @@ def _generate_buy_yes_candidate(
         reject("no ask price")
         return None
 
-    # Screening chunk: small fixed USD amount to test if a trade opportunity exists.
+    # Small screening chunk for marginal utility estimation.
     # Actual sizing is done by the binary search in _find_optimal_size_on.
     delta_usd = SCREENING_CHUNK_USD
 
@@ -603,17 +602,21 @@ def _generate_buy_yes_candidate(
         reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
-    # Compute edge for ranking/logging
-    _, actual_edge = should_trade(
+    # Check edge requirement
+    trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_YES, config.edge_buffer
     )
+    if not trade_ok:
+        threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
+        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
+        return None
 
-    # Screen by utility: accounts for existing positions (edge alone doesn't)
+    # Simulate trade and compute utility gain (screening only — require positive)
     new_portfolio = portfolio.simulate_buy_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
     if utility_gain <= 0:
-        reject(f"non-positive utility ({utility_gain:.6f}), fair={reservation_price:.1%} vwap={vwap:.1%}")
+        reject(f"non-positive utility ({utility_gain:.6f})")
         return None
 
     return TradeCandidate(
@@ -664,7 +667,7 @@ def _generate_sell_yes_candidate(
     if not best_bid or best_bid <= 0:
         return None
 
-    # Screening chunk for candidate generation
+    # Small screening chunk for marginal utility estimation
     delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
@@ -723,7 +726,7 @@ def _generate_sell_yes_candidate(
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # Screening: only require positive utility (actual sizing done by optimizer)
+    # Screening: only require positive utility (min_sell_utility applied in optimizer)
     if utility_gain <= 0:
         logger.debug(
             f"SELL_YES bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"
@@ -772,7 +775,7 @@ def _generate_buy_no_candidate(
         return None
     best_no_price = 1.0 - best_yes_bid
 
-    # Screening chunk: small fixed USD amount to test if a trade opportunity exists.
+    # Small screening chunk for marginal utility estimation.
     # Actual sizing is done by the binary search in _find_optimal_size_on.
     delta_usd = SCREENING_CHUNK_USD
 
@@ -816,17 +819,21 @@ def _generate_buy_no_candidate(
         reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
-    # Compute edge for ranking/logging
-    _, actual_edge = should_trade(
+    trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
+    if not trade_ok:
+        req_edge = compute_required_edge(reservation_price, config.edge_buffer)
+        threshold = reservation_price * (1 - req_edge)
+        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
+        return None
 
-    # Screen by utility: accounts for existing positions (edge alone doesn't)
+    # Simulate trade and compute utility gain (screening only — require positive)
     new_portfolio = portfolio.simulate_buy_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
     if utility_gain <= 0:
-        reject(f"non-positive utility ({utility_gain:.6f}), fair={reservation_price:.1%} vwap={vwap:.1%}")
+        reject(f"non-positive utility ({utility_gain:.6f})")
         return None
 
     return TradeCandidate(
@@ -879,7 +886,7 @@ def _generate_sell_no_candidate(
         return None
     best_no_price = 1.0 - best_yes_ask
 
-    # Screening chunk for candidate generation
+    # Small screening chunk for marginal utility estimation
     delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
@@ -938,7 +945,7 @@ def _generate_sell_no_candidate(
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # Screening: only require positive utility (actual sizing done by optimizer)
+    # Screening: only require positive utility (min_sell_utility applied in optimizer)
     if utility_gain <= 0:
         logger.debug(
             f"SELL_NO bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"

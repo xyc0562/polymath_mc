@@ -438,19 +438,13 @@ class GASKellyTradingBot:
         except RuntimeError:
             self._event_loop = None
 
-        # Extract market bin boundaries
-        # Bins should be sorted by upper_bound (inf will naturally sort last)
-        sorted_bins = sorted(bins, key=lambda x: x.get("upper_bound", 0))
+        # Extract market bin boundaries from API-provided bounds
+        sorted_bins = sorted(bins, key=lambda x: x.get("lower_bound", 0))
         self._market_bins = []
-        prev_upper = -1
         for b in sorted_bins:
+            lower = b.get("lower_bound", 0)
             upper = b.get("upper_bound", 0)
-            # Lower bound is previous upper + 1 (or 0 for first bin)
-            lower = prev_upper + 1
             self._market_bins.append((lower, upper))
-            # For inf upper bounds, don't update prev_upper (shouldn't matter as it's last)
-            if upper != float('inf'):
-                prev_upper = upper
 
         # Log bins with readable format
         first_bin = self._market_bins[0]
