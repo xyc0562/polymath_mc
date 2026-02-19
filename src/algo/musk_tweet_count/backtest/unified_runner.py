@@ -1,8 +1,8 @@
 """
 Unified backtest runner that uses the SAME trading logic as production.
 
-This runner uses the Kelly module's UnifiedKellyExecutor with backtest backends,
-ensuring that backtest and production trading logic are identical.
+This runner uses KellyExecutor with backtest backends, ensuring that
+backtest and production trading logic are identical (including optimal sizing).
 """
 
 import logging
@@ -20,7 +20,7 @@ from .data_provider import (
 # Import Kelly trading infrastructure
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, EventTradingRulesConfig
 from ..kelly.portfolio import Portfolio, BinPosition
-from ..kelly.executor import UnifiedKellyExecutor, TickResult
+from ..kelly.executor import KellyExecutor, TickResult
 from ..kelly.backtest_backend import (
     SimulationConfig,
     BacktestOrderbookProvider,
@@ -140,8 +140,9 @@ class UnifiedBacktestRunner:
     """
     Backtest runner using the SAME trading logic as production.
 
-    Key design: This runner uses UnifiedKellyExecutor with backtest backends,
-    ensuring identical trading logic between backtest and production.
+    Key design: This runner uses KellyExecutor with backtest backends,
+    ensuring identical trading logic between backtest and production
+    (including optimal sizing via _find_optimal_size_on).
     """
 
     def __init__(
@@ -267,8 +268,8 @@ class UnifiedBacktestRunner:
             portfolio=portfolio,
         )
 
-        # Create unified executor
-        executor = UnifiedKellyExecutor(
+        # Create executor (same class as production, with backtest backends)
+        executor = KellyExecutor(
             config=kelly_config,
             portfolio=portfolio,
             orderbook_provider=orderbook_provider,

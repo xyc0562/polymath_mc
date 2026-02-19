@@ -35,11 +35,11 @@ MIN_ORDER_VALUE_USD = 1.0
 # Orders below this will be rejected by the API
 MIN_ORDER_SIZE = 15
 
-# Screening chunk size as fraction of c_bin_max for candidate generation.
-# Must be large enough that genuine edge produces utility_gain > min_buy_utility.
-# Old adaptive delta used ~2% of c_event_max × kappa. We use 50% of c_bin_max
-# as a reasonable proxy (actual sizing is done by _find_optimal_size_on).
-SCREENING_CHUNK_RATIO = 0.5
+# Fixed screening chunk size in USD for candidate generation.
+# Small enough that utility gain is nearly linear (not affected by position),
+# so edge-based ranking is valid. Actual sizing is done by the binary search
+# in _find_optimal_size_on.
+SCREENING_CHUNK_USD = 2.0
 
 
 def check_orderbook_liquidity(
@@ -522,8 +522,9 @@ def generate_candidates(
     sells = [c for c in candidates if c.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)]
     buys = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
 
-    # Sort buys by utility gain (descending)
-    buys.sort(key=lambda c: c.utility_gain, reverse=True)
+    # Sort buys by edge (descending) — edge is a better proxy for marginal
+    # utility than utility_gain, which depends on the arbitrary screening chunk size.
+    buys.sort(key=lambda c: c.edge, reverse=True)
 
     # Sells come first, then buys
     return sells + buys
@@ -557,39 +558,31 @@ def _generate_buy_yes_candidate(
         reject("no ask price")
         return None
 
-    # Screening chunk: just enough to test if a trade opportunity exists.
+    # Screening chunk: small fixed USD amount to test if a trade opportunity exists.
     # Actual sizing is done by the binary search in _find_optimal_size_on.
-    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_ask
 
-    # Polymarket minimum: $1 value OR 15 shares (reject only if BOTH below)
-    if delta_usd < MIN_ORDER_VALUE_USD and delta < MIN_ORDER_SIZE:
-        reject(f"below minimum (${delta_usd:.2f} < ${MIN_ORDER_VALUE_USD} and {delta:.1f} < {MIN_ORDER_SIZE} shares)")
+    # Check we have at least some capital
+    if portfolio.available_capital < MIN_ORDER_VALUE_USD:
+        reject(f"insufficient capital (${portfolio.available_capital:.2f})")
         return None
 
-    # Check we have capital
-    if portfolio.available_capital < delta_usd:
-        reject(f"insufficient capital (need ${delta_usd:.2f})")
-        return None
-
-    # Check collateral limits
+    # Check collateral limits (rough check — exact sizing done later)
     position = portfolio.get_position(bin_index)
     current_bin_collateral = position.collateral_used if position else 0.0
     total_collateral = portfolio.total_collateral_used
 
-    # Estimate new collateral (will be refined after VWAP)
-    estimated_new_collateral = delta_usd
-
     if config.collateral.c_bin_max > 0:
-        if current_bin_collateral + estimated_new_collateral > config.collateral.c_bin_max:
-            reject(f"bin collateral limit (${current_bin_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+        if current_bin_collateral >= config.collateral.c_bin_max:
+            reject(f"bin collateral limit (${current_bin_collateral:.0f} >= ${config.collateral.c_bin_max:.0f})")
             return None
 
     if config.collateral.c_event_max > 0:
-        if total_collateral + estimated_new_collateral > config.collateral.c_event_max:
-            reject(f"event collateral limit (${total_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+        if total_collateral >= config.collateral.c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.c_event_max:.0f})")
             return None
 
     # Get VWAP for this chunk
@@ -597,18 +590,6 @@ def _generate_buy_yes_candidate(
     if filled <= 0:
         reject(f"no fill at delta={delta:.2f}")
         return None
-
-    # Re-check collateral limits with actual VWAP price (more accurate than estimate)
-    actual_new_collateral = filled * vwap
-    if config.collateral.c_bin_max > 0:
-        if current_bin_collateral + actual_new_collateral > config.collateral.c_bin_max:
-            reject(f"bin collateral limit with VWAP (${current_bin_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
-            return None
-
-    if config.collateral.c_event_max > 0:
-        if total_collateral + actual_new_collateral > config.collateral.c_event_max:
-            reject(f"event collateral limit with VWAP (${total_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
-            return None
 
     # Check minimum perceived probability (from our model)
     # Use actual model probability, not Kelly reservation price
@@ -622,21 +603,17 @@ def _generate_buy_yes_candidate(
         reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
-    # Check edge requirement
-    trade_ok, actual_edge = should_trade(
+    # Compute edge for ranking/logging
+    _, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_YES, config.edge_buffer
     )
-    if not trade_ok:
-        threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
-        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
-        return None
 
-    # Simulate trade and compute utility gain
+    # Screen by utility: accounts for existing positions (edge alone doesn't)
     new_portfolio = portfolio.simulate_buy_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.min_buy_utility:
-        reject(f"utility too low ({utility_gain:.6f} < {config.min_buy_utility:.6f})")
+    if utility_gain <= 0:
+        reject(f"non-positive utility ({utility_gain:.6f}), fair={reservation_price:.1%} vwap={vwap:.1%}")
         return None
 
     return TradeCandidate(
@@ -688,13 +665,12 @@ def _generate_sell_yes_candidate(
         return None
 
     # Screening chunk for candidate generation
-    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
     delta = delta_usd / best_bid
 
     # Don't sell more than we have
-    # Exit full position when edge is gone
     delta = min(delta, position.yes_shares)
 
     # Floor to 2 decimal places to avoid "not enough balance" errors
@@ -747,10 +723,10 @@ def _generate_sell_yes_candidate(
     new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # Sells require min_sell_utility (higher bar than buys to prevent cycling)
-    if utility_gain < config.min_sell_utility:
+    # Screening: only require positive utility (actual sizing done by optimizer)
+    if utility_gain <= 0:
         logger.debug(
-            f"SELL_YES bin {bin_index}: utility too low ({utility_gain:.6f} < {config.min_sell_utility:.6f}), skipping"
+            f"SELL_YES bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"
         )
         return None
 
@@ -796,55 +772,37 @@ def _generate_buy_no_candidate(
         return None
     best_no_price = 1.0 - best_yes_bid
 
-    # Screening chunk for candidate generation
-    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
+    # Screening chunk: small fixed USD amount to test if a trade opportunity exists.
+    # Actual sizing is done by the binary search in _find_optimal_size_on.
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares for VWAP calculation
     delta = delta_usd / best_no_price
 
-    # Polymarket minimum: $1 value OR 15 shares (reject only if BOTH below)
-    if delta_usd < MIN_ORDER_VALUE_USD and delta < MIN_ORDER_SIZE:
-        reject(f"below minimum (${delta_usd:.2f} < ${MIN_ORDER_VALUE_USD} and {delta:.1f} < {MIN_ORDER_SIZE} shares)")
+    # Check we have at least some capital
+    if portfolio.available_capital < MIN_ORDER_VALUE_USD:
+        reject(f"insufficient capital (${portfolio.available_capital:.2f})")
         return None
 
-    if portfolio.available_capital < delta_usd:
-        reject(f"insufficient capital (need ${delta_usd:.2f})")
-        return None
-
-    # Check collateral limits
+    # Check collateral limits (rough check — exact sizing done later)
     position = portfolio.get_position(bin_index)
     current_bin_collateral = position.collateral_used if position else 0.0
     total_collateral = portfolio.total_collateral_used
 
-    # Estimate new collateral (will be refined after VWAP)
-    estimated_new_collateral = delta_usd
-
     if config.collateral.c_bin_max > 0:
-        if current_bin_collateral + estimated_new_collateral > config.collateral.c_bin_max:
-            reject(f"bin collateral limit (${current_bin_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
+        if current_bin_collateral >= config.collateral.c_bin_max:
+            reject(f"bin collateral limit (${current_bin_collateral:.0f} >= ${config.collateral.c_bin_max:.0f})")
             return None
 
     if config.collateral.c_event_max > 0:
-        if total_collateral + estimated_new_collateral > config.collateral.c_event_max:
-            reject(f"event collateral limit (${total_collateral:.0f} + ${estimated_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
+        if total_collateral >= config.collateral.c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.c_event_max:.0f})")
             return None
 
     vwap, filled, worst_price = compute_vwap_buy_no(orderbook, delta)
     if filled <= 0:
         reject(f"no fill at delta={delta:.2f}")
         return None
-
-    # Re-check collateral limits with actual VWAP price (more accurate than estimate)
-    actual_new_collateral = filled * vwap
-    if config.collateral.c_bin_max > 0:
-        if current_bin_collateral + actual_new_collateral > config.collateral.c_bin_max:
-            reject(f"bin collateral limit with VWAP (${current_bin_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_bin_max:.0f})")
-            return None
-
-    if config.collateral.c_event_max > 0:
-        if total_collateral + actual_new_collateral > config.collateral.c_event_max:
-            reject(f"event collateral limit with VWAP (${total_collateral:.0f} + ${actual_new_collateral:.0f} > ${config.collateral.c_event_max:.0f})")
-            return None
 
     # Check minimum perceived probability (from our model)
     # Use actual model probability for NO, not Kelly reservation price
@@ -858,20 +816,17 @@ def _generate_buy_no_candidate(
         reject(f"market price too low ({vwap:.1%} < {config.edge_buffer.min_market_price:.1%})")
         return None
 
-    trade_ok, actual_edge = should_trade(
+    # Compute edge for ranking/logging
+    _, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
-    if not trade_ok:
-        req_edge = compute_required_edge(reservation_price, config.edge_buffer)
-        threshold = reservation_price * (1 - req_edge)
-        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
-        return None
 
+    # Screen by utility: accounts for existing positions (edge alone doesn't)
     new_portfolio = portfolio.simulate_buy_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    if utility_gain < config.min_buy_utility:
-        reject(f"utility too low ({utility_gain:.6f} < {config.min_buy_utility:.6f})")
+    if utility_gain <= 0:
+        reject(f"non-positive utility ({utility_gain:.6f}), fair={reservation_price:.1%} vwap={vwap:.1%}")
         return None
 
     return TradeCandidate(
@@ -925,13 +880,12 @@ def _generate_sell_no_candidate(
     best_no_price = 1.0 - best_yes_ask
 
     # Screening chunk for candidate generation
-    delta_usd = config.collateral.c_bin_max * SCREENING_CHUNK_RATIO
+    delta_usd = SCREENING_CHUNK_USD
 
     # Convert USD to shares
     delta = delta_usd / best_no_price
 
     # Don't sell more than we have
-    # Exit full position when edge is gone
     delta = min(delta, position.no_shares)
 
     # Floor to 2 decimal places to avoid "not enough balance" errors
@@ -984,10 +938,10 @@ def _generate_sell_no_candidate(
     new_portfolio = portfolio.simulate_sell_no(bin_index, filled, vwap)
     utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
 
-    # Sells require min_sell_utility (higher bar than buys to prevent cycling)
-    if utility_gain < config.min_sell_utility:
+    # Screening: only require positive utility (actual sizing done by optimizer)
+    if utility_gain <= 0:
         logger.debug(
-            f"SELL_NO bin {bin_index}: utility too low ({utility_gain:.6f} < {config.min_sell_utility:.6f}), skipping"
+            f"SELL_NO bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"
         )
         return None
 

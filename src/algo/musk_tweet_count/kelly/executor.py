@@ -531,40 +531,50 @@ class KellyExecutor:
         self,
         config: KellyConfig,
         portfolio: Portfolio,
-        orderbook_manager: OrderbookManager,
-        order_executor: OrderExecutor,
-        token_ids: Dict[int, str],  # bin_index -> YES token_id
-        no_token_ids: Optional[Dict[int, str]] = None,  # bin_index -> NO token_id
+        orderbook_manager: Optional[OrderbookManager] = None,
+        order_executor: Optional[OrderExecutor] = None,
+        token_ids: Dict[int, str] = None,
+        no_token_ids: Optional[Dict[int, str]] = None,
         on_trade: Optional[Callable[[ExecutionResult], None]] = None,
         user_stream: Optional["UserStreamClient"] = None,
         sync_portfolio: Optional[Callable[[], None]] = None,
         event_name: Optional[str] = None,
+        # Abstract backend params for backtest use
+        orderbook_provider=None,   # OrderbookProvider from backend.py
+        trade_executor=None,       # TradeExecutor from backend.py
     ):
         """
         Initialize Kelly executor.
 
+        Production callers pass orderbook_manager + order_executor.
+        Backtest callers pass orderbook_provider + trade_executor.
+
         Args:
             config: Kelly configuration
             portfolio: Portfolio state
-            orderbook_manager: Orderbook manager (WebSocket or REST)
-            order_executor: Order executor
+            orderbook_manager: Orderbook manager (WebSocket or REST) - production
+            order_executor: Order executor - production
             token_ids: Map of bin_index -> YES token_id
             no_token_ids: Map of bin_index -> NO token_id (for BUY_NO/SELL_NO)
             on_trade: Optional callback for trade notifications
             user_stream: Optional UserStreamClient for fill confirmations
             sync_portfolio: Callback to sync portfolio from API before each decision
             event_name: Optional event name for logging (e.g., "Feb 03 - Feb 10")
+            orderbook_provider: Abstract orderbook provider - backtest
+            trade_executor: Abstract trade executor - backtest
         """
         self.config = config
         self.portfolio = portfolio
         self.orderbook_manager = orderbook_manager
         self.order_executor = order_executor
-        self.token_ids = token_ids  # YES token IDs
+        self.token_ids = token_ids or {}
         self.no_token_ids = no_token_ids or {}  # NO token IDs
         self.on_trade = on_trade
         self.user_stream = user_stream
         self.sync_portfolio = sync_portfolio  # Callback to sync from API before each decision
         self.event_name = event_name or "unknown"
+        self.orderbook_provider = orderbook_provider
+        self.trade_executor = trade_executor
 
         # Reverse mapping: token_id -> bin_index (for fill callbacks)
         self.token_to_bin: Dict[str, int] = {v: k for k, v in token_ids.items()}
@@ -945,6 +955,116 @@ class KellyExecutor:
 
         return tick_result
 
+    def run_tick_sync(
+        self,
+        hours_to_settlement: float,
+        verbose: bool = False,
+    ) -> TickResult:
+        """
+        Run a single optimization tick synchronously (for backtest use).
+
+        Uses the same _compute_optimal_trades pipeline as production (including
+        _find_optimal_size_on binary search), then executes via the abstract
+        trade_executor backend.
+
+        Flow mirrors production run_tick: execute batch → refresh orderbooks → recompute → repeat.
+        """
+        start_time = time.time()
+        tick_result = TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+        )
+
+        # Check T_stop
+        if hours_to_settlement <= self.config.t_stop_hours:
+            logger.debug(
+                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
+                "Holding positions to settlement."
+            )
+            return tick_result
+
+        rate_config = self.config.rate_limit
+        max_orders = rate_config.max_orders_per_tick
+        iteration = 0
+
+        while True:
+            iteration += 1
+
+            if tick_result.num_executed >= max_orders:
+                logger.debug(f"Reached max_orders_per_tick={max_orders}")
+                break
+
+            # Get orderbooks via abstract backend
+            orderbooks = self._get_orderbooks()
+            if not orderbooks:
+                logger.debug("No orderbooks available")
+                break
+
+            # Compute optimal trades (greedy simulation on portfolio copy with binary search)
+            planned_trades = self._compute_optimal_trades(
+                orderbooks, hours_to_settlement, verbose=(verbose and iteration == 1)
+            )
+
+            if not planned_trades:
+                logger.debug(f"iter={iteration}: no trades to execute")
+                break
+
+            # Cap by remaining order budget
+            orders_remaining = max_orders - tick_result.num_executed
+            if len(planned_trades) > orders_remaining:
+                planned_trades = planned_trades[:orders_remaining]
+
+            tick_result.num_candidates += len(planned_trades)
+
+            # Execute each planned trade via abstract backend
+            executed_any = False
+            for trade in planned_trades:
+                token_id = self._get_token_id_for_action(trade)
+                if not token_id:
+                    # Fallback for backtest (no NO token IDs)
+                    token_id = self.token_ids.get(trade.bin_index, f"token_{trade.bin_index}")
+
+                from .backend import ExecutionResult as BackendExecutionResult
+                backend_result = self.trade_executor.execute(trade, token_id)
+
+                result = ExecutionResult(
+                    success=backend_result.success,
+                    candidate=trade,
+                    order_id=backend_result.order_id,
+                    filled_size=backend_result.filled_size,
+                    filled_price=backend_result.filled_price,
+                    error=backend_result.error,
+                    is_pending=False,
+                )
+                tick_result.executions.append(result)
+
+                if result.success:
+                    tick_result.num_executed += 1
+                    tick_result.total_utility_gain += trade.utility_gain
+                    executed_any = True
+
+                    if self.on_trade:
+                        self.on_trade(result)
+
+                    logger.debug(
+                        f"Executed: {trade.action.value} bin={trade.bin_index} "
+                        f"size={trade.size:.2f} @ {trade.price:.4f} "
+                        f"utility_gain={trade.utility_gain:.6f} edge={trade.edge:.2%}"
+                    )
+                else:
+                    logger.warning(f"Execution failed: {result.error}")
+
+            if not executed_any:
+                break
+
+            # Refresh orderbooks for next iteration (re-sync via abstract backend)
+            if self.orderbook_provider is not None:
+                self.orderbook_provider.refresh()
+
+        tick_result.elapsed_seconds = time.time() - start_time
+        return tick_result
+
     def _find_optimal_size(
         self,
         candidate: TradeCandidate,
@@ -1103,7 +1223,7 @@ class KellyExecutor:
             if not buy_candidates:
                 return True  # No buy candidates left = overshot
 
-            best_buy = buy_candidates[0]  # Already sorted by utility descending
+            best_buy = buy_candidates[0]  # Already sorted by edge descending
             return not (best_buy.bin_index == bin_index and best_buy.action == action)
         else:
             # For sells: check if opposing BUY for the same bin appeared
@@ -1166,16 +1286,14 @@ class KellyExecutor:
             return is_buy  # Buys: overshot; Sells: fully exited, fine
 
         if is_buy:
-            # Overshoot = this bin is no longer the best buy after the fill.
-            # The simulation loop handles alternating between bins.
-            buy_candidates = [
-                c for c in new_candidates
-                if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
-            ]
-            if not buy_candidates:
-                return True
-            best_buy = buy_candidates[0]
-            return not (best_buy.bin_index == bin_index and best_buy.action == action)
+            # Overshoot = this bin no longer has positive utility after the fill.
+            # We don't check if it's still the "best" buy — the greedy loop in
+            # _compute_optimal_trades handles switching between competing bins.
+            # Here we only care: have we passed this bin's Kelly-optimal point?
+            for c in new_candidates:
+                if c.bin_index == bin_index and c.action == action:
+                    return False  # Still has positive utility, not overshot
+            return True  # This bin dropped out of candidates entirely
         else:
             opposing = (
                 TradeAction.BUY_YES if action == TradeAction.SELL_YES
@@ -1257,6 +1375,7 @@ class KellyExecutor:
 
         br = self._bin_range(candidate.bin_index)
         bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
+
         logger.debug(
             f"[{self.event_name}] Full chunk ({full_size:.0f} shares) overshoots for "
             f"{candidate.action.value} {bin_info}, binary searching..."
@@ -1327,15 +1446,14 @@ class KellyExecutor:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
                 break
 
-            # Pick best candidate (sells come first, then buys by utility)
+            # Pick best candidate (sells come first, then buys by edge)
             best = candidates[0]
 
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-            if best.utility_gain < min_util:
+            # Screening uses a small $2 chunk so utility is tiny — just require positive
+            if best.utility_gain <= 0:
                 logger.debug(
                     f"[{self.event_name}][SIM iter={sim_iter}] Best candidate utility "
-                    f"{best.utility_gain:.6f} < {min_util}, stopping"
+                    f"{best.utility_gain:.6f} <= 0, stopping"
                 )
                 break
 
@@ -1345,9 +1463,7 @@ class KellyExecutor:
                 if not candidates:
                     break
                 best = candidates[0]
-                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-                if best.utility_gain < min_util:
+                if best.utility_gain <= 0:
                     break
                 if self._is_bin_in_fak_cooldown(best.bin_index):
                     break
@@ -1380,13 +1496,62 @@ class KellyExecutor:
             )
 
         if planned_trades:
+            # Merge trades for the same (bin_index, action) into single orders.
+            # The greedy loop may produce many small trades for the same bin
+            # (e.g., 25 × 2-share BUY_NO for bin 14). Merge them so execution
+            # is one order per (bin, action).
+            merged = self._merge_planned_trades(planned_trades)
             logger.info(
-                f"[{self.event_name}] Simulation complete: {len(planned_trades)} trades planned"
+                f"[{self.event_name}] Simulation complete: {len(planned_trades)} trades planned, "
+                f"{len(merged)} after merging"
             )
+            return merged
         else:
             logger.debug(f"[{self.event_name}] Simulation complete: no trades needed")
+            return planned_trades
 
-        return planned_trades
+    def _merge_planned_trades(self, trades: List[TradeCandidate]) -> List[TradeCandidate]:
+        """
+        Merge planned trades for the same (bin_index, action) into single orders.
+
+        The greedy simulation may produce many small trades for the same bin
+        (e.g., 25 × 2-share BUY_NO). Merging them into one order per (bin, action)
+        is more efficient for execution.
+
+        Uses VWAP for price and sums sizes and utility gains.
+        """
+        from collections import OrderedDict
+        merged: OrderedDict[tuple, TradeCandidate] = OrderedDict()
+
+        for t in trades:
+            key = (t.bin_index, t.action)
+            if key in merged:
+                existing = merged[key]
+                # VWAP: weighted average price
+                total_size = existing.size + t.size
+                if total_size > 0:
+                    existing.price = (existing.price * existing.size + t.price * t.size) / total_size
+                existing.size = total_size
+                existing.utility_gain += t.utility_gain
+                # Keep the worst limit_price (highest for buys, lowest for sells)
+                if t.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+                    existing.limit_price = max(existing.limit_price, t.limit_price)
+                else:
+                    existing.limit_price = min(existing.limit_price, t.limit_price) if existing.limit_price > 0 else t.limit_price
+            else:
+                # Clone to avoid mutating the original
+                merged[key] = TradeCandidate(
+                    bin_index=t.bin_index,
+                    action=t.action,
+                    size=t.size,
+                    price=t.price,
+                    utility_gain=t.utility_gain,
+                    reservation_price=t.reservation_price,
+                    edge=t.edge,
+                    limit_price=t.limit_price,
+                )
+
+        return list(merged.values())
 
     def _simulate_trade(self, portfolio: Portfolio, candidate: TradeCandidate) -> Portfolio:
         """
@@ -1416,10 +1581,15 @@ class KellyExecutor:
         return new_p
 
     def _get_token_id_for_action(self, candidate: TradeCandidate) -> Optional[str]:
-        """Get the token_id for a candidate's action (YES or NO token)."""
+        """Get the token_id for a candidate's action (YES or NO token).
+
+        For backtest mode (no NO token IDs), returns None so the caller can
+        fall back to the YES token_id (which is just a placeholder string).
+        """
         if candidate.action in (TradeAction.BUY_NO, TradeAction.SELL_NO):
             token_id = self.no_token_ids.get(candidate.bin_index)
-            if not token_id:
+            if not token_id and self.order_executor is not None:
+                # Only warn in production mode (backtest uses fallback)
                 logger.warning(f"No NO token_id for bin {candidate.bin_index}")
             return token_id
         else:
@@ -1437,6 +1607,8 @@ class KellyExecutor:
 
     def _get_orderbooks(self) -> Dict[int, UnifiedOrderbook]:
         """Get current orderbooks for all bins."""
+        if self.orderbook_provider is not None:
+            return self.orderbook_provider.get_all_orderbooks()
         orderbooks = {}
         for bin_index, token_id in self.token_ids.items():
             ob = self.orderbook_manager.get_orderbook(token_id)
@@ -1781,308 +1953,6 @@ class KellyExecutor:
     def stop(self) -> None:
         """Signal executor to stop."""
         self._running = False
-
-    def get_portfolio_summary(self) -> dict:
-        """Get current portfolio summary."""
-        return self.portfolio.to_summary()
-
-
-class UnifiedKellyExecutor:
-    """
-    Backend-agnostic Kelly executor that works with abstract interfaces.
-
-    This executor can be used for both live trading and backtesting by
-    swapping out the backend implementations:
-    - Live: Use LiveOrderbookProvider, LiveTradeExecutor
-    - Backtest: Use BacktestOrderbookProvider, BacktestTradeExecutor
-
-    The trading logic (candidate generation, utility calculation) is
-    identical regardless of backend.
-    """
-
-    def __init__(
-        self,
-        config: KellyConfig,
-        portfolio: Portfolio,
-        orderbook_provider,  # OrderbookProvider (from backend.py)
-        trade_executor,  # TradeExecutor (from backend.py)
-        token_ids: Dict[int, str],
-        on_trade: Optional[Callable[["ExecutionResult"], None]] = None,
-    ):
-        """
-        Initialize unified Kelly executor.
-
-        Args:
-            config: Kelly configuration
-            portfolio: Portfolio state
-            orderbook_provider: Abstract orderbook provider
-            trade_executor: Abstract trade executor
-            token_ids: Map of bin_index -> YES token_id
-            on_trade: Optional callback for trade notifications
-        """
-        self.config = config
-        self.portfolio = portfolio
-        self.orderbook_provider = orderbook_provider
-        self.trade_executor = trade_executor
-        self.token_ids = token_ids
-        self.on_trade = on_trade
-
-        # Rate limiting state (used for live trading, no-op for backtest)
-        self._order_timestamps: List[float] = []
-
-    def run_tick_sync(
-        self,
-        hours_to_settlement: float,
-    ) -> TickResult:
-        """
-        Run a single optimization tick (synchronous version).
-
-        This is the main entry point for backtesting where we don't need
-        async delays between orders.
-
-        Args:
-            hours_to_settlement: Hours until market settlement
-
-        Returns:
-            TickResult with execution summary
-        """
-        start_time = time.time()
-        tick_result = TickResult(
-            num_candidates=0,
-            num_executed=0,
-            total_utility_gain=0.0,
-        )
-
-        # Check T_stop
-        if hours_to_settlement <= self.config.t_stop_hours:
-            logger.debug(
-                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
-                "Holding positions to settlement."
-            )
-            return tick_result
-
-        # Get current orderbooks from provider
-        orderbooks = self.orderbook_provider.get_all_orderbooks()
-
-        if not orderbooks:
-            logger.debug("No orderbooks available")
-            return tick_result
-
-        rate_config = self.config.rate_limit
-        orders_this_tick = 0
-
-        for iteration in range(self.config.max_iters_per_tick):
-            # Check per-tick order limit
-            if orders_this_tick >= rate_config.max_orders_per_tick:
-                logger.debug(
-                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
-                )
-                break
-
-            # Generate candidates using production Kelly logic
-            candidates = generate_candidates(
-                portfolio=self.portfolio,
-                orderbooks=orderbooks,
-                config=self.config,
-                hours_to_settlement=hours_to_settlement,
-            )
-
-            if iteration == 0:
-                tick_result.num_candidates = len(candidates)
-
-            if not candidates:
-                logger.debug(f"No candidates at iteration {iteration}")
-                break
-
-            # Get best candidate
-            # Candidates are ordered: [sells..., buys sorted by utility]
-            best = candidates[0]
-
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-            if best.utility_gain < min_util:
-                logger.debug(
-                    f"Best candidate utility {best.utility_gain:.6f} "
-                    f"< {min_util}, stopping"
-                )
-                break
-
-            # Execute trade through abstract executor
-            token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")
-
-            # Import here to avoid circular imports
-            from .backend import ExecutionResult as BackendExecutionResult
-
-            backend_result = self.trade_executor.execute(best, token_id)
-
-            # Convert to TickResult format
-            result = ExecutionResult(
-                success=backend_result.success,
-                candidate=best,
-                order_id=backend_result.order_id,
-                filled_size=backend_result.filled_size,
-                filled_price=backend_result.filled_price,
-                error=backend_result.error,
-            )
-
-            tick_result.executions.append(result)
-
-            if result.success:
-                tick_result.num_executed += 1
-                tick_result.total_utility_gain += best.utility_gain
-                orders_this_tick += 1
-
-                # Record for rate limiting (live trading)
-                self._order_timestamps.append(time.time())
-
-                # Callback
-                if self.on_trade:
-                    self.on_trade(result)
-
-                logger.debug(
-                    f"Executed: {best.action.value} bin={best.bin_index} "
-                    f"size={best.size:.2f} @ {best.price:.4f} "
-                    f"utility_gain={best.utility_gain:.6f} edge={best.edge:.2%}"
-                )
-            else:
-                logger.warning(f"Execution failed: {result.error}")
-                break
-
-            # Refresh orderbooks for next iteration
-            self.orderbook_provider.refresh()
-            orderbooks = self.orderbook_provider.get_all_orderbooks()
-
-        tick_result.elapsed_seconds = time.time() - start_time
-        return tick_result
-
-    async def run_tick(
-        self,
-        hours_to_settlement: float,
-        verbose: bool = False,
-    ) -> TickResult:
-        """
-        Run a single optimization tick (async version for live trading).
-
-        Includes rate limiting delays between orders.
-
-        Args:
-            hours_to_settlement: Hours until market settlement
-            verbose: If True, log detailed rejection reasons for candidates
-        """
-        start_time = time.time()
-        tick_result = TickResult(
-            num_candidates=0,
-            num_executed=0,
-            total_utility_gain=0.0,
-        )
-
-        # Check T_stop
-        if hours_to_settlement <= self.config.t_stop_hours:
-            logger.info(
-                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
-                "Holding positions to settlement."
-            )
-            return tick_result
-
-        orderbooks = self.orderbook_provider.get_all_orderbooks()
-
-        if not orderbooks:
-            return tick_result
-
-        rate_config = self.config.rate_limit
-        orders_this_tick = 0
-
-        for iteration in range(self.config.max_iters_per_tick):
-            if orders_this_tick >= rate_config.max_orders_per_tick:
-                logger.info(
-                    f"Reached max orders per tick ({rate_config.max_orders_per_tick})"
-                )
-                break
-
-            # Check rate limit
-            if not self._check_rate_limit(rate_config):
-                logger.info("Rate limit reached, stopping tick early")
-                break
-
-            # Generate candidates (verbose on first iteration)
-            candidates = generate_candidates(
-                portfolio=self.portfolio,
-                orderbooks=orderbooks,
-                config=self.config,
-                hours_to_settlement=hours_to_settlement,
-                verbose=(verbose and iteration == 0),
-            )
-
-            if iteration == 0:
-                tick_result.num_candidates = len(candidates)
-
-            if not candidates:
-                break
-
-            # Candidates are ordered: [sells..., buys sorted by utility]
-            best = candidates[0]
-
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-            if best.utility_gain < min_util:
-                break
-
-            token_id = self.token_ids.get(best.bin_index, f"token_{best.bin_index}")
-
-            from .backend import ExecutionResult as BackendExecutionResult
-
-            backend_result = self.trade_executor.execute(best, token_id)
-
-            result = ExecutionResult(
-                success=backend_result.success,
-                candidate=best,
-                order_id=backend_result.order_id,
-                filled_size=backend_result.filled_size,
-                filled_price=backend_result.filled_price,
-                error=backend_result.error,
-            )
-
-            tick_result.executions.append(result)
-
-            if result.success:
-                tick_result.num_executed += 1
-                tick_result.total_utility_gain += best.utility_gain
-                orders_this_tick += 1
-
-                self._order_timestamps.append(time.time())
-
-                if self.on_trade:
-                    self.on_trade(result)
-
-                logger.info(
-                    f"Executed: {best.action.value} bin={best.bin_index} "
-                    f"size={best.size:.2f} @ {best.price:.4f} "
-                    f"utility_gain={best.utility_gain:.6f} edge={best.edge:.2%}"
-                )
-
-                # Delay between orders for live trading
-                if iteration < self.config.max_iters_per_tick - 1:
-                    await asyncio.sleep(rate_config.min_order_delay_seconds)
-            else:
-                logger.warning(f"Execution failed: {result.error}")
-                break
-
-            self.orderbook_provider.refresh()
-            orderbooks = self.orderbook_provider.get_all_orderbooks()
-
-        tick_result.elapsed_seconds = time.time() - start_time
-        return tick_result
-
-    def _check_rate_limit(self, rate_config) -> bool:
-        """Check if we're within rate limits."""
-        now = time.time()
-        cutoff = now - 60.0
-        self._order_timestamps = [ts for ts in self._order_timestamps if ts > cutoff]
-
-        if len(self._order_timestamps) >= rate_config.max_orders_per_minute:
-            return False
-
-        return True
 
     def get_portfolio_summary(self) -> dict:
         """Get current portfolio summary."""

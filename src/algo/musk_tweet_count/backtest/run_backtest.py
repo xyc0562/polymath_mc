@@ -570,7 +570,7 @@ def main():
                 c_event_max=args.capital,
                 c_bin_max_ratio=args.c_bin_max_ratio,
             ),
-            max_iters_per_tick=1000,
+            max_iters_per_tick=50,
         )
 
         unified_config = UnifiedBacktestConfig(
