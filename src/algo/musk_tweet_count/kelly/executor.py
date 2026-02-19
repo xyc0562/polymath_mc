@@ -1448,15 +1448,15 @@ class KellyExecutor:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
                 break
 
-            # Pick best candidate (sells come first, then buys by utility)
+            # Pick best candidate (sells come first, then buys by utility/$)
+            # Screening uses $2 chunk so utility_gain is tiny — just require positive.
+            # The real min_utility check happens after optimal sizing below.
             best = candidates[0]
 
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-            if best.utility_gain < min_util:
+            if best.utility_gain <= 0:
                 logger.debug(
                     f"[{self.event_name}][SIM iter={sim_iter}] Best candidate utility "
-                    f"{best.utility_gain:.6f} < {min_util}, stopping"
+                    f"{best.utility_gain:.6f} <= 0, stopping"
                 )
                 break
 
@@ -1466,9 +1466,7 @@ class KellyExecutor:
                 if not candidates:
                     break
                 best = candidates[0]
-                is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-                if best.utility_gain < min_util:
+                if best.utility_gain <= 0:
                     break
                 if self._is_bin_in_fak_cooldown(best.bin_index):
                     break
@@ -1487,8 +1485,23 @@ class KellyExecutor:
 
             best.size = optimal_size
 
-            # Simulate trade on hypothetical portfolio (returns NEW copy)
-            hyp = self._simulate_trade(hyp, best)
+            # Compute actual utility gain for the optimally-sized trade
+            hyp_after = self._simulate_trade(hyp, best)
+            from .candidates import _compute_portfolio_utility_gain
+            actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, self.config)
+
+            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
+            if actual_utility < min_util:
+                logger.debug(
+                    f"[{self.event_name}][SIM iter={sim_iter}] Optimal-size utility "
+                    f"{actual_utility:.6f} < {min_util} for {best.action.value} "
+                    f"bin={best.bin_index}, stopping"
+                )
+                break
+
+            best.utility_gain = actual_utility
+            hyp = hyp_after
 
             planned_trades.append(best)
 
