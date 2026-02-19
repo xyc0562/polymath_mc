@@ -371,6 +371,11 @@ def parse_bin_bounds(outcome: str) -> Tuple[int, int]:
         lower = int(outcome[:-1])
         return lower, float('inf')
 
+    # Handle "<X" format (e.g., "<40" -> (0, 39))
+    if outcome.startswith("<"):
+        upper = int(outcome[1:]) - 1
+        return 0, upper
+
     # Handle "X-Y" format
     if "-" in outcome:
         parts = outcome.split("-")
