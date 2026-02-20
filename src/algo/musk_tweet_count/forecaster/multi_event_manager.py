@@ -570,7 +570,7 @@ class MultiEventManager:
         # Get the active event (no await needed, just direct access under lock)
         active = self._active_events.get(event_id)
         if not active:
-            logger.warning(f"Fill for inactive event {event_id} token {token_id[:16]}...")
+            logger.warning(f"Fill for inactive event {event_id} bin={bin_index} token {token_id[:16]}...")
             return
 
         # Route fill to the bot's Kelly executor
@@ -578,11 +578,11 @@ class MultiEventManager:
             if active.bot.kelly_bot and active.bot.kelly_bot.kelly_executor:
                 active.bot.kelly_bot.kelly_executor.handle_fill(fill_event)
                 logger.info(
-                    f"[FILL ROUTED] event={active.info.short_name} bin={bin_index} | "
+                    f"[{active.info.short_name}][FILL ROUTED] bin={bin_index} | "
                     f"size={fill_event.size:.1f} @ {fill_event.price:.3f}"
                 )
         except Exception as e:
-            logger.error(f"Error routing fill to event {event_id}: {e}", exc_info=True)
+            logger.error(f"[{active.info.short_name}] Error routing fill bin={bin_index}: {e}", exc_info=True)
 
     async def _handle_global_stale_order(self, pending: PendingOrder) -> None:
         """
@@ -603,14 +603,14 @@ class MultiEventManager:
 
         active = self._active_events.get(event_id)
         if not active:
-            logger.warning(f"Stale order for inactive event {event_id} token {token_id[:16]}...")
+            logger.warning(f"Stale order for inactive event {event_id} bin={bin_index} token {token_id[:16]}...")
             return
 
         try:
             if active.bot.kelly_bot and active.bot.kelly_bot.kelly_executor:
                 await active.bot.kelly_bot.kelly_executor.handle_stale_order(pending)
         except Exception as e:
-            logger.error(f"Error handling stale order for event {event_id}: {e}", exc_info=True)
+            logger.error(f"[{active.info.short_name}] Error handling stale order bin={bin_index}: {e}", exc_info=True)
 
     def _register_event_tokens(self, event_info: EventInfo) -> None:
         """

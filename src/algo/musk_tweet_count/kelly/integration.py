@@ -128,7 +128,7 @@ class KellyTradingBot:
             initial_capital: Initial USDC capital
             bins: List of bin definitions with upper_bound and token_id
         """
-        logger.info(f"Setting up Kelly bot with {len(bins)} bins, ${initial_capital:.2f} capital")
+        logger.info(f"[{self.event_name}] Setting up Kelly bot with {len(bins)} bins, ${initial_capital:.2f} capital")
 
         # Store bin metadata
         self.num_bins = len(bins)
@@ -174,7 +174,7 @@ class KellyTradingBot:
         if self._external_user_stream:
             self.user_stream = self._external_user_stream
             self._owns_user_stream = False  # Don't stop it in shutdown()
-            logger.info("Using external UserStreamClient for fill confirmations")
+            logger.info(f"[{self.event_name}] Using external UserStreamClient for fill confirmations")
         elif not self.dry_run and self._api_key and self._api_secret:
             self.user_stream = UserStreamClient(
                 api_key=self._api_key,
@@ -184,12 +184,12 @@ class KellyTradingBot:
             self._owns_user_stream = True  # We created it, we stop it
             # Start user stream
             await self.user_stream.start()
-            logger.info("User stream started for fill confirmations")
+            logger.info(f"[{self.event_name}] User stream started for fill confirmations")
         else:
             self.user_stream = None
             self._owns_user_stream = False
             if not self.dry_run:
-                logger.warning("No API credentials for user stream - fill confirmations disabled")
+                logger.warning(f"[{self.event_name}] No API credentials for user stream - fill confirmations disabled")
 
         # Initialize Kelly executor with sync callback
         # The sync callback fetches official portfolio state from API before each decision
@@ -214,11 +214,11 @@ class KellyTradingBot:
             self.user_stream.on_stale_order = self._handle_stale_order
 
         self._setup_complete = True
-        logger.info("Kelly bot setup complete")
+        logger.info(f"[{self.event_name}] Kelly bot setup complete")
 
     async def shutdown(self) -> None:
         """Shutdown the Kelly trading bot."""
-        logger.info("Shutting down Kelly bot")
+        logger.info(f"[{self.event_name}] Shutting down Kelly bot")
         self._running = False
 
         if self.kelly_executor:
@@ -253,12 +253,12 @@ class KellyTradingBot:
         """Callback for order placement (not fill)."""
         if result.success:
             logger.info(
-                f"Order placed (pending fill): {result.candidate.action.value} "
+                f"[{self.event_name}] Order placed (pending fill): {result.candidate.action.value} "
                 f"bin={result.candidate.bin_index} "
                 f"size={result.candidate.size:.2f} @ {result.candidate.price:.4f}"
             )
         else:
-            logger.warning(f"Order placement failed: {result.error}")
+            logger.warning(f"[{self.event_name}] Order placement failed: {result.error}")
 
     def _handle_fill(self, fill_event: FillEvent) -> None:
         """
@@ -302,7 +302,7 @@ class KellyTradingBot:
         # Only log when dead bins change (avoid spam)
         if dead_bins != self._last_logged_dead_bins:
             if dead_bins:
-                logger.info(f"Dead bins (count={current_count}): {dead_bins}")
+                logger.info(f"[{self.event_name}] Dead bins (count={current_count}): {dead_bins}")
             self._last_logged_dead_bins = dead_bins
             self._ema_probabilities = None  # Reset EMA on dead bin change
 
@@ -446,7 +446,7 @@ class KellyTradingBot:
             raise RuntimeError("Bot not setup. Call setup() first.")
 
         self._running = True
-        logger.info("Starting continuous Kelly optimization")
+        logger.info(f"[{self.event_name}] Starting continuous Kelly optimization")
 
         while self._running:
             try:
@@ -459,7 +459,7 @@ class KellyTradingBot:
 
                 # Check T_stop
                 if hours_to_settlement <= self.config.t_stop_hours:
-                    logger.info("Reached T_stop. Holding positions to settlement.")
+                    logger.info(f"[{self.event_name}] Reached T_stop. Holding positions to settlement.")
                     break
 
                 # Run tick
@@ -470,7 +470,7 @@ class KellyTradingBot:
                 )
 
                 logger.info(
-                    f"Tick: candidates={result.num_candidates}, "
+                    f"[{self.event_name}] Tick: candidates={result.num_candidates}, "
                     f"executed={result.num_executed}, "
                     f"utility_gain={result.total_utility_gain:.6f}"
                 )
@@ -481,11 +481,11 @@ class KellyTradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in tick: {e}")
+                logger.error(f"[{self.event_name}] Error in tick: {e}")
                 await asyncio.sleep(tick_interval_seconds)
 
         self._running = False
-        logger.info("Continuous optimization stopped")
+        logger.info(f"[{self.event_name}] Continuous optimization stopped")
 
     def get_portfolio_summary(self) -> Dict:
         """Get current portfolio summary."""
@@ -596,7 +596,7 @@ class KellyTradingBot:
             return positions
 
         except Exception as e:
-            logger.warning(f"Failed to fetch positions from API: {e}", exc_info=True)
+            logger.warning(f"[{self.event_name}] Failed to fetch positions from API: {e}", exc_info=True)
             return {}
 
     async def fetch_usdc_balance(self) -> float:
@@ -617,7 +617,7 @@ class KellyTradingBot:
             logger.debug(f"Fetched USDC balance: ${usdc_balance:.2f}")
             return usdc_balance
         except Exception as e:
-            logger.warning(f"Failed to fetch USDC balance: {e}")
+            logger.warning(f"[{self.event_name}] Failed to fetch USDC balance: {e}")
             return 0.0
 
     async def sync_positions_from_api(self, wallet_address: str) -> Tuple[float, Dict[int, float]]:
@@ -695,13 +695,13 @@ class KellyTradingBot:
                     pos.no_avg_cost = price_used
                     # Recalculate collateral as sum of YES + NO collateral
                     pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
-                    logger.info(f"API sync: bin {bin_idx} NO updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
+                    logger.info(f"[{self.event_name}] API sync: bin {bin_idx} NO updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
                 else:
                     pos.yes_shares = api_shares
                     pos.yes_avg_cost = price_used
                     # Recalculate collateral as sum of YES + NO collateral
                     pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
-                    logger.info(f"API sync: bin {bin_idx} YES updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
+                    logger.info(f"[{self.event_name}] API sync: bin {bin_idx} YES updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
 
             synced_positions[bin_idx] = api_shares
 
@@ -713,7 +713,7 @@ class KellyTradingBot:
 
             # Check YES position - if API doesn't have it and we do, clear it
             if pos.yes_shares > 0.01 and (bin_idx, False) not in api_bin_positions:
-                logger.info(f"API sync: bin {bin_idx} YES cleared {pos.yes_shares:.2f} -> 0 (position closed)")
+                logger.info(f"[{self.event_name}] API sync: bin {bin_idx} YES cleared {pos.yes_shares:.2f} -> 0 (position closed)")
                 pos.yes_shares = 0
                 pos.yes_avg_cost = 0
                 # Recalculate collateral (only NO remains if any)
@@ -721,7 +721,7 @@ class KellyTradingBot:
 
             # Check NO position - if API doesn't have it and we do, clear it
             if pos.no_shares > 0.01 and (bin_idx, True) not in api_bin_positions:
-                logger.info(f"API sync: bin {bin_idx} NO cleared {pos.no_shares:.2f} -> 0 (position closed)")
+                logger.info(f"[{self.event_name}] API sync: bin {bin_idx} NO cleared {pos.no_shares:.2f} -> 0 (position closed)")
                 pos.no_shares = 0
                 pos.no_avg_cost = 0
                 # Recalculate collateral (only YES remains if any)

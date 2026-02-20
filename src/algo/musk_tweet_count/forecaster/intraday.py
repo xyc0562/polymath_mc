@@ -1172,14 +1172,19 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 impulse_samples = rng.negative_binomial(nb_r, nb_p, size=n_simulations)
                 samples += impulse_samples
 
-            logger.debug(
-                f"Bayesian impulse: τ_last={tau_last}, τ_now={tau_now}, "
-                f"k_obs={k_obs}, E_obs={E_obs:.2f}, "
-                f"α_post={alpha_post:.2f}, β_post={beta_post:.2f}, "
-                f"posterior_mean={posterior_mean:.3f}, "
-                f"E_remaining={E_remaining:.2f}, impulse_end={impulse_end_tau}"
-            )
+            silence_min = tau_now - tau_last
+            remaining_min = impulse_end_tau - tau_now
+            expected_next = E_remaining * posterior_mean
+            self._last_impulse = {
+                "silence_min": silence_min,
+                "k_obs": k_obs,
+                "E_obs": E_obs,
+                "rate_mult": posterior_mean,
+                "expected_next": expected_next,
+                "remaining_min": remaining_min,
+            }
         else:
+            self._last_impulse = None
             impulse_end_tau = tau
 
         # --- Bucket component (from impulse_end_tau to end_tau) ---

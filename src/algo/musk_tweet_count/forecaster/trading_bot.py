@@ -771,13 +771,14 @@ class GASKellyTradingBot:
             return result
 
         except Exception as e:
-            logger.error(f"Error in tick: {e}", exc_info=True)
+            logger.error(f"[{self.bot_config.event_name or 'unknown'}] Error in tick: {e}", exc_info=True)
             return None
 
     def _log_tick_result(self, result: TickResult) -> None:
         """Log the result of a tick."""
+        ename = self.bot_config.event_name or "unknown"
         logger.info(
-            f"Tick result: candidates={result.num_candidates}, "
+            f"[{ename}] Tick result: candidates={result.num_candidates}, "
             f"executed={result.num_executed}, "
             f"utility_gain={result.total_utility_gain:.6f}, "
             f"elapsed={result.elapsed_seconds:.2f}s"
@@ -787,13 +788,13 @@ class GASKellyTradingBot:
             if execution.success:
                 # Note: size/price are from candidate, not fill (fill comes via WebSocket)
                 logger.info(
-                    f"  Order placed: {execution.candidate.action.value} "
+                    f"[{ename}]   Order placed: {execution.candidate.action.value} "
                     f"bin={execution.candidate.bin_index} "
                     f"size={execution.candidate.size:.2f} @ {execution.candidate.price:.4f} "
                     f"(pending fill)"
                 )
             else:
-                logger.warning(f"  Order failed: {execution.error}")
+                logger.warning(f"[{ename}]   Order failed: {execution.error}")
 
     def _log_probability_comparison(
         self,
@@ -1161,10 +1162,22 @@ class GASKellyTradingBot:
 
             self._last_monte_carlo_time = datetime.now(self.forecaster.contract_utils.tz)
 
+            # Include impulse info if available
+            impulse_str = ""
+            if hasattr(self.forecaster, '_last_impulse') and self.forecaster._last_impulse:
+                imp = self.forecaster._last_impulse
+                impulse_str = (
+                    f" | impulse: silence={imp['silence_min']:.0f}min, "
+                    f"obs={imp['k_obs']} vs exp={imp['E_obs']:.1f}, "
+                    f"rate={imp['rate_mult']:.2f}x, "
+                    f"{imp['expected_next']:.1f} tweets expected in next {imp['remaining_min']:.0f}min"
+                )
+
             logger.info(
                 f"Monte Carlo recomputed: mean={forecast.mean:.1f}, "
                 f"std={forecast.std:.1f}, "
                 f"90% CI=[{forecast.p5:.0f}, {forecast.p95:.0f}]"
+                f"{impulse_str}"
             )
 
         except Exception as e:

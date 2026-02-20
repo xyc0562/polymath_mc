@@ -205,15 +205,15 @@ class OrderExecutor:
 
             # Basic price validation (library also validates against tick_size range)
             if price <= 0 or price >= 1:
-                logger.warning(f"Invalid price: {price:.4f}")
+                logger.warning(f"[{self.event_name}] Invalid price: {price:.4f}")
                 return None
             if side == "SELL":
                 if rounded_size < 1:
-                    logger.warning(f"Sell size {rounded_size} below minimum 1 share")
+                    logger.warning(f"[{self.event_name}] Sell size {rounded_size} below minimum 1 share")
                     return None
             else:
                 if rounded_size < MIN_ORDER_SIZE and rounded_size * price < MIN_ORDER_VALUE_USD:
-                    logger.warning(f"Buy size {rounded_size} below {MIN_ORDER_SIZE} shares and value ${rounded_size * price:.2f} below ${MIN_ORDER_VALUE_USD}")
+                    logger.warning(f"[{self.event_name}] Buy size {rounded_size} below {MIN_ORDER_SIZE} shares and value ${rounded_size * price:.2f} below ${MIN_ORDER_VALUE_USD}")
                     return None
 
             logger.info(
@@ -235,13 +235,13 @@ class OrderExecutor:
             response = self.client.post_order(signed_order, orderType=OrderType.FAK)
 
             logger.info(
-                f"Order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
+                f"[{self.event_name}] Order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
                 f"order_id={response.get('orderID', 'unknown')}"
             )
             return response
 
         except Exception as e:
-            logger.error(f"Order failed: {e}")
+            logger.error(f"[{self.event_name}] Order failed: {e}")
             self._last_error = str(e)
             return None
 
@@ -263,7 +263,7 @@ class OrderExecutor:
             Order response or None on failure
         """
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would place market {side}: amount={amount:.2f}")
+            logger.info(f"[{self.event_name}][DRY RUN] Would place market {side}: amount={amount:.2f}")
             return {"order_id": "dry_run_market", "status": "simulated"}
 
         try:
@@ -272,25 +272,25 @@ class OrderExecutor:
                 side=side,
                 amount=amount,
             )
-            logger.info(f"Market order placed: {side} {amount:.2f}")
+            logger.info(f"[{self.event_name}] Market order placed: {side} {amount:.2f}")
             return response
 
         except Exception as e:
-            logger.error(f"Market order failed: {e}")
+            logger.error(f"[{self.event_name}] Market order failed: {e}")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would cancel order: {order_id}")
+            logger.info(f"[{self.event_name}][DRY RUN] Would cancel order: {order_id}")
             return True
 
         try:
             self.client.cancel(order_id)
-            logger.info(f"Order cancelled: {order_id}")
+            logger.info(f"[{self.event_name}] Order cancelled: {order_id}")
             return True
         except Exception as e:
-            logger.error(f"Cancel failed: {e}")
+            logger.error(f"[{self.event_name}] Cancel failed: {e}")
             return False
 
     def place_batch_orders(
@@ -345,18 +345,18 @@ class OrderExecutor:
 
             # Validation
             if price <= 0 or price >= 1:
-                logger.warning(f"[BATCH] Invalid price: {price:.4f}, skipping order {i}")
+                logger.warning(f"[{self.event_name}][BATCH] Invalid price: {price:.4f}, skipping order {i}")
                 continue
             if order["side"] == "SELL":
                 if rounded_size < 1:
-                    logger.warning(f"[BATCH] Sell size {rounded_size} below 1 share, skipping order {i}")
+                    logger.warning(f"[{self.event_name}][BATCH] Sell size {rounded_size} below 1 share, skipping order {i}")
                     continue
             else:
                 # FAK orders require maker_amount >= $1.00
                 maker_amount = rounded_size * price
                 if maker_amount < MIN_ORDER_VALUE_USD:
                     logger.warning(
-                        f"[BATCH] Buy maker_amount ${maker_amount:.4f} below "
+                        f"[{self.event_name}][BATCH] Buy maker_amount ${maker_amount:.4f} below "
                         f"${MIN_ORDER_VALUE_USD}, skipping order {i}"
                     )
                     continue
@@ -372,20 +372,20 @@ class OrderExecutor:
                     adj_price, adjusted_size = _best_fak_price(price, rounded_size, "BUY", tick_size=ts)
                     if adjusted_size < 1 or adjusted_size * adj_price < MIN_ORDER_VALUE_USD:
                         logger.warning(
-                            f"[BATCH] No valid FAK size at or below {rounded_size} "
+                            f"[{self.event_name}][BATCH] No valid FAK size at or below {rounded_size} "
                             f"(price={price:.4f}, step={_fak_size_step(price, ts)}), skipping order {i}"
                         )
                         continue
                     if adj_price != price:
                         logger.info(
-                            f"[BATCH] Adjusted price {price:.4f} -> {adj_price:.4f} "
+                            f"[{self.event_name}][BATCH] Adjusted price {price:.4f} -> {adj_price:.4f} "
                             f"(+{round((adj_price - price) * 10000):.0f} ticks) "
                             f"and size {rounded_size} -> {adjusted_size} "
                             f"for 2dp maker_amount (${adjusted_size * adj_price:.4f})"
                         )
                     else:
                         logger.info(
-                            f"[BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
+                            f"[{self.event_name}][BATCH] Adjusted size {rounded_size} -> {adjusted_size} "
                             f"for 2dp maker_amount (${adjusted_size * price:.4f})"
                         )
                     rounded_size = adjusted_size
@@ -407,7 +407,7 @@ class OrderExecutor:
                 signed_args.append(PostOrdersArgs(order=signed, orderType=OrderType.FAK))
                 signed_indices.append(i)
             except Exception as e:
-                logger.error(f"[BATCH] Failed to sign order {i}: {e}")
+                logger.error(f"[{self.event_name}][BATCH] Failed to sign order {i}: {e}")
                 continue
 
         if not signed_args:
@@ -629,7 +629,7 @@ class KellyExecutor:
         # Check orders per minute
         if len(self._order_timestamps) >= rate_config.max_orders_per_minute:
             logger.warning(
-                f"Rate limit hit: {len(self._order_timestamps)} orders in last minute "
+                f"[{self.event_name}] Rate limit hit: {len(self._order_timestamps)} orders in last minute "
                 f"(max: {rate_config.max_orders_per_minute})"
             )
             return False
@@ -663,8 +663,10 @@ class KellyExecutor:
         """Record a FAK order failure for cooldown tracking."""
         self._fak_failure_times[bin_index] = time.time()
         cooldown = self.config.rate_limit.fak_failure_cooldown_seconds
+        br = self._bin_range(bin_index)
+        bin_info = f"bin={bin_index} ({br})" if br else f"bin={bin_index}"
         logger.info(
-            f"FAK order failed for bin {bin_index}, cooldown for {cooldown:.0f}s"
+            f"[{self.event_name}] FAK order failed for {bin_info}, cooldown for {cooldown:.0f}s"
         )
 
     async def run_tick(
@@ -700,7 +702,7 @@ class KellyExecutor:
         # Check T_stop
         if hours_to_settlement <= self.config.t_stop_hours:
             logger.info(
-                f"Past T_stop ({self.config.t_stop_hours}h before settlement). "
+                f"[{self.event_name}] Past T_stop ({self.config.t_stop_hours}h before settlement). "
                 "Holding positions to settlement."
             )
             return tick_result
@@ -1400,7 +1402,7 @@ class KellyExecutor:
 
         optimal = max(1.0, math.floor(best_valid))
 
-        logger.info(
+        logger.debug(
             f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
             f"{optimal:.0f} shares (max was {full_size:.0f})"
         )
@@ -1663,8 +1665,10 @@ class KellyExecutor:
         collateral_after = self.portfolio.total_collateral_used
         pos = self.portfolio.get_position(bin_index)
         shares_str = f"YES:{pos.yes_shares:.1f} NO:{pos.no_shares:.1f}" if pos else "none"
+        br = self._bin_range(bin_index)
+        bin_label = f"bin={bin_index} ({br})" if br else f"bin={bin_index}"
         logger.info(
-            f"[PORTFOLIO UPDATE] {action.value} bin={bin_index} | "
+            f"[{self.event_name}][PORTFOLIO UPDATE] {action.value} {bin_label} | "
             f"{size:.1f} @ {price:.4f} = ${size * price:.2f} | "
             f"invested: ${collateral_before:.2f} -> ${collateral_after:.2f} | "
             f"position: {shares_str}"
@@ -1685,22 +1689,24 @@ class KellyExecutor:
         """
         order_id = fill_event.order_id
         if not order_id:
-            logger.warning("Received fill event with no order_id")
+            logger.warning(f"[{self.event_name}] Received fill event with no order_id")
             return
 
         # Look up the pending order
         pending_info = self._pending_orders.get(order_id)
         if not pending_info:
             # This fill might be from a previous session or manual order
-            logger.info(f"Fill for unknown order {order_id[:16]}... - may be from previous session or manual trade")
+            logger.info(f"[{self.event_name}] Fill for unknown order {order_id[:16]}... - may be from previous session or manual trade")
             return
 
         candidate, token_id = pending_info
 
         from .user_stream import OrderStatus
         status_str = fill_event.status.name if hasattr(fill_event.status, 'name') else str(fill_event.status)
+        br = self._bin_range(candidate.bin_index)
+        bin_label = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
         logger.info(
-            f"[FILL {status_str}] {candidate.action.value} bin={candidate.bin_index} | "
+            f"[{self.event_name}][FILL {status_str}] {candidate.action.value} {bin_label} | "
             f"{fill_event.size:.1f} @ {fill_event.price:.4f} = ${fill_event.size * fill_event.price:.2f}"
         )
 
@@ -1727,18 +1733,20 @@ class KellyExecutor:
         """
         order_id = pending.order_id
 
+        br = self._bin_range(pending.bin_index)
+        bin_label = f"bin={pending.bin_index} ({br})" if br else f"bin={pending.bin_index}"
         logger.warning(
-            f"Cancelling stale order: {order_id[:16]}..., "
-            f"bin={pending.bin_index}, size={pending.size:.2f} @ {pending.price:.4f}"
+            f"[{self.event_name}] Cancelling stale order: {order_id[:16]}..., "
+            f"{bin_label}, size={pending.size:.2f} @ {pending.price:.4f}"
         )
 
         # Cancel via order executor (may fail for FAK orders already killed by exchange)
         success = self.order_executor.cancel_order(order_id)
 
         if success:
-            logger.info(f"Stale order {order_id[:16]}... cancelled successfully")
+            logger.info(f"[{self.event_name}] Stale order {order_id[:16]}... cancelled successfully")
         else:
-            logger.warning(f"Cancel failed for stale order {order_id[:16]}... (likely already dead FAK)")
+            logger.warning(f"[{self.event_name}] Cancel failed for stale order {order_id[:16]}... (likely already dead FAK)")
 
         # Always clean up local tracking — for FAK orders the unfilled remainder
         # is already killed by the exchange, keeping it just causes stale loops
@@ -1909,13 +1917,15 @@ class KellyExecutor:
         capital = self.portfolio.capital if self.portfolio else 0
         total_collateral = self.portfolio.total_collateral_used if self.portfolio else 0
 
+        br = self._bin_range(candidate.bin_index)
+        bin_label = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
         logger.info(
-            f"[FILL ✓] {now} | {candidate.action.value} bin={candidate.bin_index} | "
+            f"[{self.event_name}][FILL] {now} | {candidate.action.value} {bin_label} | "
             f"{filled_size:.1f} @ {filled_price:.3f} (req: {candidate.size:.1f} @ {candidate.price:.3f}) | "
             f"slip={slippage_bps:.0f}bps"
         )
         logger.info(
-            f"  → portfolio: ${capital:.2f} capital, ${total_collateral:.2f} collateral | "
+            f"[{self.event_name}]  -> portfolio: ${capital:.2f} capital, ${total_collateral:.2f} collateral | "
             f"order={order_id[:16]}..."
         )
 
@@ -1934,7 +1944,7 @@ class KellyExecutor:
             stop_event: Optional event to signal stop
         """
         self._running = True
-        logger.info("Starting continuous Kelly optimization")
+        logger.info(f"[{self.event_name}] Starting continuous Kelly optimization")
 
         while self._running:
             if stop_event and stop_event.is_set():
@@ -1945,14 +1955,14 @@ class KellyExecutor:
 
                 # Stop if past T_stop
                 if hours <= self.config.t_stop_hours:
-                    logger.info("Reached T_stop. Stopping optimization.")
+                    logger.info(f"[{self.event_name}] Reached T_stop. Stopping optimization.")
                     break
 
                 # Run tick
                 result = await self.run_tick(hours)
 
                 logger.info(
-                    f"Tick complete: candidates={result.num_candidates}, "
+                    f"[{self.event_name}] Tick complete: candidates={result.num_candidates}, "
                     f"executed={result.num_executed}, "
                     f"utility_gain={result.total_utility_gain:.6f}, "
                     f"elapsed={result.elapsed_seconds:.2f}s"
@@ -1962,11 +1972,11 @@ class KellyExecutor:
                 await asyncio.sleep(tick_interval_seconds)
 
             except Exception as e:
-                logger.error(f"Error in tick: {e}")
+                logger.error(f"[{self.event_name}] Error in tick: {e}")
                 await asyncio.sleep(tick_interval_seconds)
 
         self._running = False
-        logger.info("Kelly optimization stopped")
+        logger.info(f"[{self.event_name}] Kelly optimization stopped")
 
     def stop(self) -> None:
         """Signal executor to stop."""
