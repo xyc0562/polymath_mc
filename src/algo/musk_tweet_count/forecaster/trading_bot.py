@@ -1164,8 +1164,9 @@ class GASKellyTradingBot:
 
             # Include impulse info if available
             impulse_str = ""
-            if hasattr(self.forecaster, '_last_impulse') and self.forecaster._last_impulse:
-                imp = self.forecaster._last_impulse
+            nowcast = getattr(self.forecaster, 'nowcast', None)
+            if nowcast and hasattr(nowcast, '_last_impulse') and nowcast._last_impulse:
+                imp = nowcast._last_impulse
                 impulse_str = (
                     f" | impulse: silence={imp['silence_min']:.0f}min, "
                     f"obs={imp['k_obs']} vs exp={imp['E_obs']:.1f}, "
