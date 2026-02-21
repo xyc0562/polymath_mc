@@ -939,27 +939,25 @@ class UnifiedBacktestRunner:
         portfolio: Portfolio,
         winner_bin: Optional[int],
     ) -> Dict[int, float]:
-        """Calculate P&L for each bin."""
+        """Calculate P&L for each bin (handles both YES and NO in same bin)."""
         pnl_by_bin = {}
 
         for bin_index, pos in portfolio.positions.items():
             if not (pos.has_yes_position or pos.has_no_position):
                 continue
 
-            if bin_index == winner_bin:
-                if pos.has_yes_position:
-                    pnl = pos.yes_shares * 1.0 - (pos.yes_shares * pos.yes_avg_cost)
-                elif pos.has_no_position:
-                    pnl = -(pos.no_shares * pos.no_avg_cost)
-                else:
-                    pnl = 0.0
-            else:
-                if pos.has_yes_position:
-                    pnl = -(pos.yes_shares * pos.yes_avg_cost)
-                elif pos.has_no_position:
-                    pnl = pos.no_shares * 1.0 - (pos.no_shares * pos.no_avg_cost)
-                else:
-                    pnl = 0.0
+            pnl = 0.0
+            is_winner = (bin_index == winner_bin)
+
+            if pos.has_yes_position:
+                yes_payout = pos.yes_shares * 1.0 if is_winner else 0.0
+                yes_cost = pos.yes_shares * pos.yes_avg_cost
+                pnl += yes_payout - yes_cost
+
+            if pos.has_no_position:
+                no_payout = pos.no_shares * 1.0 if not is_winner else 0.0
+                no_cost = pos.no_shares * pos.no_avg_cost
+                pnl += no_payout - no_cost
 
             pnl_by_bin[bin_index] = pnl
 

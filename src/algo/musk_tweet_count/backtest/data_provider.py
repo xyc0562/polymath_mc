@@ -56,7 +56,8 @@ def parse_counting_dates(short_name: str, end_date: date) -> Tuple[date, date]:
     Examples:
         "Nov 18 - Nov 25" -> (2025-11-18, 2025-11-25)
         "Jan 27 - Feb 3" -> (2026-01-27, 2026-02-03)
-        "Elon Musk musk # tweets in Oct" -> (month start, month end)
+        "Elon Musk musk # tweets in Jan" -> (2026-01-01, 2026-02-01)
+        "Elon Musk musk # tweets in Oct" -> (2025-10-01, 2025-11-01)
 
     Args:
         short_name: Event short name like "Nov 18 - Nov 25"
@@ -67,6 +68,36 @@ def parse_counting_dates(short_name: str, end_date: date) -> Tuple[date, date]:
     """
     import re
 
+    month_map = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    # Pattern for monthly events: "tweets in {Month}" (e.g., "tweets in Jan", "tweets in October")
+    # Counting window = 1st of that month to 1st of next month (= end_date)
+    monthly_pattern = r"tweets\s+in\s+(\w+)"
+    monthly_match = re.search(monthly_pattern, short_name, re.IGNORECASE)
+    if monthly_match:
+        month_str = monthly_match.group(1)
+        month_num = month_map.get(month_str) or month_map.get(month_str.lower())
+        if month_num:
+            # The counting window is the full month.
+            # end_date (settlement) is the 1st of the next month.
+            # counting_start = 1st of that month
+            # counting_end = end_date (1st of next month)
+            start_year = end_date.year
+            # If the month is December and end_date is in January, start is previous year
+            if month_num > end_date.month:
+                start_year -= 1
+            try:
+                counting_start = date(start_year, month_num, 1)
+                return counting_start, end_date
+            except ValueError:
+                pass
+
     # Pattern for "Month DD - Month DD" format
     date_range_pattern = r"(\w{3})\s+(\d{1,2})\s*-\s*(\w{3})\s+(\d{1,2})"
     match = re.search(date_range_pattern, short_name)
@@ -75,12 +106,6 @@ def parse_counting_dates(short_name: str, end_date: date) -> Tuple[date, date]:
         start_month_str, start_day_str, end_month_str, end_day_str = match.groups()
         start_day = int(start_day_str)
         end_day = int(end_day_str)
-
-        # Month name to number mapping
-        month_map = {
-            "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-        }
 
         start_month = month_map.get(start_month_str, end_date.month)
         end_month = month_map.get(end_month_str, end_date.month)
@@ -100,7 +125,11 @@ def parse_counting_dates(short_name: str, end_date: date) -> Tuple[date, date]:
         except ValueError:
             pass
 
-    # Fallback: assume 7-day window ending at end_date
+    # Fallback: log warning and assume 7-day window ending at end_date
+    import logging
+    logging.getLogger(__name__).warning(
+        f"Could not parse counting dates from '{short_name}', falling back to 7-day window"
+    )
     return end_date - timedelta(days=6), end_date
 
 
