@@ -83,15 +83,18 @@ class BucketNowcastConfig:
     min_dispersion_k: float = 0.5
 
     # Hawkes-style self-exciting impulse model
-    # Each recent tweet injects a decaying activity boost with tanh saturation
+    # Shifted-linear excitation: rate_mult = clamp(1 + gain*(exc - expected*neutral_fraction), floor, ceiling)
     impulse_cutoff_minutes: float = 180.0              # Forward prediction window
     impulse_min_tweets_for_fit: int = 200              # Min tweets to fit rate curve
     impulse_rate_curve_sigma: float = 60.0             # Gaussian kernel σ for λ(τ)
     impulse_decay_halflife_minutes: float = 30.0       # Excitation decay half-life
-    impulse_floor: float = 0.4                         # Rate during extended silence
-    impulse_max_boost: float = 3.1                     # Max additional rate (total max = floor + max_boost = 3.5)
-    impulse_scale: float = 2.5                         # Excitation units for tanh scaling
+    impulse_floor: float = 0.4                         # Minimum rate_mult (extended silence)
     impulse_silence_halflife_minutes: float = 90.0     # Forward decay halflife when in silence (rate_mult < 1)
+    impulse_neutral_fraction: float = 0.3              # Fraction of expected excitation that's "neutral" (rate_mult=1.0)
+    impulse_gain: float = 0.6                          # Linear sensitivity of rate_mult to shifted excitation
+    impulse_ceiling: float = 3.0                       # Max rate_mult
+    impulse_lookback_minutes: int = 360                # How far back for expected excitation calc
+    impulse_min_expected_excitation: float = 0.3       # Below this, treat as low-data period
 
 
 @dataclass

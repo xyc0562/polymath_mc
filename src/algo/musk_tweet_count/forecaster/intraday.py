@@ -1079,6 +1079,29 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             settlement_tau=settlement_tau,
         ).astype(int)
 
+    def _avg_rate_mult_for_slice(
+        self,
+        rate_mult: float,
+        forward_decay: float,
+        rel_start: float,
+        rel_end: float,
+    ) -> float:
+        """Compute average rate_mult over a time slice [rel_start, rel_end] from now.
+
+        Uses analytical integral of 1 + (rate_mult - 1) * exp(-fd * t) over the slice.
+        Returns 1.0 if slice is beyond effective range or has zero span.
+        """
+        span = rel_end - rel_start
+        if span <= 0:
+            return 1.0
+        delta = rate_mult - 1.0
+        if abs(delta) < 1e-6 or forward_decay <= 0:
+            return 1.0
+        integral = (delta / forward_decay) * (
+            math.exp(-forward_decay * rel_start) - math.exp(-forward_decay * rel_end)
+        )
+        return 1.0 + integral / span
+
     def _sample_with_impulse(
         self,
         events: List[TweetEvent],
@@ -1092,14 +1115,17 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         """
         Core sampling using Hawkes excitation impulse + bucket model.
 
-        Timeline:
-          [day_start ... now ... impulse_end ... day_end/settlement]
-                        |--- predictive (Poisson with decaying rate_mult) ---|
-                                                |--- buckets ---|
+        Shifted-linear excitation model:
+          1. Compute actual excitation (Hawkes decay sum of recent tweets)
+          2. Compute expected excitation from rate curve lookback
+          3. shifted = excitation - expected * neutral_fraction
+          4. rate_mult = clamp(1 + gain * shifted, floor, ceiling)
 
-        Each recent tweet injects a decaying activity boost. A tanh saturation
-        prevents extreme values during intense bursts. The rate multiplier decays
-        toward baseline (1.0) over the prediction window.
+        Bucket scaling (replaces impulse window):
+          - Buckets run from tau_now to end_tau (no more impulse/bucket handoff)
+          - Each bucket mean is multiplied by avg_rate_mult for that time slice
+          - rate_mult decays toward 1.0 with asymmetric forward decay
+          - All sampling uses NegBin via buckets (no more Poisson from rate curve)
         """
         if rng is None:
             rng = np.random.default_rng()
@@ -1118,81 +1144,76 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         samples = np.full(n_simulations, float(observed))
 
-        # --- Hawkes excitation impulse component ---
+        # --- Hawkes excitation with shifted-linear model ---
         use_impulse = (
             self._impulse_fitted
             and self._rate_curve is not None
             and tau > 10
         )
 
+        rate_mult = 1.0
+        forward_decay = 0.0
+
         if use_impulse:
             tau_now = int(tau)
             halflife = self.config.impulse_decay_halflife_minutes
             decay = math.log(2) / halflife
 
-            # Hawkes excitation: each tweet adds a decaying boost
+            # Actual excitation: each tweet adds a decaying boost
             excitation = 0.0
             for e in events:
                 e_tau = self.contract_utils.get_tau(e.timestamp, contract_date)
                 if e_tau < tau_now:
                     excitation += math.exp(-decay * (tau_now - e_tau))
 
-            # Saturating rate multiplier
-            floor = self.config.impulse_floor
-            max_boost = self.config.impulse_max_boost
-            scale = self.config.impulse_scale
-            rate_mult = floor + max_boost * math.tanh(excitation / scale)
+            # Expected excitation from rate curve lookback
+            lookback = self.config.impulse_lookback_minutes
+            expected_excitation = 0.0
+            for t in range(1, lookback + 1):
+                past_tau = tau_now - t
+                if 0 <= past_tau < 1440:
+                    expected_excitation += self._rate_curve[past_tau] * math.exp(-decay * t)
 
-            # Prediction window: fixed forward from now
-            impulse_end_tau = int(min(tau_now + self.config.impulse_cutoff_minutes, end_tau))
-            impulse_end_tau = max(impulse_end_tau, tau_now)
-
-            tau_now_c = max(0, min(tau_now, 1440))
-            tau_impulse_end_c = max(0, min(impulse_end_tau, 1440))
-            window_len = tau_impulse_end_c - tau_now_c
-
-            E_impulse = 0.0
-            if window_len > 0:
-                # Asymmetric decay toward baseline (1.0):
-                #   excitation (rate_mult > 1): halflife = 30 min (fades fast)
-                #   silence (rate_mult < 1): halflife = 90 min (lingers)
-                if rate_mult >= 1.0:
-                    forward_decay = decay  # same as excitation halflife (30 min)
+            # Shifted-linear mapping
+            min_expected = self.config.impulse_min_expected_excitation
+            if expected_excitation < min_expected:
+                if excitation > min_expected:
+                    # Use floor for neutral baseline
+                    neutral = min_expected * self.config.impulse_neutral_fraction
                 else:
-                    forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
+                    # Both near zero → no signal
+                    neutral = excitation  # forces shifted=0, rate_mult=1.0
+            else:
+                neutral = expected_excitation * self.config.impulse_neutral_fraction
 
-                minutes_ahead = np.arange(window_len)
-                decay_factors = np.exp(-forward_decay * minutes_ahead)
-                future_rates = 1.0 + (rate_mult - 1.0) * decay_factors
+            shifted = excitation - neutral
+            rate_mult = 1.0 + self.config.impulse_gain * shifted
+            rate_mult = max(self.config.impulse_floor, min(self.config.impulse_ceiling, rate_mult))
 
-                # Expected tweets = Σ rate_mult(t) * λ(t) for each minute t
-                rate_curve_slice = self._rate_curve[tau_now_c:tau_impulse_end_c]
-                E_impulse = float((future_rates * rate_curve_slice).sum())
-
-                if E_impulse > 0:
-                    impulse_samples = rng.poisson(E_impulse, size=n_simulations)
-                    samples += impulse_samples
+            # Asymmetric forward decay
+            if rate_mult >= 1.0:
+                forward_decay = decay  # boost: halflife = 30 min
+            else:
+                forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
 
             # Logging
             last_tweet_tau = self._get_last_tweet_tau(events, contract_date, now)
             silence_min = (tau_now - last_tweet_tau) if last_tweet_tau is not None else tau_now
-            remaining_min = impulse_end_tau - tau_now
 
             self._last_impulse = {
                 "silence_min": silence_min,
-                "k_obs": round(excitation, 1),
-                "E_impulse": round(E_impulse, 1),
+                "excitation": round(excitation, 2),
+                "expected": round(expected_excitation, 2),
+                "shifted": round(shifted, 2),
                 "rate_mult_now": round(rate_mult, 2),
-                "expected_next": round(E_impulse, 1),
-                "remaining_min": remaining_min,
             }
         else:
             self._last_impulse = None
-            impulse_end_tau = tau
 
-        # --- Bucket component (from impulse_end_tau to end_tau) ---
-        if impulse_end_tau < end_tau:
-            # Compute regime from observed vs expected (using full day context)
+        # --- Bucket component (from tau_now to end_tau, scaled by rate_mult) ---
+        tau_now = int(tau)
+        if tau_now < end_tau:
+            # Compute regime from observed vs expected at tau_now
             full_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
             full_partial = (tau % self.bucket_size) / self.bucket_size
             expected_so_far = sum(b.mean for b in buckets[:full_bucket_idx])
@@ -1204,26 +1225,39 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             else:
                 regime = 1.0
 
-            # Determine which bucket impulse_end_tau falls in
-            bucket_start_idx = min(
-                int(impulse_end_tau) // self.bucket_size, self.n_buckets - 1
-            )
-            bucket_start_partial = (impulse_end_tau % self.bucket_size) / self.bucket_size
+            # Determine which bucket tau_now falls in
+            bucket_start_idx = min(tau_now // self.bucket_size, self.n_buckets - 1)
+            cutoff_minutes = self.config.impulse_cutoff_minutes
 
-            # Sample remaining portion of the bucket containing impulse_end_tau
-            if bucket_start_partial < 1.0:
-                b = buckets[bucket_start_idx]
-                bucket_end = min(b.end_tau, end_tau)
-                fraction = (bucket_end - impulse_end_tau) / self.bucket_size
-                if fraction > 0:
-                    remaining_mean = b.mean * fraction * regime
-                    k = b.dispersion_k
-                    if std_inflation_factor > 1.0:
-                        k = k / std_inflation_factor
-                    if remaining_mean > 0:
-                        samples += self._sample_negative_binomial(
-                            mean=remaining_mean, k=k, size=n_simulations, rng=rng,
-                        )
+            # Sample remaining portion of the bucket containing tau_now
+            b = buckets[bucket_start_idx]
+            bucket_end = min(b.end_tau, end_tau)
+            fraction = (bucket_end - tau_now) / self.bucket_size
+            if fraction > 0:
+                # Compute avg rate_mult for this slice
+                rel_start = 0.0
+                rel_end = float(bucket_end - tau_now)
+                if use_impulse and rel_start < cutoff_minutes:
+                    avg_mult = self._avg_rate_mult_for_slice(
+                        rate_mult, forward_decay,
+                        rel_start, min(rel_end, cutoff_minutes),
+                    )
+                    if rel_end > cutoff_minutes:
+                        # Blend: part under impulse, part at 1.0
+                        impulse_span = cutoff_minutes - rel_start
+                        rest_span = rel_end - cutoff_minutes
+                        avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
+                else:
+                    avg_mult = 1.0
+
+                remaining_mean = b.mean * fraction * regime * avg_mult
+                k = b.dispersion_k
+                if std_inflation_factor > 1.0:
+                    k = k / std_inflation_factor
+                if remaining_mean > 0:
+                    samples += self._sample_negative_binomial(
+                        mean=remaining_mean, k=k, size=n_simulations, rng=rng,
+                    )
 
             # Sample full remaining buckets
             for bucket_idx in range(bucket_start_idx + 1, self.n_buckets):
@@ -1232,7 +1266,23 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                     break
                 bucket_end = min(b.end_tau, end_tau)
                 fraction = (bucket_end - b.start_tau) / self.bucket_size
-                bucket_mean = b.mean * fraction * regime
+
+                # Compute avg rate_mult for this bucket slice
+                rel_start = float(b.start_tau - tau_now)
+                rel_end = float(bucket_end - tau_now)
+                if use_impulse and rel_start < cutoff_minutes:
+                    avg_mult = self._avg_rate_mult_for_slice(
+                        rate_mult, forward_decay,
+                        rel_start, min(rel_end, cutoff_minutes),
+                    )
+                    if rel_end > cutoff_minutes:
+                        impulse_span = cutoff_minutes - rel_start
+                        rest_span = rel_end - cutoff_minutes
+                        avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
+                else:
+                    avg_mult = 1.0
+
+                bucket_mean = b.mean * fraction * regime * avg_mult
                 k = b.dispersion_k
                 if std_inflation_factor > 1.0:
                     k = k / std_inflation_factor

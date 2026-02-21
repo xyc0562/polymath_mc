@@ -1167,11 +1167,12 @@ class GASKellyTradingBot:
             nowcast = getattr(self.forecaster, 'nowcast', None)
             if nowcast and hasattr(nowcast, '_last_impulse') and nowcast._last_impulse:
                 imp = nowcast._last_impulse
+                shifted = imp['shifted']
+                sign = "+" if shifted >= 0 else ""
                 impulse_str = (
                     f" | impulse: silence={imp['silence_min']:.0f}min, "
-                    f"excitation={imp['k_obs']}, "
-                    f"rate_mult={imp['rate_mult_now']:.2f}x, "
-                    f"{imp['expected_next']:.1f} tweets expected in next {imp['remaining_min']:.0f}min"
+                    f"exc={imp['excitation']} (exp={imp['expected']}, shifted={sign}{shifted}), "
+                    f"rate_mult={imp['rate_mult_now']:.2f}x"
                 )
 
             logger.info(
