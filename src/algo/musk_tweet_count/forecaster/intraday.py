@@ -10,6 +10,7 @@ Components:
 """
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -1089,18 +1090,16 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         settlement_tau: Optional[int] = None,
     ) -> np.ndarray:
         """
-        Core sampling using Bayesian Gamma-Poisson impulse + bucket model.
+        Core sampling using Hawkes excitation impulse + bucket model.
 
         Timeline:
-          [day_start ... last_tweet ... now ... impulse_end ... day_end/settlement]
-                         |--- observation ---|
-                                             |--- predictive (NB) ---|
-                                                                     |--- buckets ---|
+          [day_start ... now ... impulse_end ... day_end/settlement]
+                        |--- predictive (Poisson with decaying rate_mult) ---|
+                                                |--- buckets ---|
 
-        The rate multiplier r ~ Gamma(α₀, β₀) captures whether the current
-        tweeting rate is above (burst) or below (silence) the historical curve.
-        We observe k_obs tweets in [τ_last, τ_now] with expected E_obs under r=1,
-        then draw remaining tweets from the Negative Binomial predictive distribution.
+        Each recent tweet injects a decaying activity boost. A tanh saturation
+        prevents extreme values during intense bursts. The rate multiplier decays
+        toward baseline (1.0) over the prediction window.
         """
         if rng is None:
             rng = np.random.default_rng()
@@ -1119,68 +1118,72 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         samples = np.full(n_simulations, float(observed))
 
-        # --- Bayesian impulse component ---
-        last_tweet_tau = self._get_last_tweet_tau(events, contract_date, now)
-        cutoff = self.config.impulse_cutoff_minutes
-
+        # --- Hawkes excitation impulse component ---
         use_impulse = (
             self._impulse_fitted
             and self._rate_curve is not None
-            and last_tweet_tau is not None
-            and (tau - last_tweet_tau) < cutoff
+            and tau > 10
         )
 
         if use_impulse:
-            # 1. Observation window: [τ_last, τ_now]
-            tau_last = int(last_tweet_tau)
             tau_now = int(tau)
-            tau_last_c = max(0, min(tau_last, 1439))
-            tau_now_c = max(0, min(tau_now, 1440))
+            halflife = self.config.impulse_decay_halflife_minutes
+            decay = math.log(2) / halflife
 
-            # Expected tweets in observation window under r=1
-            E_obs = float(self._rate_curve[tau_last_c:tau_now_c].sum())
-
-            # Actual tweets in observation window (tweets after the last tweet, before now)
-            k_obs = 0
+            # Hawkes excitation: each tweet adds a decaying boost
+            excitation = 0.0
             for e in events:
                 e_tau = self.contract_utils.get_tau(e.timestamp, contract_date)
-                if tau_last < e_tau < tau_now:
-                    k_obs += 1
+                if e_tau < tau_now:
+                    excitation += math.exp(-decay * (tau_now - e_tau))
 
-            # 2. Bayesian update (Gamma-Poisson conjugacy)
-            alpha0 = self.config.impulse_prior_concentration
-            beta0 = alpha0  # Prior mean = α₀/β₀ = 1.0 (normal rate)
-            alpha_post = alpha0 + k_obs
-            beta_post = beta0 + E_obs
+            # Saturating rate multiplier
+            floor = self.config.impulse_floor
+            max_boost = self.config.impulse_max_boost
+            scale = self.config.impulse_scale
+            rate_mult = floor + max_boost * math.tanh(excitation / scale)
 
-            posterior_mean = alpha_post / beta_post if beta_post > 0 else 1.0
+            # Prediction window: fixed forward from now
+            impulse_end_tau = int(min(tau_now + self.config.impulse_cutoff_minutes, end_tau))
+            impulse_end_tau = max(impulse_end_tau, tau_now)
 
-            # 3. Predictive sampling for remaining impulse window [τ_now, τ_impulse_end]
-            impulse_end_tau = int(min(tau_last + cutoff, end_tau))
-            impulse_end_tau = max(impulse_end_tau, tau_now)  # Ensure non-negative range
-
+            tau_now_c = max(0, min(tau_now, 1440))
             tau_impulse_end_c = max(0, min(impulse_end_tau, 1440))
-            E_remaining = float(self._rate_curve[tau_now_c:tau_impulse_end_c].sum())
+            window_len = tau_impulse_end_c - tau_now_c
 
-            if E_remaining > 0:
-                # Predictive distribution: Negative Binomial
-                # NB(r=α_post, p=β_post/(β_post + E_remaining))
-                nb_r = alpha_post
-                nb_p = beta_post / (beta_post + E_remaining)
-                nb_p = max(min(nb_p, 0.9999), 0.0001)  # Clamp for numerical safety
+            E_impulse = 0.0
+            if window_len > 0:
+                # Asymmetric decay toward baseline (1.0):
+                #   excitation (rate_mult > 1): halflife = 30 min (fades fast)
+                #   silence (rate_mult < 1): halflife = 90 min (lingers)
+                if rate_mult >= 1.0:
+                    forward_decay = decay  # same as excitation halflife (30 min)
+                else:
+                    forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
 
-                impulse_samples = rng.negative_binomial(nb_r, nb_p, size=n_simulations)
-                samples += impulse_samples
+                minutes_ahead = np.arange(window_len)
+                decay_factors = np.exp(-forward_decay * minutes_ahead)
+                future_rates = 1.0 + (rate_mult - 1.0) * decay_factors
 
-            silence_min = tau_now - tau_last
+                # Expected tweets = Σ rate_mult(t) * λ(t) for each minute t
+                rate_curve_slice = self._rate_curve[tau_now_c:tau_impulse_end_c]
+                E_impulse = float((future_rates * rate_curve_slice).sum())
+
+                if E_impulse > 0:
+                    impulse_samples = rng.poisson(E_impulse, size=n_simulations)
+                    samples += impulse_samples
+
+            # Logging
+            last_tweet_tau = self._get_last_tweet_tau(events, contract_date, now)
+            silence_min = (tau_now - last_tweet_tau) if last_tweet_tau is not None else tau_now
             remaining_min = impulse_end_tau - tau_now
-            expected_next = E_remaining * posterior_mean
+
             self._last_impulse = {
                 "silence_min": silence_min,
-                "k_obs": k_obs,
-                "E_obs": E_obs,
-                "rate_mult": posterior_mean,
-                "expected_next": expected_next,
+                "k_obs": round(excitation, 1),
+                "E_impulse": round(E_impulse, 1),
+                "rate_mult_now": round(rate_mult, 2),
+                "expected_next": round(E_impulse, 1),
                 "remaining_min": remaining_min,
             }
         else:

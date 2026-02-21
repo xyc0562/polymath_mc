@@ -1169,8 +1169,8 @@ class GASKellyTradingBot:
                 imp = nowcast._last_impulse
                 impulse_str = (
                     f" | impulse: silence={imp['silence_min']:.0f}min, "
-                    f"obs={imp['k_obs']} vs exp={imp['E_obs']:.1f}, "
-                    f"rate={imp['rate_mult']:.2f}x, "
+                    f"excitation={imp['k_obs']}, "
+                    f"rate_mult={imp['rate_mult_now']:.2f}x, "
                     f"{imp['expected_next']:.1f} tweets expected in next {imp['remaining_min']:.0f}min"
                 )
 

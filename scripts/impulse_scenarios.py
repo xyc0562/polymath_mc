@@ -1,11 +1,11 @@
 """
-Compute Bayesian impulse predictions across various scenarios.
-Shows predicted tweet counts for different times-of-day, elapsed silence,
-and recent tweet patterns.
+Compute Hawkes excitation impulse predictions across various scenarios.
+Shows predicted rate multipliers for different times-of-day and recent tweet patterns.
 """
 import sys
 sys.path.insert(0, "src")
 
+import math
 import numpy as np
 from datetime import date
 from scipy.ndimage import gaussian_filter1d
@@ -69,60 +69,66 @@ for tau in range(0, 1440, 60):
 
 print()
 
-# --- Bayesian prediction function ---
-def predict_impulse(tau_now, tau_last, k_obs, rate_curve, config):
-    """Compute Bayesian impulse prediction stats."""
-    alpha0 = config.impulse_prior_concentration
-    beta0 = alpha0
+# --- Hawkes excitation prediction function ---
+def predict_hawkes(tau_now, tweet_taus, rate_curve, config):
+    """Compute Hawkes excitation impulse prediction stats."""
+    halflife = config.impulse_decay_halflife_minutes
+    decay = math.log(2) / halflife
     cutoff = config.impulse_cutoff_minutes
 
-    elapsed = tau_now - tau_last
+    # Hawkes excitation: each tweet adds a decaying boost
+    excitation = 0.0
+    for t in tweet_taus:
+        if t < tau_now:
+            excitation += math.exp(-decay * (tau_now - t))
 
-    # Observation window
-    tau_last_c = max(0, min(int(tau_last), 1439))
-    tau_now_c = max(0, min(int(tau_now), 1440))
-    E_obs = float(rate_curve[tau_last_c:tau_now_c].sum())
+    # Saturating rate multiplier
+    floor = config.impulse_floor
+    max_boost = config.impulse_max_boost
+    scale = config.impulse_scale
+    rate_mult = floor + max_boost * math.tanh(excitation / scale)
 
-    # Posterior
-    alpha_post = alpha0 + k_obs
-    beta_post = beta0 + E_obs
-    posterior_mean = alpha_post / beta_post
+    # Prediction window
+    impulse_end = int(min(tau_now + cutoff, 1440))
+    impulse_end = max(impulse_end, tau_now)
 
-    # Remaining impulse window
-    impulse_end = int(min(tau_last + cutoff, 1440))
-    impulse_end = max(impulse_end, tau_now_c)
+    tau_now_c = max(0, min(tau_now, 1440))
     tau_impulse_end_c = max(0, min(impulse_end, 1440))
-    E_remaining = float(rate_curve[tau_now_c:tau_impulse_end_c].sum())
+    window_len = tau_impulse_end_c - tau_now_c
 
-    # Predictive mean (NB mean = alpha_post * E_remaining / beta_post)
-    pred_mean = alpha_post * E_remaining / beta_post if beta_post > 0 else E_remaining
+    E_impulse = 0.0
+    if window_len > 0:
+        if rate_mult >= 1.0:
+            forward_decay = decay
+        else:
+            forward_decay = math.log(2) / config.impulse_silence_halflife_minutes
 
-    # Predictive std (NB variance = alpha_post * E_remaining * (beta_post + E_remaining) / beta_post^2)
-    if beta_post > 0:
-        pred_var = alpha_post * E_remaining * (beta_post + E_remaining) / (beta_post ** 2)
-    else:
-        pred_var = E_remaining
-    pred_std = np.sqrt(pred_var)
+        minutes_ahead = np.arange(window_len)
+        decay_factors = np.exp(-forward_decay * minutes_ahead)
+        future_rates = 1.0 + (rate_mult - 1.0) * decay_factors
+
+        rate_curve_slice = rate_curve[tau_now_c:tau_impulse_end_c]
+        E_impulse = float((future_rates * rate_curve_slice).sum())
+
+    base_rate = float(rate_curve[tau_now_c:tau_impulse_end_c].sum())
 
     return {
-        "elapsed": elapsed,
-        "E_obs": E_obs,
-        "k_obs": k_obs,
-        "alpha_post": alpha_post,
-        "beta_post": beta_post,
-        "posterior_mean": posterior_mean,
+        "excitation": excitation,
+        "rate_mult": rate_mult,
         "impulse_end": impulse_end,
-        "E_remaining": E_remaining,
-        "pred_mean": pred_mean,
-        "pred_std": pred_std,
-        "base_rate_remaining": E_remaining,  # what you'd predict at r=1
+        "E_impulse": E_impulse,
+        "base_rate": base_rate,
+        "ratio": E_impulse / base_rate if base_rate > 0.01 else float('inf'),
     }
 
 # --- Scenario table ---
 print("=" * 70)
-print("BAYESIAN IMPULSE PREDICTIONS")
-print(f"  Prior: α₀=β₀={config.impulse_prior_concentration}, cutoff={config.impulse_cutoff_minutes}min")
-print(f"  Observation window = [τ_last, τ_now] (backward from now to last tweet)")
+print("HAWKES EXCITATION IMPULSE PREDICTIONS")
+print(f"  Halflife={config.impulse_decay_halflife_minutes}min, "
+      f"floor={config.impulse_floor}, max_boost={config.impulse_max_boost}, "
+      f"scale={config.impulse_scale}")
+print(f"  Cutoff={config.impulse_cutoff_minutes}min, "
+      f"silence_halflife={config.impulse_silence_halflife_minutes}min")
 print("=" * 70)
 
 # Time-of-day points
@@ -137,77 +143,51 @@ tau_points = [
     (1260, " 9:00 AM"),
 ]
 
-# Scenarios: (elapsed_min, k_obs, label)
+# Scenarios: (description, list of tweet offsets before tau_now)
 scenarios = [
-    (5,   0,  "Silent 5min"),
-    (5,   3,  "Burst: 3 tweets in 5min"),
-    (5,   8,  "Heavy burst: 8 in 5min"),
-    (15,  0,  "Silent 15min"),
-    (15,  2,  "Normal: 2 in 15min"),
-    (15,  6,  "Burst: 6 in 15min"),
-    (30,  0,  "Silent 30min"),
-    (30,  3,  "Normal: 3 in 30min"),
-    (30,  10, "Burst: 10 in 30min"),
-    (60,  0,  "Silent 1hr"),
-    (60,  5,  "Normal: 5 in 1hr"),
-    (60,  15, "Burst: 15 in 1hr"),
-    (120, 0,  "Silent 2hr"),
-    (120, 5,  "Sparse: 5 in 2hr"),
-    (120, 20, "Burst: 20 in 2hr"),
-    (180, 0,  "Silent 3hr (at cutoff)"),
+    ("No tweets 2h",               []),
+    ("1 tweet 30min ago",           [30]),
+    ("1 tweet 5min ago",            [5]),
+    ("1 tweet 3min ago",            [3]),
+    ("2 tweets (5+10min ago)",      [5, 10]),
+    ("3 tweets in 10min",           [3, 6, 10]),
+    ("5 tweets in 15min",           [2, 5, 8, 11, 15]),
+    ("10 tweets in 30min",          [3, 6, 9, 12, 15, 18, 21, 24, 27, 30]),
 ]
 
 for tau_now, time_label in tau_points:
     print(f"\n--- τ_now={tau_now} ({time_label}) ---")
-    print(f"{'Scenario':<30} {'Elapsed':>7} {'E_obs':>7} {'k_obs':>5} "
-          f"{'post_mean':>10} {'E_rem':>7} {'Pred':>7} {'±Std':>7} "
+    print(f"{'Scenario':<30} {'Excit':>7} {'rate_mult':>10} {'E_impulse':>10} "
           f"{'Base':>7} {'Ratio':>7}")
-    print("-" * 110)
+    print("-" * 80)
 
-    for elapsed, k_obs, label in scenarios:
-        tau_last = tau_now - elapsed
-        if tau_last < 0:
-            continue  # Can't have last tweet before day start
-        if elapsed >= config.impulse_cutoff_minutes:
-            # At cutoff, impulse is disabled
-            print(f"{label:<30} {elapsed:>6}m  {'—':>7} {'—':>5} "
-                  f"{'DISABLED':>10} {'—':>7} {'—':>7} {'—':>7} "
-                  f"{'—':>7} {'—':>7}")
-            continue
+    for label, offsets in scenarios:
+        tweet_taus = [tau_now - offset for offset in offsets if tau_now - offset >= 0]
 
-        r = predict_impulse(tau_now, tau_last, k_obs, rate_curve, config)
-        ratio = r["pred_mean"] / r["base_rate_remaining"] if r["base_rate_remaining"] > 0.01 else float('inf')
-        print(f"{label:<30} {elapsed:>6}m  {r['E_obs']:>7.2f} {k_obs:>5} "
-              f"{r['posterior_mean']:>10.3f} {r['E_remaining']:>7.1f} "
-              f"{r['pred_mean']:>7.1f} {r['pred_std']:>7.1f} "
-              f"{r['base_rate_remaining']:>7.1f} {ratio:>7.2f}")
+        r = predict_hawkes(tau_now, tweet_taus, rate_curve, config)
+        print(f"{label:<30} {r['excitation']:>7.2f} {r['rate_mult']:>10.3f} "
+              f"{r['E_impulse']:>10.1f} {r['base_rate']:>7.1f} {r['ratio']:>7.2f}")
 
 
-# --- Summary: how the observation window works ---
+# --- Summary ---
 print()
 print("=" * 70)
-print("HOW THE BACKWARD OBSERVATION WINDOW WORKS")
+print("HOW THE HAWKES EXCITATION MODEL WORKS")
 print("=" * 70)
 print("""
-The model looks backward from τ_now to τ_last (the most recent tweet).
-This is NOT a fixed lookback — it's the gap since the last tweet.
+Each recent tweet contributes a decaying excitation:
+  excitation = Σ exp(-ln2 * Δ_i / halflife)   for each recent tweet
 
-  Observation window = τ_now - τ_last  (0 to 180 min)
+The rate multiplier uses tanh saturation:
+  rate_mult = floor + max_boost * tanh(excitation / scale)
 
-If elapsed >= 180 min (cutoff): impulse disabled, pure bucket sampling.
-If no tweets today: impulse disabled.
+  - No recent tweets: rate_mult → floor (0.4, silence penalty)
+  - 1 tweet 30min ago: rate_mult ≈ 1.0 (baseline)
+  - Recent burst: rate_mult → floor + max_boost = 3.5 (saturated)
 
-Within the window:
-  E_obs = ∫ rate_curve(τ) dτ from τ_last to τ_now  (expected tweets at base rate)
-  k_obs = actual tweet count in (τ_last, τ_now)     (what really happened)
+Forward prediction decays toward baseline (1.0):
+  future_rate_mult(t) = 1.0 + (rate_mult_now - 1.0) × exp(-decay × t)
 
-Posterior rate multiplier:
-  r_posterior = (α₀ + k_obs) / (β₀ + E_obs)  where α₀=β₀=1.0
-
-  - If k_obs >> E_obs: r >> 1 (burst detected, predict more)
-  - If k_obs << E_obs: r << 1 (silence detected, predict fewer)
-  - If k_obs ≈ E_obs: r ≈ 1 (normal, predict base rate)
-
-Predicted tweets in remaining impulse window [τ_now, τ_last+180]:
-  E[remaining] = r_posterior × ∫ rate_curve(τ) dτ from τ_now to impulse_end
+  - Boost (rate_mult > 1): decays down to 1.0 (halflife = 30 min)
+  - Silence (rate_mult < 1): decays up to 1.0 (halflife = 90 min)
 """)
