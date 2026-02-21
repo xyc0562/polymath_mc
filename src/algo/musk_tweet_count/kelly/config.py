@@ -123,10 +123,22 @@ class CollateralConfig:
     # With $500 budget and 0.15 ratio, max per bin = $75
     c_bin_max_ratio: float = 0.15
 
+    # Capital multiplier for phantom capital injection.
+    # 1.0 = standard Kelly (no phantom capital)
+    # 2.0 = Kelly sees 2x capital → ~2x bigger positions
+    # Phantom capital inflates Kelly's wealth perception but real capital
+    # still hard-gates execution via available_capital.
+    capital_multiplier: float = 1.0
+
+    @property
+    def virtual_c_event_max(self) -> float:
+        """Event-level collateral gate scaled by multiplier."""
+        return self.c_event_max * self.capital_multiplier
+
     @property
     def c_bin_max(self) -> float:
-        """Computed max collateral per bin."""
-        return self.c_event_max * self.c_bin_max_ratio
+        """Per-bin collateral limit, scaled by multiplier."""
+        return self.c_event_max * self.capital_multiplier * self.c_bin_max_ratio
 
 
 @dataclass

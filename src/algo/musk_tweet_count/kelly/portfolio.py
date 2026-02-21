@@ -153,6 +153,11 @@ class Portfolio:
     total_realized_pnl: float = 0.0
     last_update_time: float = field(default_factory=time.time)
 
+    # Phantom capital for Kelly utility calculation only.
+    # Inflates Kelly's perceived wealth so it sizes more aggressively.
+    # Does NOT affect available_capital (real USDC only).
+    phantom_capital: float = 0.0
+
     # External capital constraint (from shared pool manager)
     # When set, available_capital is min(internal_available, external_limit)
     external_capital_limit: Optional[float] = None
@@ -244,10 +249,12 @@ class Portfolio:
         """
         Compute terminal wealth for each possible winning bin.
 
-        Uses current capital and positions.
+        Uses current capital (+ phantom capital for Kelly utility) and positions.
+        Phantom capital inflates Kelly's perceived wealth so it sizes more
+        aggressively, but real capital still gates execution.
         """
         return compute_all_terminal_wealths(
-            capital=self.capital,
+            capital=self.capital + self.phantom_capital,
             yes_positions=self.yes_positions,
             no_positions=self.no_positions,
             num_bins=self.num_bins,
@@ -394,6 +401,7 @@ class Portfolio:
             dead_bins=self.dead_bins.copy(),
             total_realized_pnl=self.total_realized_pnl,
             last_update_time=self.last_update_time,
+            phantom_capital=self.phantom_capital,
         )
 
     def execute_buy_yes(

@@ -40,7 +40,7 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventConfig,
     EventInfo,
 )
-from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, EventTradingRulesConfig
+from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, CollateralConfig, EventTradingRulesConfig
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,8 @@ def log_config_summary(
     w(f"    Min allocation:          ${capital_pool_config.min_allocation:,.2f}")
     w(f"    Max per event:           ${multi_event_config.max_per_event:,.2f}")
     w(f"    Max per bin:             ${kelly_config.collateral.c_bin_max:,.2f}  ({kelly_config.collateral.c_bin_max_ratio:.0%} of event max)")
+    if kelly_config.collateral.capital_multiplier != 1.0:
+        w(f"    Capital multiplier:      {kelly_config.collateral.capital_multiplier}x (phantom capital enabled)")
     w("")
 
     # Kelly
@@ -711,6 +713,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
     )
     parser.add_argument(
+        "--capital-multiplier",
+        type=float,
+        default=1.0,
+        help="Capital multiplier for phantom capital injection. "
+             "1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
+             "Real capital still hard-gates execution. Default: 1.0",
+    )
+    parser.add_argument(
         "--min-buy-utility",
         type=float,
         default=0.003,
@@ -841,12 +851,17 @@ async def main() -> None:
         require_two_sided_liquidity=not args.no_require_two_sided,
     )
 
+    collateral_config = CollateralConfig(
+        capital_multiplier=args.capital_multiplier,
+    )
+
     kelly_config = KellyConfig(
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_buy_utility=args.min_buy_utility,
         min_sell_utility=args.min_sell_utility,
         edge_buffer=edge_buffer_config,
+        collateral=collateral_config,
     )
 
     # max_per_event: CLI override or kelly_config default

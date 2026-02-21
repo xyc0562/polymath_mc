@@ -579,9 +579,9 @@ def _generate_buy_yes_candidate(
             reject(f"bin collateral limit (${current_bin_collateral:.0f} >= ${config.collateral.c_bin_max:.0f})")
             return None
 
-    if config.collateral.c_event_max > 0:
-        if total_collateral >= config.collateral.c_event_max:
-            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.c_event_max:.0f})")
+    if config.collateral.virtual_c_event_max > 0:
+        if total_collateral >= config.collateral.virtual_c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.virtual_c_event_max:.0f})")
             return None
 
     # Get VWAP for this chunk
@@ -797,9 +797,9 @@ def _generate_buy_no_candidate(
             reject(f"bin collateral limit (${current_bin_collateral:.0f} >= ${config.collateral.c_bin_max:.0f})")
             return None
 
-    if config.collateral.c_event_max > 0:
-        if total_collateral >= config.collateral.c_event_max:
-            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.c_event_max:.0f})")
+    if config.collateral.virtual_c_event_max > 0:
+        if total_collateral >= config.collateral.virtual_c_event_max:
+            reject(f"event collateral limit (${total_collateral:.0f} >= ${config.collateral.virtual_c_event_max:.0f})")
             return None
 
     vwap, filled, worst_price = compute_vwap_buy_no(orderbook, delta)

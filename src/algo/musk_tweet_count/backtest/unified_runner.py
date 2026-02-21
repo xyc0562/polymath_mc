@@ -252,6 +252,12 @@ class UnifiedBacktestRunner:
             bin_upper_bounds=bin_upper_bounds,
         )
 
+        # Set phantom capital for Kelly utility inflation
+        multiplier = kelly_config.collateral.capital_multiplier
+        if multiplier > 1.0:
+            portfolio.phantom_capital = self.config.initial_capital * (multiplier - 1.0)
+            logger.info(f"  Phantom capital: ${portfolio.phantom_capital:.2f} (multiplier={multiplier}x)")
+
         backend_config = SimulationConfig(
             spread=self.config.spread,
             slippage=self.config.slippage,

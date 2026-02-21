@@ -478,6 +478,15 @@ def main():
     )
 
     parser.add_argument(
+        "--capital-multiplier",
+        type=float,
+        default=1.0,
+        help="Capital multiplier for phantom capital injection. "
+             "1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
+             "Real capital still hard-gates execution. Default: 1.0",
+    )
+
+    parser.add_argument(
         "--exit-mode",
         type=str,
         default="kelly_only",
@@ -569,6 +578,7 @@ def main():
             collateral=CollateralConfig(
                 c_event_max=args.capital,
                 c_bin_max_ratio=args.c_bin_max_ratio,
+                capital_multiplier=args.capital_multiplier,
             ),
             max_iters_per_tick=50,
         )
