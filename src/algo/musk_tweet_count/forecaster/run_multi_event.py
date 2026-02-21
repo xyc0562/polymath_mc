@@ -71,8 +71,9 @@ def log_config_summary(
     w(f"    Total capital:           ${capital_pool_config.total_capital:,.2f}")
     w(f"    Min allocation:          ${capital_pool_config.min_allocation:,.2f}")
     w(f"    Max per event:           ${multi_event_config.max_per_event:,.2f}")
-    w(f"    Max per bin:             ${kelly_config.collateral.c_bin_max:,.2f}  ({kelly_config.collateral.c_bin_max_ratio:.0%} of event max)")
     cm = kelly_config.collateral.capital_multiplier
+    bin_max_label = f"{kelly_config.collateral.c_bin_max_ratio:.0%} of event max" if cm == 1.0 else f"{kelly_config.collateral.c_bin_max_ratio:.0%} of virtual event max ${kelly_config.collateral.virtual_c_event_max:,.2f}"
+    w(f"    Max per bin:             ${kelly_config.collateral.c_bin_max:,.2f}  ({bin_max_label})")
     w(f"    Capital multiplier:      {cm}x" + (f" (phantom capital enabled, virtual event max=${kelly_config.collateral.virtual_c_event_max:,.2f})" if cm != 1.0 else " (standard Kelly)"))
     w("")
 
