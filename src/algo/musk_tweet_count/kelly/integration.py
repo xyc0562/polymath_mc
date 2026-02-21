@@ -138,8 +138,12 @@ class KellyTradingBot:
         self.bin_no_token_ids = {i: b.get("no_token_id") for i, b in enumerate(bins)}  # NO token IDs
 
         # Initialize portfolio
+        # Phantom capital is based on event budget (c_event_max), not initial_capital.
+        # initial_capital may be a small restored allocation, but the event budget
+        # is the true capital base Kelly should perceive.
         multiplier = self.config.collateral.capital_multiplier
-        phantom = initial_capital * (multiplier - 1.0) if multiplier > 1.0 else 0.0
+        event_budget = self.config.collateral.c_event_max
+        phantom = event_budget * (multiplier - 1.0) if multiplier > 1.0 else 0.0
         self.portfolio = Portfolio(
             initial_capital=initial_capital,
             capital=initial_capital,
@@ -148,7 +152,7 @@ class KellyTradingBot:
             phantom_capital=phantom,
         )
         if phantom > 0:
-            logger.info(f"[{self.event_name}] Phantom capital: ${phantom:.2f} (multiplier={multiplier}x)")
+            logger.info(f"[{self.event_name}] Phantom capital: ${phantom:.2f} (budget=${event_budget:.2f}, multiplier={multiplier}x)")
 
         # Initialize orderbook manager with WebSocket config
         ws_config = WebSocketConfig(enabled=not self._disable_websocket)

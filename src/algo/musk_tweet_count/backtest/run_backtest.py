@@ -605,6 +605,8 @@ def main():
         logger.info(f"Intraday mode: {args.intraday_mode}")
         if args.exit_mode != "kelly_only":
             logger.info(f"Exit mode: {args.exit_mode}")
+        if args.capital_multiplier != 1.0:
+            logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
     else:
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(
