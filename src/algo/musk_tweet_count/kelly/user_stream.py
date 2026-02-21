@@ -49,9 +49,11 @@ class PendingOrder:
     price: float
     size: float
     bin_index: int
+    condition_id: str = ""  # Market condition ID for event isolation
     created_at: float = field(default_factory=time.time)
     filled_size: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
+    _seen_fills: set = field(default_factory=set, repr=False)  # Dedup keys for partial fills
 
 
 @dataclass
@@ -64,6 +66,7 @@ class FillEvent:
     size: float
     status: OrderStatus
     timestamp: datetime
+    match_id: str = ""  # Unique trade/match ID from Polymarket for dedup
 
 
 @dataclass
@@ -311,6 +314,10 @@ class UserStreamClient:
             order_id = data.get("taker_order_id") or data.get("order_id")
             status_str = data.get("status", "")
 
+            # Extract unique match/trade ID for deduplication
+            # Polymarket sends id/match_id on trade events
+            match_id = data.get("id") or data.get("match_id") or ""
+
             fill = FillEvent(
                 order_id=order_id,
                 token_id=data.get("asset_id", ""),
@@ -319,6 +326,7 @@ class UserStreamClient:
                 size=float(data.get("size", 0)),
                 status=OrderStatus(status_str) if status_str else OrderStatus.MATCHED,
                 timestamp=datetime.utcnow(),
+                match_id=match_id,
             )
 
             # Log prominently so fills are visible in logs
@@ -329,23 +337,44 @@ class UserStreamClient:
             )
 
             # Update pending order
-            # NOTE: Same fill may arrive multiple times with different statuses (MATCHED -> MINED -> CONFIRMED)
-            # Each callback reports the SAME fill.size, not incremental, so we must not double-count
+            # Fill deduplication: same fill arrives multiple times with escalating statuses
+            # (MATCHED -> MINED -> CONFIRMED). We also handle genuine partial fills where
+            # different chunks fill at different times (distinct match_id or size).
             async with self._pending_lock:
                 if order_id and order_id in self._pending_orders:
                     pending = self._pending_orders[order_id]
 
-                    # Only add to filled_size on first fill callback (MATCHED)
-                    # Subsequent callbacks (MINED, CONFIRMED) are status updates only
-                    if pending.status == OrderStatus.PENDING or pending.filled_size == 0:
-                        # First fill notification - add the size
-                        pending.filled_size = fill.size  # Use SET not ADD to be safe
-                        logger.debug(f"First fill for order {order_id[:16]}...: {fill.size:.2f} shares")
+                    # Token ID validation: ensure fill belongs to this order's market
+                    if fill.token_id and pending.token_id and fill.token_id != pending.token_id:
+                        logger.warning(
+                            f"Token mismatch for order {order_id[:16]}...: "
+                            f"fill token={fill.token_id[:16]}... != pending token={pending.token_id[:16]}..."
+                        )
+                        # Still update status but don't count fill size
+                        pending.status = fill.status
                     else:
-                        # Status update only - already counted this fill
-                        logger.debug(f"Status update for order {order_id[:16]}...: {pending.status.value} -> {fill.status.value}")
+                        # Dedup key: use match_id if available, fall back to (size, price) tuple
+                        if fill.match_id:
+                            dedup_key = fill.match_id
+                        else:
+                            dedup_key = (fill.size, fill.price)
 
-                    pending.status = fill.status
+                        if dedup_key not in pending._seen_fills:
+                            # Genuinely new fill — accumulate
+                            pending._seen_fills.add(dedup_key)
+                            pending.filled_size += fill.size
+                            logger.debug(
+                                f"New fill for order {order_id[:16]}...: +{fill.size:.2f} shares "
+                                f"(total filled: {pending.filled_size:.2f}/{pending.size:.2f})"
+                            )
+                        else:
+                            # Status escalation of already-counted fill
+                            logger.debug(
+                                f"Status update for order {order_id[:16]}...: "
+                                f"{pending.status.value} -> {fill.status.value}"
+                            )
+
+                        pending.status = fill.status
 
                     # Remove if fully filled or terminal status
                     if (pending.filled_size >= pending.size or

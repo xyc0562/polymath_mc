@@ -98,12 +98,15 @@ def _best_fak_price(
     best_size = (size // base_step) * base_step
     best_price = price
 
+    # Use market tick size as bump increment (fall back to finest tick)
+    tick = float(tick_size) if tick_size else 0.0001
+    dp = len(tick_size.rstrip("0").split(".")[-1]) if tick_size and "." in tick_size else 4
+
     for bump in range(1, max_tick_bump + 1):
-        tick = 0.0001
         if side == "BUY":
-            candidate_price = round(price + bump * tick, 4)
+            candidate_price = round(price + bump * tick, dp)
         else:
-            candidate_price = round(price - bump * tick, 4)
+            candidate_price = round(price - bump * tick, dp)
             if candidate_price <= 0:
                 continue
 
@@ -577,7 +580,7 @@ class KellyExecutor:
         self.trade_executor = trade_executor
 
         # Reverse mapping: token_id -> bin_index (for fill callbacks)
-        self.token_to_bin: Dict[str, int] = {v: k for k, v in token_ids.items()}
+        self.token_to_bin: Dict[str, int] = {v: k for k, v in self.token_ids.items()}
         # Also add NO token mappings
         for bin_idx, no_token_id in self.no_token_ids.items():
             if no_token_id:
@@ -876,6 +879,7 @@ class KellyExecutor:
                                 price=trade.price,
                                 size=trade.size,
                                 bin_index=trade.bin_index,
+                                condition_id=token_id,  # Token uniquely identifies the market condition
                             )
                             asyncio.create_task(self.user_stream.add_pending_order(pending))
 
