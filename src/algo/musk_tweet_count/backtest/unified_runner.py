@@ -939,14 +939,19 @@ class UnifiedBacktestRunner:
         portfolio: Portfolio,
         winner_bin: Optional[int],
     ) -> Dict[int, float]:
-        """Calculate P&L for each bin (handles both YES and NO in same bin)."""
+        """Calculate total P&L for each bin (realized trading P&L + settlement P&L)."""
         pnl_by_bin = {}
 
         for bin_index, pos in portfolio.positions.items():
-            if not (pos.has_yes_position or pos.has_no_position):
+            has_position = pos.has_yes_position or pos.has_no_position
+            has_realized = abs(pos.realized_pnl) > 0.001
+            if not (has_position or has_realized):
                 continue
 
-            pnl = 0.0
+            # Start with realized P&L from trades already closed
+            pnl = pos.realized_pnl
+
+            # Add settlement P&L for positions still held
             is_winner = (bin_index == winner_bin)
 
             if pos.has_yes_position:

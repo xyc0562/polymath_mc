@@ -25,9 +25,10 @@ Usage:
 
 import argparse
 import logging
+import multiprocessing
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .runner import BacktestRunner, BacktestConfig, BacktestResult
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, CollateralConfig, EventTradingRulesConfig
@@ -139,44 +140,141 @@ def run_single_backtest(
     return runner.run(event_dir)
 
 
+def _preload_posts(runner, event_dirs: List[str]):
+    """Pre-load posts data for all events to ensure cache is warm."""
+    from datetime import timedelta
+
+    earliest_start = None
+    latest_end = None
+
+    for event_dir in event_dirs:
+        event = runner.price_provider.load_event(event_dir)
+        if event:
+            training_start = event.start_date - timedelta(days=runner.config.training_days)
+            if earliest_start is None or training_start < earliest_start:
+                earliest_start = training_start
+            if latest_end is None or event.end_date > latest_end:
+                latest_end = event.end_date
+
+    if earliest_start and latest_end:
+        logger.info(f"Pre-loading posts for full date range: {earliest_start} to {latest_end}")
+        runner.posts_provider.load_or_fetch(
+            start_date=earliest_start,
+            end_date=latest_end + timedelta(days=1),
+        )
+
+
+def _worker_run_event(args: Tuple) -> Tuple[str, Optional[BacktestResult], str]:
+    """Worker function for multiprocessing. Runs a single event with its own runner.
+
+    Returns (event_dir, result, captured_logs).
+    """
+    import io
+    event_dir, runner_type, config, price_data_dir, cache_dir, log_level = args
+
+    # Capture all logging output to a string buffer
+    log_buffer = io.StringIO()
+    handler = logging.StreamHandler(log_buffer)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+    # Replace all handlers on root logger with our buffer handler
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(log_level)
+
+    try:
+        if runner_type == "unified":
+            from .unified_runner import UnifiedBacktestRunner
+            runner = UnifiedBacktestRunner(
+                config=config,
+                price_data_dir=price_data_dir,
+                cache_dir=cache_dir,
+            )
+        else:
+            runner = BacktestRunner(
+                config=config,
+                price_data_dir=price_data_dir,
+                cache_dir=cache_dir,
+            )
+
+        result = runner.run(event_dir)
+        return (event_dir, result, log_buffer.getvalue())
+    except Exception as e:
+        logging.error(f"Worker error for {event_dir}: {e}")
+        return (event_dir, None, log_buffer.getvalue())
+
+
 def run_multiple_backtests(
     runner: BacktestRunner,
     event_dirs: List[str],
+    parallel: int = 0,
 ) -> List[BacktestResult]:
-    """Run backtest on multiple events."""
+    """Run backtest on multiple events, optionally in parallel."""
     # Pre-load all data for the full date range to avoid cache issues
     if event_dirs:
-        from datetime import timedelta
+        _preload_posts(runner, event_dirs)
 
-        # Find earliest and latest dates needed
-        earliest_start = None
-        latest_end = None
+    if parallel > 1 and len(event_dirs) > 1:
+        return _run_parallel(runner, event_dirs, parallel)
 
-        for event_dir in event_dirs:
-            event = runner.price_provider.load_event(event_dir)
-            if event:
-                training_start = event.start_date - timedelta(days=runner.config.training_days)
-                if earliest_start is None or training_start < earliest_start:
-                    earliest_start = training_start
-                if latest_end is None or event.end_date > latest_end:
-                    latest_end = event.end_date
-
-        if earliest_start and latest_end:
-            logger.info(f"Pre-loading posts for full date range: {earliest_start} to {latest_end}")
-            runner.posts_provider.load_or_fetch(
-                start_date=earliest_start,
-                end_date=latest_end + timedelta(days=1),
-            )
-
+    # Sequential fallback
     results = []
-
     for i, event_dir in enumerate(event_dirs, 1):
         logger.info(f"\n[{i}/{len(event_dirs)}] Running backtest: {event_dir}")
-
         result = runner.run(event_dir)
         if result:
             results.append(result)
+    return results
 
+
+def _run_parallel(
+    runner: BacktestRunner,
+    event_dirs: List[str],
+    num_processes: int,
+) -> List[BacktestResult]:
+    """Run backtests in parallel using multiprocessing.
+
+    Streams logs as each event completes (not necessarily in order).
+    Results are collected and returned sorted by event order.
+    """
+    import sys
+
+    # Determine runner type and config
+    from .unified_runner import UnifiedBacktestRunner
+    if isinstance(runner, UnifiedBacktestRunner):
+        runner_type = "unified"
+    else:
+        runner_type = "legacy"
+
+    log_level = logging.getLogger().level
+    worker_args = [
+        (event_dir, runner_type, runner.config, runner.price_data_dir, runner.cache_dir, log_level)
+        for event_dir in event_dirs
+    ]
+
+    num_procs = min(num_processes, len(event_dirs))
+    logger.info(f"Running {len(event_dirs)} events across {num_procs} processes")
+
+    # Use imap_unordered to stream results as they complete
+    results_by_event = {}
+    completed = 0
+    with multiprocessing.Pool(processes=num_procs) as pool:
+        for event_dir, result, logs in pool.imap_unordered(_worker_run_event, worker_args):
+            completed += 1
+            # Stream logs immediately as each event finishes
+            if logs:
+                sys.stderr.write(logs)
+                sys.stderr.flush()
+            logger.info(f"[{completed}/{len(event_dirs)}] Finished: {event_dir}")
+            if result is not None:
+                results_by_event[event_dir] = result
+
+    # Return results in original event order
+    results = [results_by_event[ed] for ed in event_dirs if ed in results_by_event]
+    logger.info(f"Completed: {len(results)}/{len(event_dirs)} events returned results")
     return results
 
 
@@ -272,6 +370,13 @@ def main():
         type=int,
         default=0,
         help="Limit to first N events after filtering (0 = no limit)",
+    )
+
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=8,
+        help="Number of parallel processes for multi-event runs (default: 8, 1 = sequential)",
     )
 
     # Trading parameters
@@ -690,7 +795,7 @@ def main():
         if result:
             print_summary([result])
     else:
-        results = run_multiple_backtests(runner, event_dirs)
+        results = run_multiple_backtests(runner, event_dirs, parallel=args.parallel)
         print_summary(results)
 
 

@@ -628,8 +628,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tick-interval",
         type=int,
-        default=300,
-        help="Seconds between trading ticks (default: 300)",
+        default=3600,
+        help="Seconds between trading ticks (default: 3600)",
     )
     parser.add_argument(
         "--dry-run",

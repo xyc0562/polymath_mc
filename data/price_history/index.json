@@ -1,70 +1,7 @@
 {
-  "scraped_at": "2026-02-22T19:10:15.100688",
-  "num_events": 9,
+  "scraped_at": "2026-02-22T21:26:09.292926",
+  "num_events": 2,
   "events": [
-    {
-      "event_id": "194167",
-      "title": "Elon Musk # tweets February 3 - February 10, 2026?",
-      "short_name": "Feb 3 - Feb 10",
-      "start_date": "2026-01-31",
-      "end_date": "2026-02-10",
-      "num_bins": 38,
-      "directory": "2026-02-10_Feb_3_-_Feb_10"
-    },
-    {
-      "event_id": "201408",
-      "title": "Elon Musk # tweets February 9 - February 11, 2026?",
-      "short_name": "Feb 9 - Feb 11",
-      "start_date": "2026-02-07",
-      "end_date": "2026-02-11",
-      "num_bins": 10,
-      "directory": "2026-02-11_Feb_9_-_Feb_11"
-    },
-    {
-      "event_id": "197206",
-      "title": "Elon Musk # tweets February 6 - February 13, 2026?",
-      "short_name": "Feb 6 - Feb 13",
-      "start_date": "2026-02-03",
-      "end_date": "2026-02-13",
-      "num_bins": 30,
-      "directory": "2026-02-13_Feb_6_-_Feb_13"
-    },
-    {
-      "event_id": "203558",
-      "title": "Elon Musk # tweets February 12 - February 14, 2026?",
-      "short_name": "Feb 12 - Feb 14",
-      "start_date": "2026-02-09",
-      "end_date": "2026-02-14",
-      "num_bins": 10,
-      "directory": "2026-02-14_Feb_12_-_Feb_14"
-    },
-    {
-      "event_id": "206602",
-      "title": "Elon Musk # tweets February 14 - February 16, 2026?",
-      "short_name": "Feb 14 - Feb 16",
-      "start_date": "2026-02-12",
-      "end_date": "2026-02-16",
-      "num_bins": 10,
-      "directory": "2026-02-16_Feb_14_-_Feb_16"
-    },
-    {
-      "event_id": "200970",
-      "title": "Elon Musk # tweets February 10 - February 17, 2026?",
-      "short_name": "Feb 10 - Feb 17",
-      "start_date": "2026-02-07",
-      "end_date": "2026-02-17",
-      "num_bins": 30,
-      "directory": "2026-02-17_Feb_10_-_Feb_17"
-    },
-    {
-      "event_id": "209120",
-      "title": "Elon Musk # tweets February 16 - February 18, 2026?",
-      "short_name": "Feb 16 - Feb 18",
-      "start_date": "2026-02-14",
-      "end_date": "2026-02-18",
-      "num_bins": 10,
-      "directory": "2026-02-18_Feb_16_-_Feb_18"
-    },
     {
       "event_id": "203944",
       "title": "Elon Musk # tweets February 13 - February 20, 2026?",

@@ -42,6 +42,9 @@ class BinPosition:
     # Collateral tied up in positions
     collateral_used: float = 0.0
 
+    # Realized P&L from closed trades (sells)
+    realized_pnl: float = 0.0
+
     @property
     def has_yes_position(self) -> bool:
         """Check if we hold YES shares."""
@@ -89,6 +92,7 @@ class BinPosition:
 
         self.yes_shares -= shares
         self.collateral_used -= cost_basis
+        self.realized_pnl += pnl
 
         return pnl
 
@@ -122,6 +126,7 @@ class BinPosition:
 
         self.no_shares -= shares
         self.collateral_used -= cost_basis
+        self.realized_pnl += pnl
 
         return pnl
 
@@ -389,6 +394,7 @@ class Portfolio:
                 yes_avg_cost=pos.yes_avg_cost,
                 no_avg_cost=pos.no_avg_cost,
                 collateral_used=pos.collateral_used,
+                realized_pnl=pos.realized_pnl,
             )
 
         return Portfolio(
