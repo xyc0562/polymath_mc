@@ -267,6 +267,13 @@ def main():
         help="Only test events with this counting window duration in days (e.g., 7 for weekly events)",
     )
 
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=0,
+        help="Limit to first N events after filtering (0 = no limit)",
+    )
+
     # Trading parameters
     parser.add_argument(
         "--capital",
@@ -456,6 +463,13 @@ def main():
     )
 
     parser.add_argument(
+        "--tick-interval",
+        type=int,
+        default=3600,
+        help="Tick interval in seconds (default: 3600 = 1 hour).",
+    )
+
+    parser.add_argument(
         "--projection",
         type=str,
         default="asymmetric",
@@ -593,6 +607,7 @@ def main():
             projection_model=args.projection,
             intraday_mode=args.intraday_mode,
             event_trading_rules=event_trading_rules,
+            tick_interval_seconds=args.tick_interval,
         )
 
         runner = UnifiedBacktestRunner(
@@ -662,6 +677,10 @@ def main():
             if not event_dirs:
                 logger.error(f"No events match the duration filter ({args.duration} days)")
                 return
+
+        # Limit number of events if specified
+        if args.max_events and args.max_events > 0:
+            event_dirs = event_dirs[:args.max_events]
 
     logger.info(f"Will test {len(event_dirs)} event(s)")
 

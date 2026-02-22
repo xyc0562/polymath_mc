@@ -6,6 +6,7 @@ on historical data by providing simulated orderbooks and execution.
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -188,15 +189,20 @@ class BacktestTradeExecutor(TradeExecutor):
         # Clamp price to valid range
         filled_price = max(0.001, min(0.999, filled_price))
 
-        # Check if we have enough capital for buys
+        # Check if we have enough capital for buys; reduce size to fit if needed
         if action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
             cost = size * filled_price
             if cost > self.portfolio.available_capital:
-                return ExecutionResult(
-                    success=False,
-                    candidate=candidate,
-                    error=f"Insufficient capital: need ${cost:.2f}, have ${self.portfolio.available_capital:.2f}",
-                )
+                # Reduce size to fit available capital
+                max_affordable = math.floor(self.portfolio.available_capital / filled_price)
+                if max_affordable < 1 or max_affordable * filled_price < 1.0:
+                    return ExecutionResult(
+                        success=False,
+                        candidate=candidate,
+                        error=f"Insufficient capital: need ${cost:.2f}, have ${self.portfolio.available_capital:.2f}",
+                    )
+                size = max_affordable
+                cost = size * filled_price
 
         # Execute trade on portfolio
         self._update_portfolio(candidate, size, filled_price, token_id)
