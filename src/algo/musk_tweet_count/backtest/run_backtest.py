@@ -505,6 +505,32 @@ def main():
              "Example: config/event_trading_rules.yaml",
     )
 
+    # Wind-down (early termination) parameters
+    parser.add_argument(
+        "--wind-down-start",
+        type=float,
+        default=0.0,
+        help="Hours before settlement to start closing positions (0 = disabled). Default: 0",
+    )
+    parser.add_argument(
+        "--wind-down-end",
+        type=float,
+        default=0.0,
+        help="Hours before settlement to finish closing positions. Default: 0",
+    )
+    parser.add_argument(
+        "--wind-down-excess",
+        type=float,
+        default=1.2,
+        help="Excess sell ratio during wind-down (1.2 = sell 20%% faster than linear). Default: 1.2",
+    )
+    parser.add_argument(
+        "--wind-down-tick",
+        type=float,
+        default=60.0,
+        help="Seconds between wind-down sell ticks. Default: 60",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -560,6 +586,10 @@ def main():
             min_sell_utility=args.min_sell_utility,
             t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
             kelly_only_exit=(args.exit_mode == "kelly_only"),
+            wind_down_start_hours=args.wind_down_start,
+            wind_down_end_hours=args.wind_down_end,
+            wind_down_excess_ratio=args.wind_down_excess,
+            wind_down_tick_seconds=args.wind_down_tick,
             edge_buffer=EdgeBufferConfig(
                 required_roi=args.roi,
                 friction_mid=args.friction_mid,
@@ -607,6 +637,11 @@ def main():
             logger.info(f"Exit mode: {args.exit_mode}")
         if args.capital_multiplier != 1.0:
             logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
+        if args.wind_down_start > 0:
+            logger.info(
+                f"Wind-down: start={args.wind_down_start}h, end={args.wind_down_end}h, "
+                f"excess={args.wind_down_excess}x, tick={args.wind_down_tick}s"
+            )
     else:
         # Use legacy runner
         edge_buffer = EdgeBufferConfig(

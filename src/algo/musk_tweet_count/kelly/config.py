@@ -177,6 +177,13 @@ class KellyConfig:
     # Trading cutoff hours before settlement
     t_stop_hours: float = 3.0
 
+    # Early termination: gradually close positions before settlement
+    # wind_down_start_hours=0 means disabled.
+    wind_down_start_hours: float = 0.0  # Hours before settlement to start closing
+    wind_down_end_hours: float = 0.0    # Hours before settlement to be fully closed
+    wind_down_excess_ratio: float = 1.2  # Sell at 1.2x the linear rate to absorb missed fills
+    wind_down_tick_seconds: float = 60.0  # Seconds between wind-down sell ticks
+
     # Exit mode: when True, exits use only utility check (utility_gain >= 0)
     # and skip the fair-value price threshold check.
     kelly_only_exit: bool = True

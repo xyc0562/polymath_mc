@@ -1039,10 +1039,15 @@ class MultiEventManager:
             else:
                 t_stop = self.kelly_config.t_stop_hours
 
-            if hours_to_settlement <= t_stop:
+            # If wind-down is enabled, keep event active until wind_down_end_hours
+            effective_stop = t_stop
+            if self.kelly_config.wind_down_start_hours > 0:
+                effective_stop = self.kelly_config.wind_down_end_hours
+
+            if hours_to_settlement <= effective_stop:
                 logger.info(
                     f"Event {event_id} too close to settlement "
-                    f"({hours_to_settlement:.1f}h remaining, t_stop={t_stop}h)"
+                    f"({hours_to_settlement:.1f}h remaining, effective_stop={effective_stop}h)"
                 )
                 return False
 
@@ -1132,8 +1137,13 @@ class MultiEventManager:
             else:
                 t_stop = self.kelly_config.t_stop_hours
 
-            if hours_to_settlement <= t_stop:
-                logger.info(f"Event {event_id} expired (t_stop={t_stop}h), removing from pending")
+            # If wind-down is enabled, keep event active until wind_down_end_hours
+            effective_stop = t_stop
+            if self.kelly_config.wind_down_start_hours > 0:
+                effective_stop = self.kelly_config.wind_down_end_hours
+
+            if hours_to_settlement <= effective_stop:
+                logger.info(f"Event {event_id} expired (effective_stop={effective_stop}h), removing from pending")
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
                 # Return any restored capital allocation (e.g., from reconstruct_state_from_api)

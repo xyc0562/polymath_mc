@@ -89,6 +89,11 @@ def log_config_summary(
     w(f"    Prob EMA alpha:          {kelly_config.prob_ema_alpha}")
     w(f"    T_stop hours:            per-event (from trading rules, default={kelly_config.t_stop_hours})")
     w(f"    Max iters/tick:          {kelly_config.max_iters_per_tick}")
+    if kelly_config.wind_down_start_hours > 0:
+        w(f"    Wind-down start:         T-{kelly_config.wind_down_start_hours}h")
+        w(f"    Wind-down end:           T-{kelly_config.wind_down_end_hours}h")
+        w(f"    Wind-down excess ratio:  {kelly_config.wind_down_excess_ratio}x")
+        w(f"    Wind-down tick:          {kelly_config.wind_down_tick_seconds}s")
     w("")
 
     # Edge buffer
@@ -757,6 +762,32 @@ def parse_args() -> argparse.Namespace:
              "linear F(τ) scaling, 'bucket' uses Negative Binomial per 3-hour bucket.",
     )
 
+    # Wind-down (early termination) parameters
+    parser.add_argument(
+        "--wind-down-start",
+        type=float,
+        default=0.0,
+        help="Hours before settlement to start closing positions (0 = disabled). Default: 0",
+    )
+    parser.add_argument(
+        "--wind-down-end",
+        type=float,
+        default=0.0,
+        help="Hours before settlement to finish closing positions. Default: 0",
+    )
+    parser.add_argument(
+        "--wind-down-excess",
+        type=float,
+        default=1.2,
+        help="Excess sell ratio during wind-down. Default: 1.2",
+    )
+    parser.add_argument(
+        "--wind-down-tick",
+        type=float,
+        default=60.0,
+        help="Seconds between wind-down sell ticks. Default: 60",
+    )
+
     # Other
     parser.add_argument(
         "-v", "--verbose",
@@ -863,6 +894,10 @@ async def main() -> None:
         min_sell_utility=args.min_sell_utility,
         edge_buffer=edge_buffer_config,
         collateral=collateral_config,
+        wind_down_start_hours=args.wind_down_start,
+        wind_down_end_hours=args.wind_down_end,
+        wind_down_excess_ratio=args.wind_down_excess,
+        wind_down_tick_seconds=args.wind_down_tick,
     )
 
     # max_per_event: CLI override or kelly_config default

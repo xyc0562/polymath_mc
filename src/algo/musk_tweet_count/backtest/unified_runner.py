@@ -294,7 +294,7 @@ class UnifiedBacktestRunner:
         sampled_timestamps = self._sample_timestamps(event.all_timestamps, tick_interval)
         logger.info(f"  Sampled {len(sampled_timestamps)} ticks (every {tick_interval}s)")
 
-        # Calculate settlement time for exit logic
+        # Calculate settlement time
         # Settlement is at 12pm EST (noon ET) on the end date of counting
         # Contract days use noon ET boundaries: "Dec 19 - Dec 26" means Dec 19 12:00 to Dec 26 12:00
         # So counting_end_date = Dec 26 means settlement at Dec 26 12:00 ET
@@ -313,8 +313,27 @@ class UnifiedBacktestRunner:
         )
         # Also use this to stop processing ticks after settlement
         settlement_ts = int(settlement_dt.timestamp())
-        exit_window_start = settlement_dt - timedelta(hours=self.config.exit_hours_before_settlement)
-        in_exit_mode = False
+
+        # Inject wind-down timestamps at finer intervals if wind-down is enabled
+        wind_start_h = kelly_config.wind_down_start_hours
+        wind_end_h = kelly_config.wind_down_end_hours
+        wind_tick_s = kelly_config.wind_down_tick_seconds
+        if wind_start_h > 0 and wind_tick_s > 0:
+            wind_down_begin_ts = settlement_ts - int(wind_start_h * 3600)
+            wind_down_finish_ts = settlement_ts - int(wind_end_h * 3600)
+            wind_down_timestamps = []
+            ts_cursor = wind_down_begin_ts
+            tick_step = max(1, int(wind_tick_s))  # Ensure at least 1s step to prevent infinite loop
+            while ts_cursor <= wind_down_finish_ts:
+                wind_down_timestamps.append(ts_cursor)
+                ts_cursor += tick_step
+            # Merge and deduplicate, keeping sorted order
+            merged = sorted(set(sampled_timestamps + wind_down_timestamps))
+            logger.info(
+                f"  Wind-down: injected {len(wind_down_timestamps)} ticks "
+                f"({wind_tick_s:.0f}s interval), total={len(merged)} ticks"
+            )
+            sampled_timestamps = merged
 
         # Track contract day for interday model updates
         last_contract_day = None
@@ -358,19 +377,14 @@ class UnifiedBacktestRunner:
             if ts >= settlement_ts:
                 break
 
-            # Check for early exit mode
-            if self.config.exit_hours_before_settlement > 0 and dt >= exit_window_start and not in_exit_mode:
-                in_exit_mode = True
-                logger.info(f"  Entering exit mode at {dt.strftime('%Y-%m-%d %H:%M')}")
-                # Note: In unified system, we continue running but T_stop will prevent new trades
-                # and the executor will hold positions to settlement
-                continue
-
-            if in_exit_mode:
-                continue
-
             # Check event trading rules (duration-based restrictions)
-            if self.config.event_trading_rules is not None:
+            # But skip rule gating during wind-down — wind-down sells must always proceed
+            hours_to_settle = (settlement_dt - dt.astimezone(est_tz)).total_seconds() / 3600.0
+            in_wind_down = (
+                kelly_config.wind_down_start_hours > 0
+                and hours_to_settle <= kelly_config.wind_down_start_hours
+            )
+            if self.config.event_trading_rules is not None and not in_wind_down:
                 # Convert dt to EST for consistent comparison with counting_start_dt and settlement_dt
                 dt_est = dt.astimezone(est_tz)
                 is_allowed, reason = self._check_trading_rules(

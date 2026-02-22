@@ -1010,11 +1010,46 @@ class GASKellyTradingBot:
         # Run initial tick to establish baseline
         await self.run_sync_driven_tick()
 
+        # Wind-down async task (spawned when wind-down starts)
+        wind_down_task: Optional[asyncio.Task] = None
+
         while self._running:
             try:
                 hours_elapsed, hours_remaining = self._get_timing()
                 if hours_remaining <= 0:
                     logger.info("Past settlement time, stopping")
+                    break
+
+                # Check if wind-down should start
+                wind_start = self.kelly_config.wind_down_start_hours
+                wind_end = self.kelly_config.wind_down_end_hours
+                if wind_start > 0 and hours_remaining <= wind_start and wind_down_task is None:
+                    logger.info(
+                        f"[{self.bot_config.event_name}] Starting wind-down timer "
+                        f"(tick every {self.kelly_config.wind_down_tick_seconds}s)"
+                    )
+                    wind_down_task = asyncio.create_task(
+                        self._run_wind_down_timer(),
+                        name=f"wind_down_{self.bot_config.event_name}",
+                    )
+
+                # If wind-down is complete, wait for timer to finish its final tick then stop
+                if wind_start > 0 and hours_remaining <= wind_end:
+                    logger.info(f"[{self.bot_config.event_name}] Past wind-down end")
+                    if wind_down_task is not None and not wind_down_task.done():
+                        # Give the timer a chance to run its final sell tick
+                        try:
+                            await asyncio.wait_for(wind_down_task, timeout=30)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"[{self.bot_config.event_name}] Wind-down timer didn't finish in 30s, cancelling")
+                            wind_down_task.cancel()
+                            try:
+                                await wind_down_task
+                            except asyncio.CancelledError:
+                                pass
+                        wind_down_task = None  # Prevent double-cancel in cleanup below
+                    # Any remaining positions are held to settlement
+                    logger.info(f"[{self.bot_config.event_name}] Wind-down complete, holding any remaining positions to settlement")
                     break
 
                 # Idle — just wait for stop signal or periodic check (60s)
@@ -1030,6 +1065,57 @@ class GASKellyTradingBot:
             except Exception as e:
                 logger.error(f"Error in sync-driven idle loop: {e}")
                 await asyncio.sleep(30)
+
+        # Cancel wind-down task if running
+        if wind_down_task is not None and not wind_down_task.done():
+            wind_down_task.cancel()
+            try:
+                await wind_down_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run_wind_down_timer(self) -> None:
+        """
+        Async timer for wind-down sells, independent of XTracker sync.
+
+        Calls run_tick() every wind_down_tick_seconds. The executor's run_tick()
+        handles wind-down logic (computing sell targets, placing FAK orders).
+        """
+        tick_interval = self.kelly_config.wind_down_tick_seconds
+        ename = self.bot_config.event_name or "unknown"
+        logger.info(f"[{ename}] Wind-down timer started (interval={tick_interval}s)")
+
+        while self._running:
+            try:
+                # Check if past wind-down end
+                _, hours_remaining = self._get_timing()
+                if hours_remaining <= self.kelly_config.wind_down_end_hours:
+                    # Final sell: run one last tick to sell all remaining
+                    logger.info(f"[{ename}] Wind-down end reached, running final sell tick")
+                    await self.run_tick(log_header=False)
+                    break
+
+                # Run a tick (executor handles wind-down logic)
+                await self.run_tick(log_header=False)
+
+                # Sleep until next wind-down tick
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=tick_interval,
+                    )
+                    break  # Stop requested
+                except asyncio.TimeoutError:
+                    pass
+
+            except asyncio.CancelledError:
+                logger.info(f"[{ename}] Wind-down timer cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[{ename}] Error in wind-down timer: {e}", exc_info=True)
+                await asyncio.sleep(tick_interval)
+
+        logger.info(f"[{ename}] Wind-down timer stopped")
 
     async def _run_legacy_loop(self) -> None:
         """Legacy two-pronged slow/fast tick loop (for backtest/standalone)."""

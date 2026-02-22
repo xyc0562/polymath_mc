@@ -615,6 +615,10 @@ class KellyExecutor:
         # giving the API time to propagate the fill to positions endpoint.
         self._post_confirm_delay: float = 5.0
 
+        # Wind-down state
+        self._in_wind_down: bool = False
+        self._wind_down_snapshot: Optional[Dict[int, Dict[str, float]]] = None  # bin_idx -> {yes: shares, no: shares}
+
     def _check_rate_limit(self) -> bool:
         """
         Check if we're within rate limits.
@@ -701,6 +705,16 @@ class KellyExecutor:
             num_executed=0,
             total_utility_gain=0.0,
         )
+
+        # Check wind-down mode (before T_stop check)
+        wind_start = self.config.wind_down_start_hours
+        wind_end = self.config.wind_down_end_hours
+        if wind_start > 0 and hours_to_settlement <= wind_start:
+            if not self._in_wind_down:
+                self._in_wind_down = True
+                self._wind_down_snapshot = self._snapshot_positions()
+                logger.info(f"[{self.event_name}] WIND-DOWN: Starting (T-{hours_to_settlement:.1f}h)")
+            return await self._run_wind_down_tick(hours_to_settlement)
 
         # Check T_stop
         if hours_to_settlement <= self.config.t_stop_hours:
@@ -981,6 +995,16 @@ class KellyExecutor:
             num_executed=0,
             total_utility_gain=0.0,
         )
+
+        # Check wind-down mode (before T_stop check)
+        wind_start = self.config.wind_down_start_hours
+        wind_end = self.config.wind_down_end_hours
+        if wind_start > 0 and hours_to_settlement <= wind_start:
+            if not self._in_wind_down:
+                self._in_wind_down = True
+                self._wind_down_snapshot = self._snapshot_positions()
+                logger.info(f"[{self.event_name}] WIND-DOWN: Starting (T-{hours_to_settlement:.1f}h)")
+            return self._run_wind_down_tick_sync(hours_to_settlement)
 
         # Check T_stop
         if hours_to_settlement <= self.config.t_stop_hours:
@@ -1985,6 +2009,265 @@ class KellyExecutor:
     def stop(self) -> None:
         """Signal executor to stop."""
         self._running = False
+
+    def _snapshot_positions(self) -> Dict[int, Dict[str, float]]:
+        """Deep-copy current positions (yes_shares, no_shares per bin) for wind-down."""
+        snapshot = {}
+        for bin_idx, pos in self.portfolio.positions.items():
+            snapshot[bin_idx] = {
+                "yes": pos.yes_shares,
+                "no": pos.no_shares,
+            }
+        return snapshot
+
+    def _compute_wind_down_sells(
+        self,
+        hours_to_settlement: float,
+    ) -> List[TradeCandidate]:
+        """
+        Compute wind-down sell candidates based on linear schedule.
+
+        Returns list of TradeCandidate objects for sells needed this tick.
+        """
+        wind_start = self.config.wind_down_start_hours
+        wind_end = self.config.wind_down_end_hours
+        excess = self.config.wind_down_excess_ratio
+
+        # Compute progress
+        if wind_start <= wind_end:
+            progress = 1.0
+        else:
+            progress = (wind_start - hours_to_settlement) / (wind_start - wind_end)
+        progress = max(0.0, min(1.0, progress))
+
+        # Apply excess ratio
+        aggressive_progress = min(1.0, progress * excess)
+
+        # Past wind_end: sell everything
+        if hours_to_settlement <= wind_end:
+            aggressive_progress = 1.0
+
+        sells = []
+        snapshot = self._wind_down_snapshot or {}
+
+        for bin_idx, orig in snapshot.items():
+            pos = self.portfolio.get_position(bin_idx)
+            if not pos:
+                continue
+
+            # YES side
+            if orig["yes"] > 0:
+                target_yes = max(0, math.floor(orig["yes"] * (1 - aggressive_progress)))
+                to_sell_yes = pos.yes_shares - target_yes
+                sell = self._make_wind_down_sell(
+                    bin_idx, "yes", to_sell_yes, pos.yes_shares
+                )
+                if sell:
+                    sells.append(sell)
+
+            # NO side
+            if orig["no"] > 0:
+                target_no = max(0, math.floor(orig["no"] * (1 - aggressive_progress)))
+                to_sell_no = pos.no_shares - target_no
+                sell = self._make_wind_down_sell(
+                    bin_idx, "no", to_sell_no, pos.no_shares
+                )
+                if sell:
+                    sells.append(sell)
+
+        logger.info(
+            f"[{self.event_name}] WIND-DOWN: progress={progress:.1%} "
+            f"aggressive={aggressive_progress:.1%} "
+            f"sells={len(sells)}"
+        )
+        return sells
+
+    def _make_wind_down_sell(
+        self,
+        bin_idx: int,
+        side: str,  # "yes" or "no"
+        to_sell: float,
+        current_shares: float,
+    ) -> Optional[TradeCandidate]:
+        """Create a TradeCandidate for a wind-down sell, or None if skip."""
+        to_sell = math.floor(to_sell)
+        if to_sell < 1:
+            return None
+
+        # Anti-stranding: if remaining shares would be < MIN_ORDER_SIZE, sell all
+        remaining = current_shares - to_sell
+        if 0 < remaining < MIN_ORDER_SIZE:
+            to_sell = math.floor(current_shares)
+            if to_sell < 1:
+                return None
+
+        # Get best bid from orderbook for price
+        orderbooks = self._get_orderbooks()
+        ob = orderbooks.get(bin_idx)
+
+        if side == "yes":
+            action = TradeAction.SELL_YES
+            best_bid = ob.best_yes_bid if ob and ob.best_yes_bid else 0.01
+        else:
+            action = TradeAction.SELL_NO
+            best_bid = ob.best_no_bid if ob and ob.best_no_bid else 0.01
+
+        # Check minimum value
+        if to_sell * best_bid < MIN_ORDER_VALUE_USD:
+            return None
+
+        # Apply _best_fak_price for decimal precision (SELL side)
+        tick_size = None  # Let _best_fak_price handle default
+        adj_price, adj_size = _best_fak_price(best_bid, to_sell, "SELL", tick_size=tick_size)
+
+        if adj_size < 1:
+            return None
+
+        return TradeCandidate(
+            bin_index=bin_idx,
+            action=action,
+            size=adj_size,
+            price=adj_price,
+            utility_gain=0.0,
+            reservation_price=0.0,
+            edge=0.0,
+            limit_price=adj_price,
+        )
+
+    async def _run_wind_down_tick(
+        self,
+        hours_to_settlement: float,
+    ) -> TickResult:
+        """Run a single wind-down tick (production async path)."""
+        start_time = time.time()
+        tick_result = TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+        )
+
+        # Sync portfolio FIRST so sell sizes are based on current positions
+        if self.sync_portfolio:
+            try:
+                await self.sync_portfolio()
+            except Exception as e:
+                logger.warning(f"[{self.event_name}] Wind-down: failed to sync portfolio: {e}")
+
+        sells = self._compute_wind_down_sells(hours_to_settlement)
+        if not sells:
+            tick_result.elapsed_seconds = time.time() - start_time
+            return tick_result
+
+        tick_result.num_candidates = len(sells)
+
+        # Execute each sell
+        for trade in sells:
+            result = None
+            token_id = self._get_token_id_for_action(trade)
+            if not token_id:
+                token_id = self.token_ids.get(trade.bin_index, f"token_{trade.bin_index}")
+
+            if self.order_executor and not self.order_executor.dry_run:
+                result = self.order_executor.execute_candidate(trade, token_id)
+                tick_result.executions.append(result)
+                if result.success:
+                    tick_result.num_executed += 1
+                    self._record_order()
+                    # Register pending order for fill tracking
+                    if result.order_id:
+                        self._pending_orders[result.order_id] = (trade, token_id)
+                        confirm_event = asyncio.Event()
+                        self._confirmation_events[result.order_id] = confirm_event
+                        if self.user_stream:
+                            from .user_stream import PendingOrder
+                            pending = PendingOrder(
+                                order_id=result.order_id,
+                                token_id=token_id,
+                                side="SELL",
+                                price=trade.price,
+                                size=trade.size,
+                                bin_index=trade.bin_index,
+                                condition_id=token_id,
+                            )
+                            asyncio.create_task(self.user_stream.add_pending_order(pending))
+            elif self.order_executor and self.order_executor.dry_run:
+                # Dry run: simulate fill
+                self._update_portfolio(
+                    candidate=trade,
+                    token_id=token_id,
+                    filled_size=trade.size,
+                    filled_price=trade.price,
+                )
+                result = ExecutionResult(
+                    success=True,
+                    candidate=trade,
+                    order_id=f"wind_down_dry_{self._trade_count}",
+                    filled_size=trade.size,
+                    filled_price=trade.price,
+                    is_pending=False,
+                )
+                tick_result.executions.append(result)
+                tick_result.num_executed += 1
+
+            if result is not None and self.on_trade:
+                self.on_trade(result)
+
+        tick_result.elapsed_seconds = time.time() - start_time
+        return tick_result
+
+    def _run_wind_down_tick_sync(
+        self,
+        hours_to_settlement: float,
+    ) -> TickResult:
+        """Run a single wind-down tick (backtest sync path)."""
+        start_time = time.time()
+        tick_result = TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+        )
+
+        sells = self._compute_wind_down_sells(hours_to_settlement)
+        if not sells:
+            tick_result.elapsed_seconds = time.time() - start_time
+            return tick_result
+
+        tick_result.num_candidates = len(sells)
+
+        for trade in sells:
+            token_id = self._get_token_id_for_action(trade)
+            if not token_id:
+                token_id = self.token_ids.get(trade.bin_index, f"token_{trade.bin_index}")
+
+            if self.trade_executor:
+                from .backend import ExecutionResult as BackendExecutionResult
+                backend_result = self.trade_executor.execute(trade, token_id)
+
+                result = ExecutionResult(
+                    success=backend_result.success,
+                    candidate=trade,
+                    order_id=backend_result.order_id,
+                    filled_size=backend_result.filled_size,
+                    filled_price=backend_result.filled_price,
+                    error=backend_result.error,
+                    is_pending=False,
+                )
+                tick_result.executions.append(result)
+
+                if result.success:
+                    tick_result.num_executed += 1
+                    if self.on_trade:
+                        self.on_trade(result)
+
+                    br = self._bin_range(trade.bin_index)
+                    bin_info = f"bin={trade.bin_index} ({br})" if br else f"bin={trade.bin_index}"
+                    logger.debug(
+                        f"[{self.event_name}] WIND-DOWN SELL: {trade.action.value} {bin_info} "
+                        f"size={trade.size:.0f} @ {trade.price:.4f}"
+                    )
+
+        tick_result.elapsed_seconds = time.time() - start_time
+        return tick_result
 
     def get_portfolio_summary(self) -> dict:
         """Get current portfolio summary."""

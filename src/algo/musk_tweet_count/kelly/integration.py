@@ -466,10 +466,16 @@ class KellyTradingBot:
                 hours_elapsed = state.get("hours_elapsed", 0)
                 hours_to_settlement = state.get("hours_to_settlement", 0)
 
-                # Check T_stop
-                if hours_to_settlement <= self.config.t_stop_hours:
-                    logger.info(f"[{self.event_name}] Reached T_stop. Holding positions to settlement.")
-                    break
+                # Check T_stop (or wind-down end if wind-down enabled)
+                if self.config.wind_down_start_hours > 0:
+                    # With wind-down, keep running until wind_down_end
+                    if hours_to_settlement <= self.config.wind_down_end_hours:
+                        logger.info(f"[{self.event_name}] Past wind-down end. Holding any remaining positions to settlement.")
+                        break
+                else:
+                    if hours_to_settlement <= self.config.t_stop_hours:
+                        logger.info(f"[{self.event_name}] Reached T_stop. Holding positions to settlement.")
+                        break
 
                 # Run tick
                 result = await self.run_tick(
