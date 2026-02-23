@@ -803,7 +803,27 @@ class KellyExecutor:
                     if self.on_trade:
                         self.on_trade(result)
             else:
-                # Live mode: build and submit batch
+                # Live mode: drop BUY trades whose bin also has a SELL
+                # (SELL failing + BUY succeeding = dual-position deadlock)
+                sell_bins = {
+                    t.bin_index for t in planned_trades
+                    if t.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                }
+                if sell_bins:
+                    before = len(planned_trades)
+                    planned_trades = [
+                        t for t in planned_trades
+                        if t.action not in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+                        or t.bin_index not in sell_bins
+                    ]
+                    dropped = before - len(planned_trades)
+                    if dropped:
+                        logger.info(
+                            "Dropped %d BUY trade(s) on bins with pending SELLs: %s",
+                            dropped, sell_bins,
+                        )
+
+                # Build and submit batch
                 order_specs = []
                 trade_token_pairs = []
                 for trade in planned_trades:
