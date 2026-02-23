@@ -79,6 +79,9 @@ class BucketNowcastConfig:
     # Minimum expected count to compute regime (avoid division by near-zero)
     min_expected_for_regime: float = 1.0
 
+    # Sampling distribution: "negbin", "com_poisson", or "negbin_reflected"
+    bucket_distribution: str = "com_poisson"
+
     # Minimum dispersion k (floor for Negative Binomial)
     min_dispersion_k: float = 0.5
 
@@ -195,12 +198,15 @@ class MonteCarloConfig:
     #   - Unofficial data (560+ days): s=1.5 → Coverage90=92.5%
     #   - XTracker official EWMA (87 days): s=2.0 → Coverage90=78.4%
     #   - XTracker official GAS (89 days): s=2.5 → Coverage90=88.7%
-    dispersion_inflation_factor: float = 1.85
+    # Sampling distribution for future days: "negbin", "com_poisson", or "negbin_reflected"
+    sampling_distribution: str = "negbin"
+
+    dispersion_inflation_factor: float = 3.0
 
     # Standard deviation inflation factor for today's nowcast
     # today_std' = today_std * sqrt(today_std_inflation_factor)
     # Set to same as dispersion_inflation_factor for consistency
-    today_std_inflation_factor: float = 1.85
+    today_std_inflation_factor: float = 3.0
 
     # Hard cap for individual future day samples (not applied to today's nowcast)
     # Based on historical analysis: only 1% of days exceeded 200

@@ -1300,18 +1300,16 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         size: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """Sample from Negative Binomial distribution."""
-        if mean <= 0:
-            return np.zeros(size)
+        """Sample using configured distribution (negbin, com_poisson, or negbin_reflected)."""
+        from .distributions import sample_negbin, sample_com_poisson, sample_negbin_reflected
 
-        # numpy uses (n, p) parameterization where n=k, p=k/(k+μ)
-        p = k / (k + mean)
-
-        # Handle edge cases
-        if p <= 0 or p >= 1 or k <= 0:
-            return np.full(size, int(round(mean)))
-
-        return rng.negative_binomial(k, p, size=size)
+        dist = self.config.bucket_distribution
+        if dist == "com_poisson":
+            return sample_com_poisson(mean, k, size, rng)
+        elif dist == "negbin_reflected":
+            return sample_negbin_reflected(mean, k, size, rng)
+        else:
+            return sample_negbin(mean, k, size, rng)
 
     def get_expected_progress(self, tau: int, is_weekend: bool = False) -> float:
         """

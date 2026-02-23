@@ -118,13 +118,14 @@ class EnsembleMonteCarloForecaster:
 
             adjusted_mean = mean * regime_adjustment
 
-            p = k_adjusted / (k_adjusted + adjusted_mean)
-
-            if p <= 0 or p >= 1 or k_adjusted <= 0:
-                samples.append(int(round(adjusted_mean)))
+            from .distributions import sample_negbin_scalar, sample_com_poisson_scalar, sample_negbin_reflected_scalar
+            dist = self.mc_config.sampling_distribution
+            if dist == "com_poisson":
+                samples.append(sample_com_poisson_scalar(adjusted_mean, k_adjusted, rng))
+            elif dist == "negbin_reflected":
+                samples.append(sample_negbin_reflected_scalar(adjusted_mean, k_adjusted, rng))
             else:
-                sample = rng.negative_binomial(k_adjusted, p)
-                samples.append(int(sample))
+                samples.append(sample_negbin_scalar(adjusted_mean, k_adjusted, rng))
 
         return samples
 

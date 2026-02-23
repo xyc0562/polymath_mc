@@ -222,19 +222,17 @@ class MonteCarloForecaster:
                 sigma_inflated = dispersion_param * np.sqrt(dispersion_inflation)
                 sample = self.interday.regime.sample(adjusted_mean, rng, sigma=sigma_inflated)
             else:
-                # NegBin sampling: dispersion_param is k where Var = μ + μ²/k
                 # Apply dispersion inflation: k' = k / s
-                # This increases variance without changing mean
                 k_inflated = dispersion_param / dispersion_inflation
 
-                # numpy uses (n, p) where n = k, p = k / (k + μ)
-                p = k_inflated / (k_inflated + adjusted_mean)
-
-                # Handle edge cases
-                if p <= 0 or p >= 1 or k_inflated <= 0:
-                    sample = int(round(adjusted_mean))
+                from .distributions import sample_negbin_scalar, sample_com_poisson_scalar, sample_negbin_reflected_scalar
+                dist = self.mc_config.sampling_distribution
+                if dist == "com_poisson":
+                    sample = sample_com_poisson_scalar(adjusted_mean, k_inflated, rng)
+                elif dist == "negbin_reflected":
+                    sample = sample_negbin_reflected_scalar(adjusted_mean, k_inflated, rng)
                 else:
-                    sample = int(rng.negative_binomial(k_inflated, p))
+                    sample = sample_negbin_scalar(adjusted_mean, k_inflated, rng)
 
             # Apply daily cap to prevent unrealistic forecasts
             if daily_cap > 0:
