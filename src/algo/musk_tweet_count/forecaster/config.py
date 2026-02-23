@@ -195,12 +195,12 @@ class MonteCarloConfig:
     #   - Unofficial data (560+ days): s=1.5 → Coverage90=92.5%
     #   - XTracker official EWMA (87 days): s=2.0 → Coverage90=78.4%
     #   - XTracker official GAS (89 days): s=2.5 → Coverage90=88.7%
-    dispersion_inflation_factor: float = 2.5
+    dispersion_inflation_factor: float = 1.85
 
     # Standard deviation inflation factor for today's nowcast
     # today_std' = today_std * sqrt(today_std_inflation_factor)
     # Set to same as dispersion_inflation_factor for consistency
-    today_std_inflation_factor: float = 2.5
+    today_std_inflation_factor: float = 1.85
 
     # Hard cap for individual future day samples (not applied to today's nowcast)
     # Based on historical analysis: only 1% of days exceeded 200
