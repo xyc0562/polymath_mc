@@ -201,12 +201,12 @@ class MonteCarloConfig:
     # Sampling distribution for future days: "negbin", "com_poisson", or "negbin_reflected"
     sampling_distribution: str = "negbin"
 
-    dispersion_inflation_factor: float = 3.0
+    dispersion_inflation_factor: float = 2.5
 
     # Standard deviation inflation factor for today's nowcast
     # today_std' = today_std * sqrt(today_std_inflation_factor)
     # Set to same as dispersion_inflation_factor for consistency
-    today_std_inflation_factor: float = 3.0
+    today_std_inflation_factor: float = 2.5
 
     # Hard cap for individual future day samples (not applied to today's nowcast)
     # Based on historical analysis: only 1% of days exceeded 200
