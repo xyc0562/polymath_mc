@@ -85,13 +85,6 @@ class BucketNowcastConfig:
     # Minimum dispersion k (floor for Negative Binomial)
     min_dispersion_k: float = 0.5
 
-<<<<<<< Updated upstream
-    # COM-Poisson ν scale: multiplier on the base ν = k/(k+μ) mapping.
-    # >1 = thinner left tail (less overdispersion), <1 = fatter.
-=======
-    # CMP nu_scale: multiplier on ν for COM-Poisson distribution
-    # Higher = thinner tails (especially left). 1.0 = default mapping.
->>>>>>> Stashed changes
     cmp_nu_scale: float = 1.0
 
     # Hawkes-style self-exciting impulse model
@@ -212,11 +205,6 @@ class MonteCarloConfig:
 
     dispersion_inflation_factor: float = 2.5
 
-<<<<<<< Updated upstream
-    # COM-Poisson ν scale for MC sampling (same semantics as bucket config)
-=======
-    # CMP nu_scale: multiplier on ν for COM-Poisson distribution
->>>>>>> Stashed changes
     cmp_nu_scale: float = 1.0
 
     # Standard deviation inflation factor for today's nowcast
