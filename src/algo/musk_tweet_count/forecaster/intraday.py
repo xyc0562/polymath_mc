@@ -1305,7 +1305,8 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         dist = self.config.bucket_distribution
         if dist == "com_poisson":
-            return sample_com_poisson(mean, k, size, rng)
+            return sample_com_poisson(mean, k, size, rng,
+                                      nu_scale=self.config.cmp_nu_scale)
         elif dist == "negbin_reflected":
             return sample_negbin_reflected(mean, k, size, rng)
         else:

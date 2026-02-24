@@ -85,6 +85,10 @@ class BucketNowcastConfig:
     # Minimum dispersion k (floor for Negative Binomial)
     min_dispersion_k: float = 0.5
 
+    # COM-Poisson ν scale: multiplier on the base ν = k/(k+μ) mapping.
+    # >1 = thinner left tail (less overdispersion), <1 = fatter.
+    cmp_nu_scale: float = 1.0
+
     # Hawkes-style self-exciting impulse model
     # Shifted-linear excitation: rate_mult = clamp(1 + gain*(exc - expected*neutral_fraction), floor, ceiling)
     impulse_cutoff_minutes: float = 180.0              # Forward prediction window
@@ -202,6 +206,9 @@ class MonteCarloConfig:
     sampling_distribution: str = "negbin"
 
     dispersion_inflation_factor: float = 2.5
+
+    # COM-Poisson ν scale for MC sampling (same semantics as bucket config)
+    cmp_nu_scale: float = 1.0
 
     # Standard deviation inflation factor for today's nowcast
     # today_std' = today_std * sqrt(today_std_inflation_factor)

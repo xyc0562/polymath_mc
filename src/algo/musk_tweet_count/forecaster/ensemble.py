@@ -121,7 +121,8 @@ class EnsembleMonteCarloForecaster:
             from .distributions import sample_negbin_scalar, sample_com_poisson_scalar, sample_negbin_reflected_scalar
             dist = self.mc_config.sampling_distribution
             if dist == "com_poisson":
-                samples.append(sample_com_poisson_scalar(adjusted_mean, k_adjusted, rng))
+                samples.append(sample_com_poisson_scalar(adjusted_mean, k_adjusted, rng,
+                                                         nu_scale=self.mc_config.cmp_nu_scale))
             elif dist == "negbin_reflected":
                 samples.append(sample_negbin_reflected_scalar(adjusted_mean, k_adjusted, rng))
             else:

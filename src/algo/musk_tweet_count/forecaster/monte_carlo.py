@@ -228,7 +228,8 @@ class MonteCarloForecaster:
                 from .distributions import sample_negbin_scalar, sample_com_poisson_scalar, sample_negbin_reflected_scalar
                 dist = self.mc_config.sampling_distribution
                 if dist == "com_poisson":
-                    sample = sample_com_poisson_scalar(adjusted_mean, k_inflated, rng)
+                    sample = sample_com_poisson_scalar(adjusted_mean, k_inflated, rng,
+                                                       nu_scale=self.mc_config.cmp_nu_scale)
                 elif dist == "negbin_reflected":
                     sample = sample_negbin_reflected_scalar(adjusted_mean, k_inflated, rng)
                 else:
