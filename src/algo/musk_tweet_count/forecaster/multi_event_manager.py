@@ -768,13 +768,10 @@ class MultiEventManager:
             Number of new events compared to before refresh
         """
         contract_today = self.contract_utils.get_current_contract_date()
-        calendar_today = datetime.now(self._tz).date()
-
-        # Fetch from yesterday's contract day to today's calendar date
-        # This ensures we capture:
-        # 1. Late-arriving posts from yesterday's contract day
-        # 2. Today's contract day (which may span 2 calendar days around noon ET)
-        # 3. Posts from the current calendar day even if before noon ET
+        # Use contract_today + 1 for API endDate to avoid timezone mismatch.
+        # The XTracker API uses UTC timestamps, so posts from late ET hours
+        # have UTC dates of "tomorrow". Adding 1 day ensures we always capture them.
+        api_end_date = contract_today + timedelta(days=1)
         yesterday = contract_today - timedelta(days=1)
 
         # Determine which contract days we're updating
@@ -786,11 +783,10 @@ class MultiEventManager:
             for d in contract_days_to_update
         )
 
-        # Fetch all posts in date range - use calendar_today to catch all posts
-        # even if before noon ET (contract day boundary)
+        # Fetch all posts in date range
         events = self.posts_xtracker_client.fetch_all_events(
             start_date=yesterday,
-            end_date=calendar_today,  # Use calendar date, not contract date
+            end_date=api_end_date,
         )
 
         # IMPORTANT: Don't replace cache if fetch failed or returned empty
@@ -832,7 +828,7 @@ class MultiEventManager:
         if new_events != 0:
             logger.info(
                 f"Incremental refresh: {'+' if new_events > 0 else ''}{new_events} events "
-                f"(fetched {yesterday} to {calendar_today}, contract days: {contract_days_to_update})"
+                f"(fetched {yesterday} to {api_end_date}, contract days: {contract_days_to_update})"
             )
 
         return max(0, new_events)

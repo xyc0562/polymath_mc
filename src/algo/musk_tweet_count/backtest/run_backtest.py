@@ -125,7 +125,7 @@ def filter_events_by_duration(
             # Calculate duration (matches trading rules convention)
             # "Dec 19 - Dec 26" = 7 days (noon Dec 19 to noon Dec 26)
             event_duration = (event.counting_end_date - event.counting_start_date).days
-            if event_duration == duration_days:
+            if event_duration <= duration_days:
                 filtered.append(event_dir)
 
     return filtered
@@ -624,6 +624,14 @@ def main():
              "Example: config/event_trading_rules.yaml",
     )
 
+    parser.add_argument(
+        "--nu-scale",
+        type=float,
+        default=1.0,
+        help="CMP nu_scale multiplier for COM-Poisson distribution. "
+             "Higher = thinner left tail. Default: 1.0",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -713,6 +721,7 @@ def main():
             intraday_mode=args.intraday_mode,
             event_trading_rules=event_trading_rules,
             tick_interval_seconds=args.tick_interval,
+            cmp_nu_scale=args.nu_scale,
         )
 
         runner = UnifiedBacktestRunner(
@@ -725,6 +734,8 @@ def main():
         logger.info(f"Intraday mode: {args.intraday_mode}")
         if args.exit_mode != "kelly_only":
             logger.info(f"Exit mode: {args.exit_mode}")
+        if args.nu_scale != 1.0:
+            logger.info(f"CMP nu_scale: {args.nu_scale}")
         if args.capital_multiplier != 1.0:
             logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
     else:

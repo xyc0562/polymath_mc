@@ -101,6 +101,7 @@ def sample_negbin_reflected_scalar(mean: float, k: float, rng: np.random.Generat
     return int(result[0])
 
 
+<<<<<<< Updated upstream
 # ---------------------------------------------------------------------------
 # COM-Poisson: cached CDF builder + fast sampling
 # ---------------------------------------------------------------------------
@@ -187,6 +188,8 @@ def _cmp_nu_from_k(mean: float, k: float, nu_scale: float = 1.0) -> float:
     return max(0.05, min(nu, 5.0))
 
 
+=======
+>>>>>>> Stashed changes
 def sample_com_poisson(mean: float, k: float, size: int, rng: np.random.Generator,
                        nu_scale: float = 1.0) -> np.ndarray:
     """
@@ -201,7 +204,11 @@ def sample_com_poisson(mean: float, k: float, size: int, rng: np.random.Generato
         k: Dispersion parameter (same interface as NegBin — lower = more variance)
         size: Number of samples
         rng: Random generator
+<<<<<<< Updated upstream
         nu_scale: Multiplier on ν (>1 = thinner left tail, <1 = fatter)
+=======
+        nu_scale: Multiplier on ν (higher = thinner tails, especially left)
+>>>>>>> Stashed changes
 
     Returns:
         Array of samples
@@ -211,7 +218,15 @@ def sample_com_poisson(mean: float, k: float, size: int, rng: np.random.Generato
     if k <= 0:
         return np.full(size, int(round(mean)))
 
+<<<<<<< Updated upstream
     nu = _cmp_nu_from_k(mean, k, nu_scale)
+=======
+    # Map NegBin-style k to COM-Poisson ν
+    # NegBin var = μ(1+μ/k), COM-Poisson var ≈ μ/ν
+    # Match: ν = k/(k+μ)
+    nu = k / (k + mean) * nu_scale
+    nu = max(0.05, min(nu, 5.0))
+>>>>>>> Stashed changes
 
     # Round for cache hits (2 decimal places)
     mean_r = round(mean, 2)

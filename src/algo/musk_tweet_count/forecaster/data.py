@@ -372,22 +372,20 @@ class XTrackerClient:
 
         Fetches all data in a single API call, then groups by contract day.
 
-        Note: Uses calendar date (not contract date) as end_date to ensure
-        we capture all posts even if before noon ET boundary.
+        Note: Uses contract_today + 1 as end_date to avoid timezone mismatch.
+        The XTracker API uses UTC timestamps, so posts from late ET hours
+        have UTC dates of "tomorrow". Adding 1 day ensures we always capture them.
         """
         contract_today = contract_utils.get_current_contract_date()
-        calendar_today = datetime.now(contract_utils.tz).date()
         start_date = contract_today - timedelta(days=n_days)
 
         # Ensure we don't go before data availability
         if start_date < self.DATA_START_DATE:
             start_date = self.DATA_START_DATE
 
-        # Use calendar_today to fetch all posts including those from
-        # the current calendar day (which may be before noon ET boundary)
         return self.fetch_events_by_contract_day(
             start_date=start_date,
-            end_date=calendar_today,
+            end_date=contract_today + timedelta(days=1),
             contract_utils=contract_utils,
             handle=handle,
         )

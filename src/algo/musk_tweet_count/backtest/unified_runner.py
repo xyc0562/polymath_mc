@@ -135,6 +135,9 @@ class UnifiedBacktestConfig:
     # If None, no duration-based restrictions are applied
     event_trading_rules: Optional[EventTradingRulesConfig] = None
 
+    # CMP nu_scale for COM-Poisson distribution (higher = thinner left tail)
+    cmp_nu_scale: float = 1.0
+
 
 class UnifiedBacktestRunner:
     """
@@ -257,6 +260,12 @@ class UnifiedBacktestRunner:
         if multiplier > 1.0:
             portfolio.phantom_capital = self.config.initial_capital * (multiplier - 1.0)
             logger.info(f"  Phantom capital: ${portfolio.phantom_capital:.2f} (multiplier={multiplier}x)")
+            # Reset collateral multiplier to 1.0 so collateral limits (c_bin_max,
+            # virtual_c_event_max) stay at real capital levels. Phantom capital
+            # already handles Kelly utility inflation independently. Without this,
+            # collateral limits scale by multiplier, allowing oversized trades
+            # that drain real capital at multiplier-x rate.
+            kelly_config.collateral.capital_multiplier = 1.0
 
         backend_config = SimulationConfig(
             spread=self.config.spread,
@@ -384,12 +393,11 @@ class UnifiedBacktestRunner:
                         logger.debug(f"  Trading blocked: {reason}")
                     continue
 
-            # Skip if capital is exhausted (less than $1 available)
+            # Log capital exhaustion but DON'T skip — we may still need to SELL positions
             if portfolio.available_capital < 1.0:
                 if not getattr(self, '_capital_exhausted_logged', False):
-                    logger.info(f"  Capital exhausted (${portfolio.available_capital:.2f} remaining) - skipping remaining ticks")
+                    logger.info(f"  Capital exhausted (${portfolio.available_capital:.2f} remaining) - continuing for potential sells")
                     self._capital_exhausted_logged = True
-                continue
 
             # Update forecast and probabilities
             # The forecaster returns the TOTAL expected count (past + future).
@@ -755,16 +763,19 @@ class UnifiedBacktestRunner:
             Tuple of (forecaster, backtest_posts) where backtest_posts are posts
             from the event period that will be added incrementally during backtest.
         """
-        from ..forecaster.config import ForecasterConfig, MonteCarloConfig
+        from ..forecaster.config import ForecasterConfig, MonteCarloConfig, BucketNowcastConfig
         from ..forecaster.forecaster import TweetCountForecaster
         from ..forecaster.data import EventStore, ContractDayUtils, XTrackerClient, TweetEvent
         from datetime import timezone as tz
         from zoneinfo import ZoneInfo
 
         # Use fixed seed for reproducible backtests
-        mc_config = MonteCarloConfig(n_simulations=10000, random_seed=42)
+        mc_config = MonteCarloConfig(n_simulations=10000, random_seed=42,
+                                     cmp_nu_scale=self.config.cmp_nu_scale)
+        bucket_config = BucketNowcastConfig(cmp_nu_scale=self.config.cmp_nu_scale)
         config = ForecasterConfig(
             monte_carlo=mc_config,
+            bucket_nowcast=bucket_config,
             intraday_mode=self.config.intraday_mode,
         )
         contract_utils = ContractDayUtils(
