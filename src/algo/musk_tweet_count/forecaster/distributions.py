@@ -138,13 +138,16 @@ def _cmp_cdf(mean_round: float, nu_round: float) -> Tuple[np.ndarray, np.ndarray
     # Closed-form initial estimate (Shmueli et al. 2005):
     #   E[X] ≈ λ^(1/ν) - (ν-1)/(2ν)
     #   => λ ≈ (μ + (ν-1)/(2ν))^ν
-    lam0 = (mean + (nu - 1) / (2 * nu)) ** nu
+    base = mean + (nu - 1) / (2 * nu)
+    if base > 0:
+        lam0 = base ** nu
+    else:
+        lam0 = 0.0
     lam0 = max(lam0, 1e-3)
 
     # Newton-Raphson refinement (typically converges in 3-5 iterations)
     lam = lam0
-    eps = 1e-4
-    for _ in range(10):
+    for _ in range(15):
         m = _mean_for_lam(lam)
         err = m - mean
         if abs(err) < 1e-6:
@@ -156,7 +159,18 @@ def _cmp_cdf(mean_round: float, nu_round: float) -> Tuple[np.ndarray, np.ndarray
         if abs(deriv) < 1e-12:
             break
         lam -= err / deriv
-        lam = max(lam, eps)
+        lam = max(lam, 1e-6)
+
+    # Fall back to binary search if Newton didn't converge
+    if abs(_mean_for_lam(lam) - mean) > 0.01:
+        lo, hi = 1e-3, max(mean, 1.0) ** 3 + 10
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if _mean_for_lam(mid) < mean:
+                lo = mid
+            else:
+                hi = mid
+        lam = (lo + hi) / 2
 
     pmf = _pmf(lam)
     cdf = np.cumsum(pmf)
