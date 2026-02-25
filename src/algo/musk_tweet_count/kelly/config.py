@@ -48,12 +48,12 @@ class EdgeBufferConfig:
     # Minimum perceived probability to trade (from our model)
     # Don't trade if our model assigns probability < this threshold
     # Set to 0 to disable.
-    min_perceived_prob: float = 0.03  # 5%
+    min_perceived_prob: float = 0.03  # 3%
 
     # Minimum market price to trade (avoids illiquid tail bets)
     # Don't buy YES if market price < this, don't buy NO if market price < this
     # Set to 0 to disable.
-    min_market_price: float = 0.01  # 3%
+    min_market_price: float = 0.01  # 1%
 
     # Require two-sided liquidity (both bid and ask must exist)
     # If True, skip bins where only one side has liquidity

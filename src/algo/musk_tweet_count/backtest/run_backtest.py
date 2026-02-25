@@ -477,17 +477,17 @@ def main():
     parser.add_argument(
         "--kappa",
         type=float,
-        default=0.25,
-        help="Fractional Kelly multiplier. Default: 0.25 (quarter Kelly)",
+        default=KellyConfig.kappa,
+        help=f"Fractional Kelly multiplier. Default: {KellyConfig.kappa}",
     )
 
     parser.add_argument(
         "--kelly-fraction",
         type=float,
-        default=1.0,
-        help="Fractional Kelly parameter α ∈ (0, 1]. "
-             "1.0 = full Kelly (log utility). "
-             "0.5 = half Kelly. 0.25 = quarter Kelly. Default: 1.0",
+        default=KellyConfig.kelly_fraction,
+        help=f"Fractional Kelly parameter α ∈ (0, 1]. "
+             f"1.0 = full Kelly (log utility). "
+             f"0.5 = half Kelly. 0.25 = quarter Kelly. Default: {KellyConfig.kelly_fraction}",
     )
 
     parser.add_argument(
@@ -513,9 +513,8 @@ def main():
     parser.add_argument(
         "--c-bin-max-ratio",
         type=float,
-        default=0.15,
-        help="Max collateral per bin as ratio of c_event_max. Default: 0.15 (15%%). "
-             "With $500 event max, this means $75 max per bin.",
+        default=CollateralConfig.c_bin_max_ratio,
+        help=f"Max collateral per bin as ratio of c_event_max. Default: {CollateralConfig.c_bin_max_ratio}",
     )
 
     parser.add_argument(
@@ -544,8 +543,8 @@ def main():
     parser.add_argument(
         "--max-spread-ratio",
         type=float,
-        default=2.0,
-        help="Maximum spread ratio (ask-bid)/bid to trade. Default: 2.0. Set to 0 to disable.",
+        default=EdgeBufferConfig.max_spread_ratio,
+        help=f"Maximum spread ratio (ask-bid)/bid to trade. Default: {EdgeBufferConfig.max_spread_ratio}. Set to 0 to disable.",
     )
 
     parser.add_argument(
@@ -691,7 +690,6 @@ def main():
                 required_roi=args.roi,
                 friction_mid=args.friction_mid,
                 friction_tail=args.friction_tail,
-                tail_threshold=0.09,
                 min_perceived_prob=args.min_perceived_prob,
                 min_market_price=args.min_market_price,
                 max_spread_ratio=args.max_spread_ratio,

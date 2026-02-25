@@ -675,38 +675,38 @@ def parse_args() -> argparse.Namespace:
         "--kappa",
         type=float,
         default=KellyConfig.kappa,
-        help="Fractional Kelly multiplier (default: 0.25)",
+        help=f"Fractional Kelly multiplier (default: {KellyConfig.kappa})",
     )
     parser.add_argument(
         "--kelly-fraction",
         type=float,
-        default=1.0,
-        help="Fractional Kelly parameter α ∈ (0, 1]. "
-             "1.0 = full Kelly, 0.5 = half Kelly, 0.25 = quarter Kelly (default: 1.0)",
+        default=KellyConfig.kelly_fraction,
+        help=f"Fractional Kelly parameter α ∈ (0, 1]. "
+             f"1.0 = full Kelly, 0.5 = half Kelly, 0.25 = quarter Kelly (default: {KellyConfig.kelly_fraction})",
     )
     parser.add_argument(
         "--required-roi",
         type=float,
-        default=0.10,
-        help="Required ROI for edge buffer (default: 0.10)",
+        default=EdgeBufferConfig.required_roi,
+        help=f"Required ROI for edge buffer (default: {EdgeBufferConfig.required_roi})",
     )
     parser.add_argument(
         "--min-prob",
         type=float,
-        default=0.05,
-        help="Minimum model probability to trade a bin (default: 0.05 = 5%%)",
+        default=EdgeBufferConfig.min_perceived_prob,
+        help=f"Minimum model probability to trade a bin (default: {EdgeBufferConfig.min_perceived_prob})",
     )
     parser.add_argument(
         "--min-market-price",
         type=float,
-        default=0.03,
-        help="Minimum market price to trade (default: 0.03 = 3%%)",
+        default=EdgeBufferConfig.min_market_price,
+        help=f"Minimum market price to trade (default: {EdgeBufferConfig.min_market_price})",
     )
     parser.add_argument(
         "--max-spread-ratio",
         type=float,
-        default=2.0,
-        help="Maximum spread ratio (ask-bid)/bid to trade. Default: 2.0. Set to 0 to disable.",
+        default=EdgeBufferConfig.max_spread_ratio,
+        help=f"Maximum spread ratio (ask-bid)/bid to trade. Default: {EdgeBufferConfig.max_spread_ratio}. Set to 0 to disable.",
     )
     parser.add_argument(
         "--no-require-two-sided",
@@ -716,22 +716,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capital-multiplier",
         type=float,
-        default=1.0,
-        help="Capital multiplier for phantom capital injection. "
-             "1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
-             "Real capital still hard-gates execution. Default: 1.0",
+        default=CollateralConfig.capital_multiplier,
+        help=f"Capital multiplier for phantom capital injection. "
+             f"1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
+             f"Real capital still hard-gates execution. Default: {CollateralConfig.capital_multiplier}",
     )
     parser.add_argument(
         "--min-buy-utility",
         type=float,
-        default=0.003,
-        help="Minimum utility gain for buys (default: 0.003)",
+        default=KellyConfig.min_buy_utility,
+        help=f"Minimum utility gain for buys (default: {KellyConfig.min_buy_utility})",
     )
     parser.add_argument(
         "--min-sell-utility",
         type=float,
-        default=0.006,
-        help="Minimum utility gain for sells (default: 0.006)",
+        default=KellyConfig.min_sell_utility,
+        help=f"Minimum utility gain for sells (default: {KellyConfig.min_sell_utility})",
     )
 
     # Projection model
@@ -844,8 +844,6 @@ async def main() -> None:
     # Kelly config first (source of truth for c_event_max)
     edge_buffer_config = EdgeBufferConfig(
         required_roi=args.required_roi,
-        friction_mid=0.015,
-        friction_tail=0.03,
         min_perceived_prob=args.min_prob,
         min_market_price=args.min_market_price,
         max_spread_ratio=args.max_spread_ratio,
