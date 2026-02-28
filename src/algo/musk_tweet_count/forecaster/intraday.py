@@ -746,6 +746,43 @@ class BucketDistribution:
     dispersion_k: float  # Negative Binomial dispersion parameter
 
 
+@dataclass
+class ImpulseOverrideWindow:
+    """Time-of-day override for impulse rate_mult bounds."""
+
+    name: str
+    start: int   # tau start (minutes since noon ET)
+    end: int     # tau end
+    floor: Optional[float] = None
+    ceiling: Optional[float] = None
+
+
+def _load_impulse_overrides(path: str) -> List[ImpulseOverrideWindow]:
+    """Load impulse rate_mult overrides from YAML. Returns empty list if file not found."""
+    import os
+    if not os.path.exists(path):
+        logger.warning(f"Impulse overrides file not found: {path}")
+        return []
+    try:
+        import yaml
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        overrides = []
+        for name, window in (data.get("overrides") or {}).items():
+            overrides.append(ImpulseOverrideWindow(
+                name=name,
+                start=int(window["start"]),
+                end=int(window["end"]),
+                floor=window.get("floor"),
+                ceiling=window.get("ceiling"),
+            ))
+        logger.info(f"Loaded {len(overrides)} impulse override windows from {path}")
+        return overrides
+    except Exception as e:
+        logger.error(f"Failed to load impulse overrides from {path}: {e}")
+        return []
+
+
 class BucketIntradayForecaster(BaseIntradayForecaster):
     """
     Bucket-based intraday forecaster.
@@ -791,6 +828,9 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         # Bayesian impulse: kernel-smoothed rate curve λ(τ) at 1-min resolution
         self._rate_curve: Optional[np.ndarray] = None  # shape (1440,), tweets/min
         self._impulse_fitted: bool = False
+
+        # Impulse overrides
+        self._impulse_overrides: List[ImpulseOverrideWindow] = []
 
         # Fitted flag
         self._fitted = False
@@ -857,6 +897,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         # Fit impulse response from inter-tweet timing
         self._fit_impulse(historical_events, today)
+        self._impulse_overrides = _load_impulse_overrides(self.config.impulse_overrides_path)
 
         # Log bucket means for debugging
         if self._weekday_buckets:
@@ -1190,6 +1231,16 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             rate_mult = 1.0 + self.config.impulse_gain * shifted
             rate_mult = max(self.config.impulse_floor, min(self.config.impulse_ceiling, rate_mult))
 
+            # Apply time-of-day overrides
+            active_override_name = None
+            for ov in self._impulse_overrides:
+                if ov.start <= tau_now < ov.end:
+                    ov_floor = ov.floor if ov.floor is not None else self.config.impulse_floor
+                    ov_ceiling = ov.ceiling if ov.ceiling is not None else self.config.impulse_ceiling
+                    rate_mult = max(ov_floor, min(ov_ceiling, rate_mult))
+                    active_override_name = ov.name
+                    break
+
             # Asymmetric forward decay
             if rate_mult >= 1.0:
                 forward_decay = decay  # boost: halflife = 30 min
@@ -1206,6 +1257,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 "expected": round(expected_excitation, 2),
                 "shifted": round(shifted, 2),
                 "rate_mult_now": round(rate_mult, 2),
+                "override": active_override_name,
             }
         else:
             self._last_impulse = None

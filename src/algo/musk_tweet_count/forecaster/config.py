@@ -100,6 +100,7 @@ class BucketNowcastConfig:
     impulse_ceiling: float = 3.0                       # Max rate_mult
     impulse_lookback_minutes: int = 360                # How far back for expected excitation calc
     impulse_min_expected_excitation: float = 0.3       # Below this, treat as low-data period
+    impulse_overrides_path: str = "config/impulse_overrides.yaml"  # Time-of-day rate_mult overrides
 
 
 @dataclass

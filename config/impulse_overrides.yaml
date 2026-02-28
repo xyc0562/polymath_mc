@@ -1,0 +1,11 @@
+# Impulse rate_mult overrides by time-of-day (tau = minutes since noon ET)
+# Each window specifies floor/ceiling bounds on rate_mult.
+# If floor/ceiling not specified, global defaults from BucketNowcastConfig are used.
+#
+# Tau reference (ET): 0=noon, 540=9pm, 780=1am, 1020=5am, 1260=9am, 1440=noon
+overrides:
+  near_end:
+    start: 1200   # 8:00 AM ET (3h before settlement)
+    end: 1440     # 12:00 PM ET (settlement)
+    floor: 1.0    # No silence penalty in final 4 hours
+    # ceiling: not set → uses global default (3.0)
