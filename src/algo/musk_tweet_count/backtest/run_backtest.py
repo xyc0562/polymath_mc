@@ -1,6 +1,8 @@
 """
 Command-line interface for running backtests.
 
+Uses unified Kelly trading logic (same as production).
+
 Usage:
     # List available events
     python -m src.algo.musk_tweet_count.backtest.run_backtest --list
@@ -13,10 +15,6 @@ Usage:
     python -m src.algo.musk_tweet_count.backtest.run_backtest \
         --start-date 2025-11-01 --end-date 2025-12-31
 
-    # Run with unified Kelly trading logic (same as production)
-    python -m src.algo.musk_tweet_count.backtest.run_backtest \
-        --event "2025-11-25_Nov_18_-_Nov_25" --unified
-
     # Custom parameters
     python -m src.algo.musk_tweet_count.backtest.run_backtest \
         --event "2025-11-25_Nov_18_-_Nov_25" \
@@ -26,11 +24,11 @@ Usage:
 import argparse
 import logging
 import multiprocessing
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from .runner import BacktestRunner, BacktestConfig, BacktestResult
+from .unified_runner import UnifiedBacktestRunner, UnifiedBacktestConfig, BacktestResult
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, CollateralConfig, EventTradingRulesConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
@@ -132,12 +130,30 @@ def filter_events_by_duration(
 
 
 def run_single_backtest(
-    runner: BacktestRunner,
+    runner: UnifiedBacktestRunner,
     event_dir: str,
 ) -> Optional[BacktestResult]:
     """Run backtest on a single event."""
     logger.info(f"Running backtest: {event_dir}")
     return runner.run(event_dir)
+
+
+def parse_timestamp_arg(value: str) -> int:
+    """
+    Parse a CLI timestamp argument as Unix seconds.
+
+    Accepts either:
+    - Unix seconds as an integer string
+    - ISO-8601 datetime, with or without timezone (naive values are treated as UTC)
+    """
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 def _preload_posts(runner, event_dirs: List[str]):
@@ -170,7 +186,7 @@ def _worker_run_event(args: Tuple) -> Tuple[str, Optional[BacktestResult], str]:
     Returns (event_dir, result, captured_logs).
     """
     import io
-    event_dir, runner_type, config, price_data_dir, cache_dir, log_level = args
+    event_dir, config, price_data_dir, cache_dir, log_level = args
 
     # Capture all logging output to a string buffer
     log_buffer = io.StringIO()
@@ -186,19 +202,11 @@ def _worker_run_event(args: Tuple) -> Tuple[str, Optional[BacktestResult], str]:
     root_logger.setLevel(log_level)
 
     try:
-        if runner_type == "unified":
-            from .unified_runner import UnifiedBacktestRunner
-            runner = UnifiedBacktestRunner(
-                config=config,
-                price_data_dir=price_data_dir,
-                cache_dir=cache_dir,
-            )
-        else:
-            runner = BacktestRunner(
-                config=config,
-                price_data_dir=price_data_dir,
-                cache_dir=cache_dir,
-            )
+        runner = UnifiedBacktestRunner(
+            config=config,
+            price_data_dir=price_data_dir,
+            cache_dir=cache_dir,
+        )
 
         result = runner.run(event_dir)
         return (event_dir, result, log_buffer.getvalue())
@@ -208,7 +216,7 @@ def _worker_run_event(args: Tuple) -> Tuple[str, Optional[BacktestResult], str]:
 
 
 def run_multiple_backtests(
-    runner: BacktestRunner,
+    runner: UnifiedBacktestRunner,
     event_dirs: List[str],
     parallel: int = 0,
 ) -> List[BacktestResult]:
@@ -231,7 +239,7 @@ def run_multiple_backtests(
 
 
 def _run_parallel(
-    runner: BacktestRunner,
+    runner: UnifiedBacktestRunner,
     event_dirs: List[str],
     num_processes: int,
 ) -> List[BacktestResult]:
@@ -242,16 +250,9 @@ def _run_parallel(
     """
     import sys
 
-    # Determine runner type and config
-    from .unified_runner import UnifiedBacktestRunner
-    if isinstance(runner, UnifiedBacktestRunner):
-        runner_type = "unified"
-    else:
-        runner_type = "legacy"
-
     log_level = logging.getLogger().level
     worker_args = [
-        (event_dir, runner_type, runner.config, runner.price_data_dir, runner.cache_dir, log_level)
+        (event_dir, runner.config, runner.price_data_dir, runner.cache_dir, log_level)
         for event_dir in event_dirs
     ]
 
@@ -388,13 +389,6 @@ def main():
     )
 
     parser.add_argument(
-        "--max-position",
-        type=float,
-        default=100.0,
-        help="Max position per bin. Default: 100",
-    )
-
-    parser.add_argument(
         "--spread",
         type=float,
         default=0.02,
@@ -436,13 +430,6 @@ def main():
         help="Close all positions X hours before settlement. Default: 0 (disabled)",
     )
 
-    parser.add_argument(
-        "--stop-loss",
-        type=float,
-        default=0.0,
-        help="Exit position if value drops below this fraction of entry cost. 0 = disabled (default). WARNING: Stop-loss typically hurts returns in prediction markets.",
-    )
-
     # Paths
     parser.add_argument(
         "--price-data",
@@ -458,6 +445,33 @@ def main():
         help="Directory for caching posts data",
     )
 
+    # Optional seeded replay controls
+    parser.add_argument(
+        "--resume-from-ts",
+        type=str,
+        help="Resume replay from this UTC timestamp (ISO-8601 or Unix seconds).",
+    )
+    parser.add_argument(
+        "--seed-state",
+        type=str,
+        help="Path to JSON file with seeded portfolio state for replay.",
+    )
+    parser.add_argument(
+        "--seed-from-log",
+        type=str,
+        help="Path to production log file to extract seeded portfolio state from.",
+    )
+    parser.add_argument(
+        "--seed-log-ts",
+        type=str,
+        help="UTC timestamp of the production log snapshot to seed from (ISO-8601 or Unix seconds).",
+    )
+    parser.add_argument(
+        "--seed-log-event",
+        type=str,
+        help="Event name inside the production log. Defaults to the event short name.",
+    )
+
     # Logging
     parser.add_argument(
         "-v", "--verbose",
@@ -465,15 +479,7 @@ def main():
         help="Enable verbose logging",
     )
 
-    # Unified mode (uses same trading logic as production)
-    parser.add_argument(
-        "--unified",
-        action="store_true",
-        help="Use unified Kelly trading logic (same as production). "
-             "This ensures backtest uses identical logic to live trading.",
-    )
-
-    # Kelly parameters for unified mode
+    # Kelly parameters
     parser.add_argument(
         "--kappa",
         type=float,
@@ -520,7 +526,7 @@ def main():
     parser.add_argument(
         "--trade-verbose",
         action="store_true",
-        help="Print detailed information about each trade (unified mode only). "
+        help="Print detailed information about each trade. "
              "Shows price, size, edge, odds, Kelly reservation prices, etc.",
     )
 
@@ -617,10 +623,9 @@ def main():
     parser.add_argument(
         "--event-rules",
         type=str,
-        default=None,
-        help="Path to YAML file with event trading rules configuration. "
-             "Controls when trading is allowed based on event duration. "
-             "Example: config/event_trading_rules.yaml",
+        default="config/event_trading_rules.yaml",
+        help="Path to event trading rules YAML config (default: config/event_trading_rules.yaml). "
+             "Controls when trading is allowed based on event duration and counting status.",
     )
 
     parser.add_argument(
@@ -635,6 +640,45 @@ def main():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    replay_requested = any([
+        args.resume_from_ts,
+        args.seed_state,
+        args.seed_from_log,
+        args.seed_log_ts,
+        args.seed_log_event,
+    ])
+    if replay_requested and not args.event:
+        logger.error("Replay resume/seed options currently require a single --event")
+        return
+    if args.seed_state and args.seed_from_log:
+        logger.error("Use either --seed-state or --seed-from-log, not both")
+        return
+    if args.seed_from_log and not args.seed_log_ts:
+        logger.error("--seed-from-log requires --seed-log-ts")
+        return
+    if args.seed_log_ts and not args.seed_from_log:
+        logger.error("--seed-log-ts requires --seed-from-log")
+        return
+    if args.seed_log_event and not args.seed_from_log:
+        logger.error("--seed-log-event requires --seed-from-log")
+        return
+
+    resume_from_ts = None
+    if args.resume_from_ts:
+        try:
+            resume_from_ts = parse_timestamp_arg(args.resume_from_ts)
+        except ValueError:
+            logger.error(f"Invalid replay resume timestamp: {args.resume_from_ts}")
+            return
+
+    seed_log_snapshot_ts = None
+    if args.seed_log_ts:
+        try:
+            seed_log_snapshot_ts = parse_timestamp_arg(args.seed_log_ts)
+        except ValueError:
+            logger.error(f"Invalid seed log timestamp: {args.seed_log_ts}")
+            return
 
     price_data_dir = Path(args.price_data)
     cache_dir = Path(args.cache_dir)
@@ -664,106 +708,96 @@ def main():
 
     max_orders = args.max_orders
 
-    # Load event trading rules if specified
+    # Load event trading rules
     event_trading_rules = None
     if args.event_rules:
-        event_trading_rules = EventTradingRulesConfig.from_yaml(args.event_rules)
-        logger.info(f"Loaded event trading rules from: {args.event_rules}")
-        for cat in event_trading_rules.categories:
-            logger.info(f"  {cat.name}: duration=[{cat.duration_min_days}, {cat.duration_max_days}) days")
+        try:
+            rules_path = Path(args.event_rules)
+            if rules_path.exists():
+                event_trading_rules = EventTradingRulesConfig.from_yaml(str(rules_path))
+                logger.info(f"Loaded event trading rules from {args.event_rules}")
+                for cat in event_trading_rules.categories:
+                    logger.info(f"  {cat.name}: duration=[{cat.duration_min_days}, {cat.duration_max_days}) days")
+            else:
+                logger.warning(f"Event rules file not found: {args.event_rules}, using defaults")
+                event_trading_rules = EventTradingRulesConfig.default()
+        except Exception as e:
+            logger.error(f"Failed to load event rules from {args.event_rules}: {e}")
+            logger.info("Using default event trading rules")
+            event_trading_rules = EventTradingRulesConfig.default()
 
-    # Choose between unified and legacy runners
-    if args.unified:
-        # Use unified runner with production Kelly logic
-        from .unified_runner import UnifiedBacktestRunner, UnifiedBacktestConfig
-
-        # Build KellyConfig with CLI overrides
-        _default_kelly = KellyConfig()
-        trading_config = KellyConfig(
-            kappa=args.kappa,
-            kelly_fraction=args.kelly_fraction,
-            min_buy_utility=args.min_buy_utility,
-            min_sell_utility=args.min_sell_utility,
-            t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
-            kelly_only_exit=(args.exit_mode == "kelly_only"),
-            edge_buffer=EdgeBufferConfig(
-                required_roi=args.roi,
-                friction_mid=args.friction_mid,
-                friction_tail=args.friction_tail,
-                min_perceived_prob=args.min_perceived_prob,
-                min_market_price=args.min_market_price,
-                max_spread_ratio=args.max_spread_ratio,
-                require_two_sided_liquidity=not args.no_require_two_sided,
-            ),
-            rate_limit=RateLimitConfig(
-                max_orders_per_tick=max_orders,
-                min_order_delay_seconds=0.0,
-                max_orders_per_minute=1000,
-            ),
-            collateral=CollateralConfig(
-                c_event_max=args.capital,
-                c_bin_max_ratio=args.c_bin_max_ratio,
-                capital_multiplier=args.capital_multiplier,
-            ),
-            max_iters_per_tick=50,
-        )
-
-        unified_config = UnifiedBacktestConfig(
-            initial_capital=args.capital,
-            spread=args.spread,
-            slippage=args.slippage,
-            trading=trading_config,
-            exit_hours_before_settlement=args.exit_hours,
-            verbose=args.trade_verbose,
-            projection_model=args.projection,
-            intraday_mode=args.intraday_mode,
-            event_trading_rules=event_trading_rules,
-            tick_interval_seconds=args.tick_interval,
-            cmp_nu_scale=args.nu_scale,
-        )
-
-        runner = UnifiedBacktestRunner(
-            config=unified_config,
-            price_data_dir=price_data_dir,
-            cache_dir=cache_dir,
-        )
-        logger.info(f"Using UNIFIED runner (same Kelly logic as production)")
-        logger.info(f"Projection model: {args.projection}")
-        logger.info(f"Intraday mode: {args.intraday_mode}")
-        if args.exit_mode != "kelly_only":
-            logger.info(f"Exit mode: {args.exit_mode}")
-        if args.nu_scale != 1.0:
-            logger.info(f"CMP nu_scale: {args.nu_scale}")
-        if args.capital_multiplier != 1.0:
-            logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
-    else:
-        # Use legacy runner
-        edge_buffer = EdgeBufferConfig(
+    # Build KellyConfig with CLI overrides
+    _default_kelly = KellyConfig()
+    trading_config = KellyConfig(
+        kappa=args.kappa,
+        kelly_fraction=args.kelly_fraction,
+        min_buy_utility=args.min_buy_utility,
+        min_sell_utility=args.min_sell_utility,
+        t_stop_hours=args.t_stop if args.t_stop is not None else _default_kelly.t_stop_hours,
+        kelly_only_exit=(args.exit_mode == "kelly_only"),
+        edge_buffer=EdgeBufferConfig(
             required_roi=args.roi,
             friction_mid=args.friction_mid,
             friction_tail=args.friction_tail,
-            tail_threshold=0.09,  # 9% threshold
             min_perceived_prob=args.min_perceived_prob,
             min_market_price=args.min_market_price,
             max_spread_ratio=args.max_spread_ratio,
             require_two_sided_liquidity=not args.no_require_two_sided,
-        )
-        config = BacktestConfig(
-            initial_capital=args.capital,
-            max_position_per_bin=args.max_position,
-            spread=args.spread,
-            slippage=args.slippage,
-            edge_buffer=edge_buffer,
-            exit_hours_before_settlement=args.exit_hours,
-            stop_loss_pct=args.stop_loss,
-        )
+        ),
+        rate_limit=RateLimitConfig(
+            max_orders_per_tick=max_orders,
+            min_order_delay_seconds=0.0,
+            max_orders_per_minute=1000,
+        ),
+        collateral=CollateralConfig(
+            c_event_max=args.capital,
+            c_bin_max_ratio=args.c_bin_max_ratio,
+            capital_multiplier=args.capital_multiplier,
+        ),
+        max_iters_per_tick=50,
+    )
 
-        runner = BacktestRunner(
-            config=config,
-            price_data_dir=price_data_dir,
-            cache_dir=cache_dir,
-        )
-        logger.info("Using legacy runner")
+    config = UnifiedBacktestConfig(
+        initial_capital=args.capital,
+        spread=args.spread,
+        slippage=args.slippage,
+        trading=trading_config,
+        exit_hours_before_settlement=args.exit_hours,
+        verbose=args.trade_verbose,
+        projection_model=args.projection,
+        intraday_mode=args.intraday_mode,
+        event_trading_rules=event_trading_rules,
+        tick_interval_seconds=args.tick_interval,
+        cmp_nu_scale=args.nu_scale,
+        resume_from_timestamp=resume_from_ts,
+        seed_state_path=args.seed_state,
+        seed_log_path=args.seed_from_log,
+        seed_log_snapshot_timestamp=seed_log_snapshot_ts,
+        seed_log_event_name=args.seed_log_event,
+    )
+
+    runner = UnifiedBacktestRunner(
+        config=config,
+        price_data_dir=price_data_dir,
+        cache_dir=cache_dir,
+    )
+    logger.info(f"Projection model: {args.projection}")
+    logger.info(f"Intraday mode: {args.intraday_mode}")
+    if args.exit_mode != "kelly_only":
+        logger.info(f"Exit mode: {args.exit_mode}")
+    if args.nu_scale != 1.0:
+        logger.info(f"CMP nu_scale: {args.nu_scale}")
+    if args.capital_multiplier != 1.0:
+        logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
+    if resume_from_ts is not None:
+        logger.info(f"Replay resume timestamp: {datetime.fromtimestamp(resume_from_ts, tz=timezone.utc).isoformat()}")
+    if args.seed_state:
+        logger.info(f"Replay seed state file: {args.seed_state}")
+    if args.seed_from_log:
+        log_seed_dt = datetime.fromtimestamp(seed_log_snapshot_ts, tz=timezone.utc).isoformat()
+        logger.info(f"Replay seed from log: {args.seed_from_log} @ {log_seed_dt}")
+        if args.seed_log_event:
+            logger.info(f"Replay seed log event: {args.seed_log_event}")
 
     # Determine which events to test
     if args.event:

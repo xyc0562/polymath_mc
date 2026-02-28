@@ -16,6 +16,11 @@ from .data_provider import (
     CachedPostsProvider,
     EventPriceData,
 )
+from .replay_seed import (
+    ReplaySeedState,
+    extract_seed_state_from_log,
+    load_seed_state,
+)
 
 # Import Kelly trading infrastructure
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, EventTradingRulesConfig
@@ -109,6 +114,7 @@ class UnifiedBacktestConfig:
 
     # Tick frequency
     tick_interval_seconds: int = 3600  # 1 hour between ticks
+    resume_from_timestamp: Optional[int] = None
 
     # Forecaster settings
     training_days: int = 45
@@ -137,6 +143,12 @@ class UnifiedBacktestConfig:
 
     # CMP nu_scale for COM-Poisson distribution (higher = thinner left tail)
     cmp_nu_scale: float = 1.0
+
+    # Optional seeded replay inputs
+    seed_state_path: Optional[str] = None
+    seed_log_path: Optional[str] = None
+    seed_log_snapshot_timestamp: Optional[int] = None
+    seed_log_event_name: Optional[str] = None
 
 
 class UnifiedBacktestRunner:
@@ -201,6 +213,8 @@ class UnifiedBacktestRunner:
         logger.info(f"  Counting period: {event.counting_start_date} to {event.counting_end_date}")
         logger.info(f"  Bins: {len(event.bins)}, Winner: bin {event.winner_bin_index}")
 
+        seed_state = self._load_replay_seed_state(event)
+
         # Log event trading rules if configured
         if self.config.event_trading_rules is not None:
             event_duration_days = (event.counting_end_date - event.counting_start_date).days
@@ -254,6 +268,13 @@ class UnifiedBacktestRunner:
             probabilities=initial_probs,
             bin_upper_bounds=bin_upper_bounds,
         )
+        if seed_state is not None:
+            self._apply_replay_seed_state(
+                portfolio=portfolio,
+                token_ids=token_ids,
+                event=event,
+                seed_state=seed_state,
+            )
 
         # Set phantom capital for Kelly utility inflation
         multiplier = kelly_config.collateral.capital_multiplier
@@ -300,8 +321,18 @@ class UnifiedBacktestRunner:
 
         # Sample timestamps
         tick_interval = self.config.tick_interval_seconds
-        sampled_timestamps = self._sample_timestamps(event.all_timestamps, tick_interval)
+        sampled_timestamps = self._sample_timestamps(
+            event.all_timestamps,
+            tick_interval,
+            start_at_ts=self.config.resume_from_timestamp,
+        )
+        if self.config.resume_from_timestamp is not None:
+            resume_dt = datetime.fromtimestamp(self.config.resume_from_timestamp, tz=timezone.utc)
+            logger.info(f"  Replay resume timestamp: {resume_dt.isoformat()}")
         logger.info(f"  Sampled {len(sampled_timestamps)} ticks (every {tick_interval}s)")
+        if not sampled_timestamps:
+            logger.error("No sampled ticks available after applying replay start timestamp")
+            return None
 
         # Calculate settlement time for exit logic
         # Settlement is at 12pm EST (noon ET) on the end date of counting
@@ -740,20 +771,86 @@ class UnifiedBacktestRunner:
         self,
         timestamps: List[int],
         interval_seconds: int,
+        start_at_ts: Optional[int] = None,
     ) -> List[int]:
         """Sample timestamps at regular intervals."""
         if not timestamps:
             return []
 
-        sampled = [timestamps[0]]
-        last_ts = timestamps[0]
+        eligible = timestamps
+        if start_at_ts is not None:
+            eligible = [ts for ts in timestamps if ts >= start_at_ts]
+            if not eligible:
+                return []
 
-        for ts in timestamps[1:]:
+        sampled = [eligible[0]]
+        last_ts = eligible[0]
+
+        for ts in eligible[1:]:
             if ts - last_ts >= interval_seconds:
                 sampled.append(ts)
                 last_ts = ts
 
         return sampled
+
+    def _load_replay_seed_state(self, event: EventPriceData) -> Optional[ReplaySeedState]:
+        """Load optional seeded replay state for this event."""
+        if self.config.seed_state_path:
+            seed_state = load_seed_state(Path(self.config.seed_state_path))
+        elif self.config.seed_log_path:
+            if self.config.seed_log_snapshot_timestamp is None:
+                raise ValueError("seed_log_snapshot_timestamp is required when seed_log_path is set")
+            seed_event_name = self.config.seed_log_event_name or event.short_name
+            seed_state = extract_seed_state_from_log(
+                log_path=Path(self.config.seed_log_path),
+                event_name=seed_event_name,
+                snapshot_timestamp=self.config.seed_log_snapshot_timestamp,
+            )
+        else:
+            return None
+
+        if seed_state.event_budget is not None and abs(seed_state.event_budget - self.config.initial_capital) > 0.05:
+            logger.warning(
+                "Replay seed event budget ($%.2f) differs from backtest capital ($%.2f)",
+                seed_state.event_budget,
+                self.config.initial_capital,
+            )
+        return seed_state
+
+    def _apply_replay_seed_state(
+        self,
+        portfolio: Portfolio,
+        token_ids: Dict[int, str],
+        event: EventPriceData,
+        seed_state: ReplaySeedState,
+    ) -> None:
+        """Apply a seeded portfolio state before replay begins."""
+        for bin_index, seeded in seed_state.positions.items():
+            if bin_index not in token_ids:
+                raise ValueError(
+                    f"Replay seed references bin {bin_index}, which is not present in event {event.short_name}"
+                )
+
+            position = portfolio.ensure_position(bin_index, token_ids[bin_index])
+            position.yes_shares = seeded.yes_shares
+            position.yes_avg_cost = seeded.yes_avg_cost
+            position.no_shares = seeded.no_shares
+            position.no_avg_cost = seeded.no_avg_cost
+            position.collateral_used = seeded.collateral_used
+
+        invested = portfolio.total_collateral_used
+        if seed_state.available_capital is not None:
+            portfolio.capital = max(0.0, seed_state.available_capital)
+        else:
+            portfolio.capital = max(0.0, self.config.initial_capital - invested)
+
+        logger.info(
+            "  Seeded replay state from %s: available=$%.2f, invested=$%.2f, positions=%d",
+            seed_state.source,
+            portfolio.capital,
+            invested,
+            len([p for p in portfolio.positions.values() if p.has_yes_position or p.has_no_position]),
+        )
 
     def _create_forecaster(self, event: EventPriceData):
         """
