@@ -175,7 +175,7 @@ class KellyConfig:
     max_iters_per_tick: int = 100
 
     # Trading cutoff hours before settlement
-    t_stop_hours: float = 3.0
+    t_stop_hours: float = 1.0
 
     # Exit mode: when True, exits use only utility check (utility_gain >= 0)
     # and skip the fair-value price threshold check.
