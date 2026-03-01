@@ -25,7 +25,7 @@ from .intraday import (
     IntradayNowcast,
     BucketIntradayForecaster,
 )
-from .interday import InterdayForecaster
+from .interday import InterdayForecaster, GASInterdayForecaster, PIGInterdayForecaster
 from .monte_carlo import MonteCarloForecaster, ForecastResult
 from .projection import ProjectionModel, AsymmetricProjection, create_projection_model
 
@@ -106,12 +106,36 @@ class TweetCountForecaster:
             logger.info("Using RIDGE intraday forecaster")
 
         # Interday components
-        self.interday = InterdayForecaster(
-            self.config.regime,
-            self.config.dispersion,
-            self.config.weekend,
-            self.contract_utils,
-        )
+        interday_model = self.config.interday_model.lower()
+        if interday_model == "gas":
+            self.interday = GASInterdayForecaster(
+                self.config.gas,
+                self.config.dispersion,
+                self.config.weekend,
+                self.contract_utils,
+            )
+            logger.info("Using GAS interday forecaster")
+        elif interday_model == "pig":
+            self.interday = PIGInterdayForecaster(
+                self.config.gas,
+                self.config.dispersion,
+                self.config.weekend,
+                self.contract_utils,
+            )
+            logger.info("Using PIG interday forecaster")
+        elif interday_model == "ewma":
+            self.interday = InterdayForecaster(
+                self.config.regime,
+                self.config.dispersion,
+                self.config.weekend,
+                self.contract_utils,
+            )
+            logger.info("Using EWMA interday forecaster")
+        else:
+            raise ValueError(
+                f"Unsupported interday_model={self.config.interday_model!r}. "
+                "Expected one of: ewma, gas, pig."
+            )
 
         # Monte Carlo
         self.monte_carlo: Optional[MonteCarloForecaster] = None

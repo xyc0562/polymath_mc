@@ -355,12 +355,13 @@ class Backtester:
         # Create fresh forecaster
         forecaster = self._create_forecaster()
 
-        # Fit progress curve
-        historical_timestamps = {
-            d: [e.timestamp for e in events]
-            for d, events in training_events.items()
-        }
-        forecaster.progress_curve.fit(historical_timestamps, as_of_date=forecast_date)
+        # Fit progress curve only for ridge intraday mode.
+        if forecaster.progress_curve is not None:
+            historical_timestamps = {
+                d: [e.timestamp for e in events]
+                for d, events in training_events.items()
+            }
+            forecaster.progress_curve.fit(historical_timestamps, as_of_date=forecast_date)
 
         # Fit nowcast
         forecaster.nowcast.fit(training_events, training_counts, as_of_date=forecast_date)

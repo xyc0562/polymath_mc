@@ -144,6 +144,7 @@ def log_config_summary(
     # Forecaster
     w("  FORECASTER")
     w(f"    Intraday mode:           {forecaster_config.intraday_mode}")
+    w(f"    Interday model:          {forecaster_config.interday_model}")
     w(f"    Projection model:        {multi_event_config.projection_model}")
     w(f"    Timezone:                {forecaster_config.timezone}")
     w(f"    Contract boundary hr:    {forecaster_config.contract_boundary_hour}")
@@ -757,6 +758,17 @@ def parse_args() -> argparse.Namespace:
              "linear F(τ) scaling, 'bucket' uses Negative Binomial per 3-hour bucket.",
     )
 
+    parser.add_argument(
+        "--interday-model",
+        type=str,
+        default="ewma",
+        choices=["ewma", "gas", "pig"],
+        help="Interday forecaster mode: "
+             "'ewma' (default) uses the original EWMA regime model. "
+             "'gas' uses NB-GAS regime dynamics. "
+             "'pig' uses PIG-GAS with heavier-tailed future-day sampling.",
+    )
+
     # Other
     parser.add_argument(
         "-v", "--verbose",
@@ -872,7 +884,10 @@ async def main() -> None:
         min_allocation=args.min_allocation,
     )
 
-    forecaster_config = ForecasterConfig(intraday_mode=args.intraday_mode)
+    forecaster_config = ForecasterConfig(
+        intraday_mode=args.intraday_mode,
+        interday_model=args.interday_model,
+    )
 
     # Load event trading rules
     event_trading_rules = None

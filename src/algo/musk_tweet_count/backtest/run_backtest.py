@@ -602,6 +602,17 @@ def main():
     )
 
     parser.add_argument(
+        "--interday-model",
+        type=str,
+        default="ewma",
+        choices=["ewma", "gas", "pig"],
+        help="Interday forecaster mode. "
+             "'ewma' (default) uses the original EWMA regime model. "
+             "'gas' uses NB-GAS regime dynamics. "
+             "'pig' uses PIG-GAS with heavier-tailed future-day sampling.",
+    )
+
+    parser.add_argument(
         "--capital-multiplier",
         type=float,
         default=1.0,
@@ -766,6 +777,7 @@ def main():
         verbose=args.trade_verbose,
         projection_model=args.projection,
         intraday_mode=args.intraday_mode,
+        interday_model=args.interday_model,
         event_trading_rules=event_trading_rules,
         tick_interval_seconds=args.tick_interval,
         cmp_nu_scale=args.nu_scale,
@@ -783,6 +795,7 @@ def main():
     )
     logger.info(f"Projection model: {args.projection}")
     logger.info(f"Intraday mode: {args.intraday_mode}")
+    logger.info(f"Interday model: {args.interday_model}")
     if args.exit_mode != "kelly_only":
         logger.info(f"Exit mode: {args.exit_mode}")
     if args.nu_scale != 1.0:

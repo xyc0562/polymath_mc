@@ -301,6 +301,9 @@ class ForecasterConfig:
     # Intraday forecaster mode: "ridge" (original) or "bucket" (new)
     intraday_mode: str = "ridge"
 
+    # Interday forecaster mode: "ewma" (default), "gas", or "pig"
+    interday_model: str = "ewma"
+
     # Component configs
     intraday_curve: IntradayCurveConfig = field(default_factory=IntradayCurveConfig)
     burst_features: BurstFeaturesConfig = field(default_factory=BurstFeaturesConfig)

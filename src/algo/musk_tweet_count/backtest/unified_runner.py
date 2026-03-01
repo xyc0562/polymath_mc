@@ -136,6 +136,9 @@ class UnifiedBacktestConfig:
     # - bucket: Bucket-based forecaster with 8 time buckets
     intraday_mode: str = "ridge"
 
+    # Interday forecaster mode: "ewma" (default), "gas", or "pig"
+    interday_model: str = "ewma"
+
     # Event trading rules configuration
     # Controls when trading is allowed based on event duration
     # If None, no duration-based restrictions are applied
@@ -874,6 +877,7 @@ class UnifiedBacktestRunner:
             monte_carlo=mc_config,
             bucket_nowcast=bucket_config,
             intraday_mode=self.config.intraday_mode,
+            interday_model=self.config.interday_model,
         )
         contract_utils = ContractDayUtils(
             timezone=config.timezone,
