@@ -137,6 +137,9 @@ class MultiEventConfig:
     # How often to log health status (seconds)
     health_log_interval: int = 3600  # Every hour
 
+    # How often to re-sync capital pool from on-chain USDC balance (seconds)
+    capital_sync_interval: int = 3600  # 1 hour
+
 
 class MultiEventManager:
     """
@@ -1419,6 +1422,7 @@ class MultiEventManager:
         # Track last execution times for periodic tasks
         last_count_validation = datetime.now(self._tz)
         last_event_scan = datetime.now(self._tz)
+        last_capital_sync = datetime.now(self._tz)
         self._last_health_log_time = datetime.now(self._tz)
 
         logger.info(
@@ -1426,7 +1430,8 @@ class MultiEventManager:
             f"sync_poll={self.config.sync_poll_interval}s, "
             f"count_validation={self.config.count_validation_interval}s, "
             f"event_scan={self.config.event_scan_interval}s, "
-            f"health_log={self.config.health_log_interval}s"
+            f"health_log={self.config.health_log_interval}s, "
+            f"capital_sync={self.config.capital_sync_interval}s"
         )
 
         # Log initial health status
@@ -1522,6 +1527,12 @@ class MultiEventManager:
                     await self._cleanup_old_data()
                     last_event_scan = now
 
+                # Capital re-sync from API (1 hour)
+                if (now - last_capital_sync).total_seconds() >= self.config.capital_sync_interval:
+                    await self._sync_capital_from_api()
+                    await self._try_start_pending_events()
+                    last_capital_sync = now
+
                 # Health logging (1 hour)
                 if (now - self._last_health_log_time).total_seconds() >= self.config.health_log_interval:
                     self._log_health()
@@ -1549,6 +1560,13 @@ class MultiEventManager:
 
         # Shutdown
         await self._shutdown()
+
+    async def _sync_capital_from_api(self) -> None:
+        """Re-sync capital pool total from on-chain USDC balance + positions."""
+        try:
+            await self._initialize_capital_from_api()
+        except Exception as e:
+            logger.warning(f"Capital re-sync failed: {e}")
 
     async def _update_capital_values(self) -> None:
         """Update capital pool with current portfolio values."""
