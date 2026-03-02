@@ -16,7 +16,7 @@ event_categories:
   - name: "short"
     duration_days: [0, 4]  # 0, 1, 2, 3 day events
     trading_rules:
-      require_counting_started: true
+      require_counting_started: false
 
   # Weekly events (4-8 days): Can trade before counting, but limited
   # Rationale: Longer horizon provides some buffer against regime errors,

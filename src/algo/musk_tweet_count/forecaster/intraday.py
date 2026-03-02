@@ -832,6 +832,9 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         # Impulse overrides
         self._impulse_overrides: List[ImpulseOverrideWindow] = []
 
+        # Last logged regime details for debugging/live diagnostics
+        self._last_regime: Optional[Dict[str, float | int | None]] = None
+
         # Fitted flag
         self._fitted = False
 
@@ -1272,10 +1275,21 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             expected_so_far += buckets[full_bucket_idx].mean * full_partial
 
             if expected_so_far >= self.config.min_expected_for_regime:
-                regime = observed / expected_so_far
-                regime = np.clip(regime, self.config.regime_min, self.config.regime_max)
+                raw_regime = observed / expected_so_far
+                regime = np.clip(raw_regime, self.config.regime_min, self.config.regime_max)
             else:
+                raw_regime = None
                 regime = 1.0
+
+            self._last_regime = {
+                "tau_now": tau_now,
+                "bucket_idx": int(full_bucket_idx),
+                "observed": int(observed),
+                "expected_so_far": round(expected_so_far, 2),
+                "raw_regime": round(raw_regime, 3) if raw_regime is not None else None,
+                "regime": round(float(regime), 3),
+                "min_expected": self.config.min_expected_for_regime,
+            }
 
             # Determine which bucket tau_now falls in
             bucket_start_idx = min(tau_now // self.bucket_size, self.n_buckets - 1)

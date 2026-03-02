@@ -1163,22 +1163,51 @@ class GASKellyTradingBot:
             self._last_monte_carlo_time = datetime.now(self.forecaster.contract_utils.tz)
 
             # Include impulse info if available
+            remaining_mean = forecast.mean - current_count
+            remaining_str = f" | remaining={remaining_mean:.1f}"
+
+            breakdown_str = ""
+            if forecast_breakdown:
+                past_count = forecast_breakdown["past_count"]
+                past_days = forecast_breakdown["past_days"]
+                remaining_days = forecast_breakdown["remaining_days"]
+                today_obs = current_count - past_count
+                breakdown_str = (
+                    f" | window: past={past_count} ({past_days}d), "
+                    f"today_obs={today_obs}, rem_days={remaining_days}"
+                )
+
             impulse_str = ""
             nowcast = getattr(self.forecaster, 'nowcast', None)
             if nowcast and hasattr(nowcast, '_last_impulse') and nowcast._last_impulse:
                 imp = nowcast._last_impulse
                 shifted = imp['shifted']
                 sign = "+" if shifted >= 0 else ""
+                override_str = f", override={imp['override']}" if imp.get("override") else ""
                 impulse_str = (
                     f" | impulse: silence={imp['silence_min']:.0f}min, "
                     f"exc={imp['excitation']} (exp={imp['expected']}, shifted={sign}{shifted}), "
-                    f"rate_mult={imp['rate_mult_now']:.2f}x"
+                    f"rate_mult={imp['rate_mult_now']:.2f}x{override_str}"
+                )
+
+            regime_str = ""
+            if nowcast and hasattr(nowcast, '_last_regime') and nowcast._last_regime:
+                reg = nowcast._last_regime
+                raw = reg.get("raw_regime")
+                raw_str = f"{raw:.2f}x" if raw is not None else "n/a"
+                regime_str = (
+                    f" | regime: tau={reg['tau_now']}, "
+                    f"obs={reg['observed']}, exp={reg['expected_so_far']}, "
+                    f"raw={raw_str}, clipped={reg['regime']:.2f}x"
                 )
 
             logger.info(
                 f"Monte Carlo recomputed: mean={forecast.mean:.1f}, "
                 f"std={forecast.std:.1f}, "
                 f"90% CI=[{forecast.p5:.0f}, {forecast.p95:.0f}]"
+                f"{remaining_str}"
+                f"{breakdown_str}"
+                f"{regime_str}"
                 f"{impulse_str}"
             )
 
