@@ -814,6 +814,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "'pig' uses PIG-GAS with heavier-tailed future-day sampling.",
     )
 
+    parser.add_argument(
+        "--historical-bootstrap",
+        action="store_true",
+        help="Blend late intraday bucket forecasts with weighted historical suffix samples.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-start-hours",
+        type=float,
+        default=6.0,
+        help="Hours left threshold where historical bootstrap starts blending in. Default: 6.0.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-full-hours",
+        type=float,
+        default=3.0,
+        help="Hours left threshold where historical bootstrap reaches max blend. Default: 3.0.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-max-blend",
+        type=float,
+        default=0.35,
+        help="Maximum mixture weight for historical bootstrap samples. Default: 0.35.",
+    )
+
     # Other
     parser.add_argument(
         "-v", "--verbose",
@@ -940,6 +967,17 @@ async def main() -> None:
         intraday_mode=args.intraday_mode,
         interday_model=args.interday_model,
     )
+    forecaster_config.bucket_nowcast.use_historical_bootstrap = args.historical_bootstrap
+    forecaster_config.bucket_nowcast.bootstrap_start_hours = args.bootstrap_start_hours
+    forecaster_config.bucket_nowcast.bootstrap_full_hours = args.bootstrap_full_hours
+    forecaster_config.bucket_nowcast.bootstrap_max_blend = args.bootstrap_max_blend
+    if args.historical_bootstrap:
+        logger.info(
+            "Historical intraday bootstrap: enabled (start=%.1fh, full=%.1fh, max_blend=%.2f)",
+            args.bootstrap_start_hours,
+            args.bootstrap_full_hours,
+            args.bootstrap_max_blend,
+        )
 
     # Load event trading rules
     event_trading_rules = None

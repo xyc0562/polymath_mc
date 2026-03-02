@@ -647,6 +647,33 @@ def main():
              "Higher = thinner left tail. Default: 1.0",
     )
 
+    parser.add_argument(
+        "--historical-bootstrap",
+        action="store_true",
+        help="Blend late intraday bucket forecasts with weighted historical suffix samples.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-start-hours",
+        type=float,
+        default=6.0,
+        help="Hours left threshold where historical bootstrap starts blending in. Default: 6.0.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-full-hours",
+        type=float,
+        default=3.0,
+        help="Hours left threshold where historical bootstrap reaches max blend. Default: 3.0.",
+    )
+
+    parser.add_argument(
+        "--bootstrap-max-blend",
+        type=float,
+        default=0.35,
+        help="Maximum mixture weight for historical bootstrap samples. Default: 0.35.",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -781,6 +808,10 @@ def main():
         event_trading_rules=event_trading_rules,
         tick_interval_seconds=args.tick_interval,
         cmp_nu_scale=args.nu_scale,
+        use_historical_bootstrap=args.historical_bootstrap,
+        bootstrap_start_hours=args.bootstrap_start_hours,
+        bootstrap_full_hours=args.bootstrap_full_hours,
+        bootstrap_max_blend=args.bootstrap_max_blend,
         resume_from_timestamp=resume_from_ts,
         seed_state_path=args.seed_state,
         seed_log_path=args.seed_from_log,
@@ -800,6 +831,13 @@ def main():
         logger.info(f"Exit mode: {args.exit_mode}")
     if args.nu_scale != 1.0:
         logger.info(f"CMP nu_scale: {args.nu_scale}")
+    if args.historical_bootstrap:
+        logger.info(
+            "Historical intraday bootstrap: enabled (start=%.1fh, full=%.1fh, max_blend=%.2f)",
+            args.bootstrap_start_hours,
+            args.bootstrap_full_hours,
+            args.bootstrap_max_blend,
+        )
     if args.capital_multiplier != 1.0:
         logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")
     if resume_from_ts is not None:

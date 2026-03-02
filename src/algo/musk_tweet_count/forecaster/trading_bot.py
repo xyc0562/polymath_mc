@@ -1198,6 +1198,15 @@ class GASKellyTradingBot:
                     f"raw={raw_str}, clipped={reg['regime']:.2f}x"
                 )
 
+            bootstrap_str = ""
+            if nowcast and hasattr(nowcast, '_last_bootstrap') and nowcast._last_bootstrap:
+                bs = nowcast._last_bootstrap
+                if bs.get("alpha", 0) > 0:
+                    bootstrap_str = (
+                        f" | hist_bs: n_eff={bs['n_eff']}, alpha={bs['alpha']:.2f}, "
+                        f"rem={bs['remaining_mean']:.1f}+/-{bs['remaining_std']:.1f}"
+                    )
+
             logger.info(
                 f"Monte Carlo recomputed: mean={forecast.mean:.1f}, "
                 f"std={forecast.std:.1f}, "
@@ -1206,6 +1215,7 @@ class GASKellyTradingBot:
                 f"{breakdown_str}"
                 f"{regime_str}"
                 f"{impulse_str}"
+                f"{bootstrap_str}"
             )
 
         except Exception as e:

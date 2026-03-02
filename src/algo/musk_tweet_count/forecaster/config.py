@@ -79,6 +79,20 @@ class BucketNowcastConfig:
     # Minimum expected count to compute regime (avoid division by near-zero)
     min_expected_for_regime: float = 1.0
 
+    # Optional conditional historical bootstrap for late intraday suffixes.
+    # Uses weighted historical remaining-count samples and blends them with the
+    # model-based bucket/impulse forecast in the late window.
+    use_historical_bootstrap: bool = False
+    bootstrap_start_hours: float = 6.0
+    bootstrap_full_hours: float = 3.0
+    bootstrap_max_blend: float = 0.35
+    bootstrap_regime_sigma: float = 0.35
+    bootstrap_recent60_sigma: float = 4.0
+    bootstrap_recent180_sigma: float = 8.0
+    bootstrap_silence_sigma_minutes: float = 60.0
+    bootstrap_min_effective_n: float = 5.0
+    bootstrap_full_effective_n: float = 20.0
+
     # Sampling distribution: "negbin", "com_poisson", or "negbin_reflected"
     bucket_distribution: str = "com_poisson"
 

@@ -757,6 +757,16 @@ class ImpulseOverrideWindow:
     ceiling: Optional[float] = None
 
 
+@dataclass
+class HistoricalSuffixProfile:
+    """Observed intraday path for one historical contract day."""
+
+    contract_date: date
+    is_weekend: bool
+    taus: np.ndarray
+    final_count: int
+
+
 def _load_impulse_overrides(path: str) -> List[ImpulseOverrideWindow]:
     """Load impulse rate_mult overrides from YAML. Returns empty list if file not found."""
     import os
@@ -834,6 +844,11 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         # Last logged regime details for debugging/live diagnostics
         self._last_regime: Optional[Dict[str, float | int | None]] = None
+        self._last_impulse: Optional[Dict[str, float | int | None]] = None
+        self._last_bootstrap: Optional[Dict[str, float | int]] = None
+
+        # Historical suffix profiles for optional direct historical bootstrap
+        self._historical_suffix_profiles: List[HistoricalSuffixProfile] = []
 
         # Fitted flag
         self._fitted = False
@@ -888,6 +903,11 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         # Fit distributions for each bucket
         self._weekday_buckets = self._fit_bucket_distributions(weekday_bucket_counts)
         self._weekend_buckets = self._fit_bucket_distributions(weekend_bucket_counts)
+        self._historical_suffix_profiles = self._build_historical_suffix_profiles(
+            historical_events=historical_events,
+            historical_counts=historical_counts,
+            as_of_date=today,
+        )
 
         self._fitted = True
 
@@ -909,6 +929,36 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         if self._weekend_buckets:
             means = [b.mean for b in self._weekend_buckets]
             logger.debug(f"Weekend bucket means: {[f'{m:.1f}' for m in means]}")
+
+    def _build_historical_suffix_profiles(
+        self,
+        historical_events: Dict[date, List[TweetEvent]],
+        historical_counts: Dict[date, int],
+        as_of_date: date,
+    ) -> List[HistoricalSuffixProfile]:
+        """Build per-day historical profiles for conditional suffix bootstrap."""
+        profiles: List[HistoricalSuffixProfile] = []
+
+        for contract_date, final_count in historical_counts.items():
+            days_ago = (as_of_date - contract_date).days
+            if days_ago > self.config.training_window_days:
+                continue
+
+            events = historical_events.get(contract_date, [])
+            taus = sorted(
+                self.contract_utils.get_tau(event.timestamp, contract_date)
+                for event in events
+            )
+            profiles.append(
+                HistoricalSuffixProfile(
+                    contract_date=contract_date,
+                    is_weekend=self.contract_utils.is_weekend(contract_date),
+                    taus=np.asarray(taus, dtype=np.int16),
+                    final_count=int(final_count),
+                )
+            )
+
+        return profiles
 
     def _count_events_per_bucket(
         self,
@@ -1145,6 +1195,151 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         )
         return 1.0 + integral / span
 
+    def _count_taus_in_window(self, taus: np.ndarray, start_tau: int, end_tau: int) -> int:
+        """Count tweets with start_tau < tau <= end_tau."""
+        if taus.size == 0 or end_tau <= start_tau:
+            return 0
+        lo = np.searchsorted(taus, start_tau, side="right")
+        hi = np.searchsorted(taus, end_tau, side="right")
+        return int(max(0, hi - lo))
+
+    def _get_silence_minutes(self, taus: np.ndarray, tau_now: int) -> int:
+        """Minutes since last tweet before tau_now, or tau_now if none."""
+        if taus.size == 0:
+            return tau_now
+        idx = np.searchsorted(taus, tau_now, side="left") - 1
+        if idx < 0:
+            return tau_now
+        return int(max(0, tau_now - int(taus[idx])))
+
+    def _gaussian_weight(self, diff: float, sigma: float) -> float:
+        """Gaussian similarity weight with defensive sigma handling."""
+        if sigma <= 0:
+            return 1.0 if abs(diff) < 1e-9 else 0.0
+        z = diff / sigma
+        return float(math.exp(-0.5 * z * z))
+
+    def _compute_historical_bootstrap_alpha(self, hours_left: float, n_eff: float) -> float:
+        """Blend weight for historical bootstrap based on time left and sample size."""
+        if not self.config.use_historical_bootstrap or hours_left > self.config.bootstrap_start_hours:
+            return 0.0
+
+        if self.config.bootstrap_start_hours <= self.config.bootstrap_full_hours:
+            time_alpha = 1.0
+        else:
+            span = self.config.bootstrap_start_hours - self.config.bootstrap_full_hours
+            time_alpha = (self.config.bootstrap_start_hours - hours_left) / span
+            time_alpha = float(np.clip(time_alpha, 0.0, 1.0))
+
+        if self.config.bootstrap_full_effective_n <= self.config.bootstrap_min_effective_n:
+            sample_alpha = 1.0
+        else:
+            sample_alpha = (
+                (n_eff - self.config.bootstrap_min_effective_n)
+                / (self.config.bootstrap_full_effective_n - self.config.bootstrap_min_effective_n)
+            )
+            sample_alpha = float(np.clip(sample_alpha, 0.0, 1.0))
+
+        return float(self.config.bootstrap_max_blend * time_alpha * sample_alpha)
+
+    def _sample_historical_bootstrap_suffix(
+        self,
+        observed: int,
+        event_taus: np.ndarray,
+        tau_now: int,
+        end_tau: int,
+        is_weekend: bool,
+        expected_so_far: float,
+        n_simulations: int,
+        rng: np.random.Generator,
+    ) -> Optional[np.ndarray]:
+        """Sample remaining final counts from weighted historical suffix analogs."""
+        hours_left = max(0.0, end_tau - tau_now) / 60.0
+        self._last_bootstrap = None
+
+        if not self.config.use_historical_bootstrap:
+            return None
+        if hours_left > self.config.bootstrap_start_hours:
+            return None
+        if not self._historical_suffix_profiles:
+            return None
+
+        current_regime = observed / expected_so_far if expected_so_far >= self.config.min_expected_for_regime else 1.0
+        current_regime = max(current_regime, 1e-3)
+        current_recent60 = self._count_taus_in_window(event_taus, tau_now - 60, tau_now)
+        current_recent180 = self._count_taus_in_window(event_taus, tau_now - 180, tau_now)
+        current_silence = self._get_silence_minutes(event_taus, tau_now)
+
+        remaining_values: List[int] = []
+        weights: List[float] = []
+
+        for profile in self._historical_suffix_profiles:
+            if profile.is_weekend != is_weekend:
+                continue
+
+            hist_observed = int(np.searchsorted(profile.taus, tau_now, side="right"))
+            hist_end_count = int(np.searchsorted(profile.taus, end_tau, side="right"))
+            hist_remaining = max(0, hist_end_count - hist_observed)
+            hist_recent60 = self._count_taus_in_window(profile.taus, tau_now - 60, tau_now)
+            hist_recent180 = self._count_taus_in_window(profile.taus, tau_now - 180, tau_now)
+            hist_silence = self._get_silence_minutes(profile.taus, tau_now)
+            hist_regime = hist_observed / expected_so_far if expected_so_far >= self.config.min_expected_for_regime else 1.0
+            hist_regime = max(hist_regime, 1e-3)
+
+            weight = 1.0
+            weight *= self._gaussian_weight(
+                math.log(current_regime) - math.log(hist_regime),
+                self.config.bootstrap_regime_sigma,
+            )
+            weight *= self._gaussian_weight(
+                current_recent60 - hist_recent60,
+                self.config.bootstrap_recent60_sigma,
+            )
+            weight *= self._gaussian_weight(
+                current_recent180 - hist_recent180,
+                self.config.bootstrap_recent180_sigma,
+            )
+            weight *= self._gaussian_weight(
+                current_silence - hist_silence,
+                self.config.bootstrap_silence_sigma_minutes,
+            )
+
+            if weight <= 0.0:
+                continue
+
+            remaining_values.append(hist_remaining)
+            weights.append(weight)
+
+        if not weights:
+            return None
+
+        weights_arr = np.asarray(weights, dtype=float)
+        weights_sum = float(weights_arr.sum())
+        if weights_sum <= 0:
+            return None
+        probs = weights_arr / weights_sum
+        n_eff = float((weights_sum ** 2) / np.square(weights_arr).sum())
+        alpha = self._compute_historical_bootstrap_alpha(hours_left, n_eff)
+
+        remaining_arr = np.asarray(remaining_values, dtype=int)
+        weighted_mean = float(np.dot(probs, remaining_arr))
+        weighted_var = float(np.dot(probs, np.square(remaining_arr - weighted_mean)))
+
+        self._last_bootstrap = {
+            "hours_left": round(hours_left, 2),
+            "n_hist": int(len(remaining_values)),
+            "n_eff": round(n_eff, 2),
+            "alpha": round(alpha, 3),
+            "remaining_mean": round(weighted_mean, 2),
+            "remaining_std": round(math.sqrt(max(weighted_var, 0.0)), 2),
+        }
+
+        if alpha <= 0.0:
+            return None
+
+        sampled_remaining = rng.choice(remaining_arr, size=n_simulations, replace=True, p=probs)
+        return observed + sampled_remaining
+
     def _sample_with_impulse(
         self,
         events: List[TweetEvent],
@@ -1182,7 +1377,15 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 f"No bucket distributions for {'weekend' if is_weekend else 'weekday'}."
             )
 
-        observed = len([e for e in events if e.timestamp < now])
+        event_taus = np.asarray(
+            sorted(
+                self.contract_utils.get_tau(event.timestamp, contract_date)
+                for event in events
+                if event.timestamp < now
+            ),
+            dtype=np.int16,
+        )
+        observed = int(event_taus.size)
         end_tau = min(settlement_tau, 1440) if settlement_tau is not None else 1440
 
         samples = np.full(n_simulations, float(observed))
@@ -1361,6 +1564,24 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                     samples += self._sample_negative_binomial(
                         mean=bucket_mean, k=k, size=n_simulations, rng=rng,
                     )
+
+            bootstrap_samples = self._sample_historical_bootstrap_suffix(
+                observed=observed,
+                event_taus=event_taus,
+                tau_now=tau_now,
+                end_tau=end_tau,
+                is_weekend=is_weekend,
+                expected_so_far=expected_so_far,
+                n_simulations=n_simulations,
+                rng=rng,
+            )
+            if bootstrap_samples is not None and self._last_bootstrap:
+                alpha = self._last_bootstrap["alpha"]
+                use_bootstrap = rng.random(n_simulations) < alpha
+                samples = np.where(use_bootstrap, bootstrap_samples, samples)
+        else:
+            self._last_regime = None
+            self._last_bootstrap = None
 
         return samples
 

@@ -147,6 +147,12 @@ class UnifiedBacktestConfig:
     # CMP nu_scale for COM-Poisson distribution (higher = thinner left tail)
     cmp_nu_scale: float = 1.0
 
+    # Optional intraday historical bootstrap overlay
+    use_historical_bootstrap: bool = False
+    bootstrap_start_hours: float = 6.0
+    bootstrap_full_hours: float = 3.0
+    bootstrap_max_blend: float = 0.35
+
     # Optional seeded replay inputs
     seed_state_path: Optional[str] = None
     seed_log_path: Optional[str] = None
@@ -872,7 +878,13 @@ class UnifiedBacktestRunner:
         # Use fixed seed for reproducible backtests
         mc_config = MonteCarloConfig(n_simulations=10000, random_seed=42,
                                      cmp_nu_scale=self.config.cmp_nu_scale)
-        bucket_config = BucketNowcastConfig(cmp_nu_scale=self.config.cmp_nu_scale)
+        bucket_config = BucketNowcastConfig(
+            cmp_nu_scale=self.config.cmp_nu_scale,
+            use_historical_bootstrap=self.config.use_historical_bootstrap,
+            bootstrap_start_hours=self.config.bootstrap_start_hours,
+            bootstrap_full_hours=self.config.bootstrap_full_hours,
+            bootstrap_max_blend=self.config.bootstrap_max_blend,
+        )
         config = ForecasterConfig(
             monte_carlo=mc_config,
             bucket_nowcast=bucket_config,
