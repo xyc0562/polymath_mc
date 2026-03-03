@@ -439,6 +439,8 @@ def generate_candidates(
                 config=config,
                 hours_to_settlement=hours_to_settlement,
                 kelly_only_exit=config.kelly_only_exit,
+                verbose=verbose,
+                rejection_reasons=rejection_reasons,
             )
             if candidate:
                 candidates.append(candidate)
@@ -489,6 +491,8 @@ def generate_candidates(
                 config=config,
                 hours_to_settlement=hours_to_settlement,
                 kelly_only_exit=config.kelly_only_exit,
+                verbose=verbose,
+                rejection_reasons=rejection_reasons,
             )
             if candidate:
                 candidates.append(candidate)
@@ -640,6 +644,8 @@ def _generate_sell_yes_candidate(
     config: KellyConfig,
     hours_to_settlement: float,
     kelly_only_exit: bool = False,
+    verbose: bool = False,
+    rejection_reasons: Optional[dict] = None,
 ) -> Optional[TradeCandidate]:
     """
     Generate a SELL YES candidate if profitable.
@@ -657,14 +663,20 @@ def _generate_sell_yes_candidate(
     if not position or not position.has_yes_position:
         return None
 
+    def _reject(reason: str) -> None:
+        if verbose and rejection_reasons is not None:
+            rejection_reasons.setdefault(bin_index, []).append(f"SELL_YES: {reason}")
+
     # Get available depth in shares
     depth_shares = get_available_depth(orderbook, "SELL_YES")
     if depth_shares <= 0:
+        _reject("no bid depth")
         return None
 
     # Get best bid price (selling YES at bid)
     best_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else None
     if not best_bid or best_bid <= 0:
+        _reject("no bid price")
         return None
 
     # Small screening chunk for marginal utility estimation
@@ -689,16 +701,21 @@ def _generate_sell_yes_candidate(
 
     # For exits, only enforce 1 share minimum (no USD value requirement)
     if delta < 1:
+        _reject(f"size too small ({delta:.2f} < 1 share)")
         return None
 
     vwap, filled, worst_price = compute_vwap_sell_yes(orderbook, delta)
     if filled <= 0:
+        _reject("no fill from orderbook")
         return None
 
     # Sell friction: require market price meaningfully above Kelly fair value
     # This applies even in kelly_only_exit mode to prevent cycling
     sell_friction = config.edge_buffer.sell_friction
     if sell_friction > 0 and vwap < reservation_price + sell_friction:
+        _reject(
+            f"sell friction (bid={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
+        )
         logger.debug(
             f"SELL_YES bin {bin_index}: sell friction "
             f"(vwap={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
@@ -714,6 +731,10 @@ def _generate_sell_yes_candidate(
     # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
     if not kelly_only_exit:
         if vwap < exit_threshold:
+            _reject(
+                f"below exit threshold (bid={vwap:.1%}, model={model_probability:.1%}, "
+                f"kelly={reservation_price:.1%}, threshold={exit_threshold:.1%})"
+            )
             logger.debug(
                 f"SELL_YES bin {bin_index}: below exit threshold "
                 f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
@@ -728,6 +749,9 @@ def _generate_sell_yes_candidate(
 
     # Screening: only require positive utility (min_sell_utility applied in optimizer)
     if utility_gain <= 0:
+        _reject(
+            f"non-positive utility ({utility_gain:.6f}, bid={vwap:.1%}, fair={reservation_price:.1%})"
+        )
         logger.debug(
             f"SELL_YES bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"
         )
@@ -857,6 +881,8 @@ def _generate_sell_no_candidate(
     config: KellyConfig,
     hours_to_settlement: float,
     kelly_only_exit: bool = False,
+    verbose: bool = False,
+    rejection_reasons: Optional[dict] = None,
 ) -> Optional[TradeCandidate]:
     """
     Generate a SELL NO candidate if profitable.
@@ -870,6 +896,10 @@ def _generate_sell_no_candidate(
     2. Exit when market >= Kelly reservation price (utility-based exit,
        e.g., when concentrated position makes hedging valuable)
     """
+    def _reject(reason: str) -> None:
+        if verbose and rejection_reasons is not None:
+            rejection_reasons.setdefault(bin_index, []).append(f"SELL_NO: {reason}")
+
     position = portfolio.get_position(bin_index)
     if not position or not position.has_no_position:
         return None
@@ -877,12 +907,14 @@ def _generate_sell_no_candidate(
     # Get available depth in shares
     depth_shares = get_available_depth(orderbook, "SELL_NO")
     if depth_shares <= 0:
+        _reject("no ask depth")
         return None
 
     # Get best ask price (selling NO = buying YES at ask)
     # NO sell price = 1 - YES ask price
     best_yes_ask = orderbook.yes_asks[0].price if orderbook.yes_asks else None
     if not best_yes_ask or best_yes_ask <= 0:
+        _reject("no ask price")
         return None
     best_no_price = 1.0 - best_yes_ask
 
@@ -908,16 +940,21 @@ def _generate_sell_no_candidate(
 
     # For exits, only enforce 1 share minimum (no USD value requirement)
     if delta < 1:
+        _reject(f"size too small ({delta:.2f} < 1 share)")
         return None
 
     vwap, filled, worst_price = compute_vwap_sell_no(orderbook, delta)
     if filled <= 0:
+        _reject("no fill from orderbook")
         return None
 
     # Sell friction: require market price meaningfully above Kelly fair value
     # This applies even in kelly_only_exit mode to prevent cycling
     sell_friction = config.edge_buffer.sell_friction
     if sell_friction > 0 and vwap < reservation_price + sell_friction:
+        _reject(
+            f"sell friction (bid={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
+        )
         logger.debug(
             f"SELL_NO bin {bin_index}: sell friction "
             f"(vwap={vwap:.1%} < fair+friction={reservation_price + sell_friction:.1%})"
@@ -933,6 +970,10 @@ def _generate_sell_no_candidate(
     # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
     if not kelly_only_exit:
         if vwap < exit_threshold:
+            _reject(
+                f"below exit threshold (bid={vwap:.1%}, model={model_probability:.1%}, "
+                f"kelly={reservation_price:.1%}, threshold={exit_threshold:.1%})"
+            )
             logger.debug(
                 f"SELL_NO bin {bin_index}: below exit threshold "
                 f"(vwap={vwap:.4f}, model={model_probability:.4f}, kelly={reservation_price:.4f}, threshold={exit_threshold:.4f})"
@@ -947,6 +988,9 @@ def _generate_sell_no_candidate(
 
     # Screening: only require positive utility (min_sell_utility applied in optimizer)
     if utility_gain <= 0:
+        _reject(
+            f"non-positive utility ({utility_gain:.6f}, bid={vwap:.1%}, fair={reservation_price:.1%})"
+        )
         logger.debug(
             f"SELL_NO bin {bin_index}: non-positive utility ({utility_gain:.6f}), skipping"
         )
