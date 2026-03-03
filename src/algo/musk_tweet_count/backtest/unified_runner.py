@@ -26,6 +26,7 @@ from .replay_seed import (
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, EventTradingRulesConfig
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import KellyExecutor, TickResult
+from ..kelly.market_aware import compute_market_aware_blend
 from ..kelly.backtest_backend import (
     SimulationConfig,
     BacktestOrderbookProvider,
@@ -485,6 +486,25 @@ class UnifiedBacktestRunner:
                 if b.upper_bound < current_count
             ]
 
+            # Update orderbooks from historical data
+            simulated_obs = self.price_provider.get_all_orderbooks(event, ts)
+            orderbook_provider.update_from_simulated(simulated_obs, ts)
+
+            probabilities, blend_context = compute_market_aware_blend(
+                probabilities=probabilities,
+                dead_bins=dead_bins,
+                orderbooks=simulated_obs,
+                market_config=self.config.trading.market_aware,
+            )
+            if blend_context is not None:
+                logger.debug(
+                    "  Market-aware blend: lambda=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
+                    blend_context["blend"],
+                    blend_context["coverage_ratio"],
+                    blend_context["avg_spread"],
+                    blend_context["disagreement"],
+                )
+
             # Update portfolio with new probabilities and dead bins
             portfolio.probabilities = probabilities
             portfolio.dead_bins = dead_bins
@@ -492,10 +512,6 @@ class UnifiedBacktestRunner:
 
             # Calculate hours to settlement
             hours_to_settlement = (settlement_dt - dt).total_seconds() / 3600.0
-
-            # Update orderbooks from historical data
-            simulated_obs = self.price_provider.get_all_orderbooks(event, ts)
-            orderbook_provider.update_from_simulated(simulated_obs, ts)
 
             # Store context for verbose logging
             self._current_tick_context = {

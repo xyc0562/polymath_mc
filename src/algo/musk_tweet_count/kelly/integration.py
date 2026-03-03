@@ -30,6 +30,7 @@ from .candidates import TradeCandidate
 from .executor import KellyExecutor, OrderExecutor, ExecutionResult, TickResult
 from .websocket_client import OrderbookManager, WebSocketConfig
 from .kelly_math import identify_dead_bins, renormalize_probabilities
+from .market_aware import compute_market_aware_blend
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,7 @@ class KellyTradingBot:
         current_count: int,
         hours_elapsed: float,
         hours_remaining: float,
+        orderbooks: Optional[Dict[int, UnifiedOrderbook]] = None,
     ) -> None:
         """
         Update probability estimates and identify dead bins.
@@ -302,6 +304,7 @@ class KellyTradingBot:
             current_count: Current tweet count from xtracker
             hours_elapsed: Hours since counting period started
             hours_remaining: Hours until settlement
+            orderbooks: Optional live orderbooks for market-aware shrinkage
         """
         if not self._setup_complete:
             raise RuntimeError("Bot not setup. Call setup() first.")
@@ -340,6 +343,22 @@ class KellyTradingBot:
             if total > 0:
                 probabilities = [p / total for p in probabilities]
         self._ema_probabilities = probabilities
+
+        probabilities, blend_context = compute_market_aware_blend(
+            probabilities=probabilities,
+            dead_bins=dead_bins,
+            orderbooks=orderbooks,
+            market_config=self.config.market_aware,
+        )
+        if blend_context is not None:
+            logger.debug(
+                "[%s] Market-aware blend applied: lambda=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
+                self.event_name,
+                blend_context["blend"],
+                blend_context["coverage_ratio"],
+                blend_context["avg_spread"],
+                blend_context["disagreement"],
+            )
 
         # Update portfolio
         self.portfolio.update_probabilities(probabilities, renormalize=False)
@@ -402,11 +421,8 @@ class KellyTradingBot:
             # The executor calls sync_portfolio callback before each generate_candidates() call
             # This ensures we always use official API data, not calculated estimates
 
-            # Update probabilities (this also identifies dead bins)
-            self.update_probabilities(current_count, hours_elapsed, hours_to_settlement)
-
             # Fetch fresh orderbooks only for LIVE bins (skip dead bins)
-            dead_bins = set(self.portfolio.dead_bins)
+            dead_bins = set(identify_dead_bins(self.bin_upper_bounds, current_count))
             orderbooks = {}
             for bin_idx, token_id in self.bin_token_ids.items():
                 if bin_idx in dead_bins:
@@ -416,6 +432,14 @@ class KellyTradingBot:
                 ob = self.orderbook_manager.get_orderbook(token_id)
                 if ob:
                     orderbooks[bin_idx] = ob
+
+            # Update probabilities (this also identifies dead bins)
+            self.update_probabilities(
+                current_count,
+                hours_elapsed,
+                hours_to_settlement,
+                orderbooks=orderbooks,
+            )
 
             # Build bin ranges for logging
             bin_ranges = {}

@@ -139,6 +139,88 @@ class RateLimitConfig:
 
 
 @dataclass
+class MarketAwareConfig:
+    """
+    Configuration for market-aware probability shrinkage.
+
+    This is a small robust-Kelly layer that gently shrinks model probabilities
+    toward a market-implied distribution when quote coverage is good and the
+    model meaningfully disagrees with the market.
+    """
+
+    # Enable market-aware shrinkage.
+    enabled: bool = False
+
+    # Maximum blend weight toward market-implied probabilities.
+    max_blend: float = 0.15
+
+    # Minimum fraction of live bins that must have two-sided quotes.
+    min_coverage_ratio: float = 0.50
+
+    # If average mid spread exceeds this, disable the shrinkage.
+    max_avg_spread: float = 0.06
+
+    # Half-L1 disagreement scale at which the blend reaches max_blend.
+    # 0.5 * sum_i |p_model_i - p_mkt_i|
+    disagreement_scale: float = 0.20
+
+
+@dataclass
+class RobustKellyConfig:
+    """
+    Configuration for market-aware Kelly fraction haircuts.
+
+    Unlike market-aware probability shrinkage, this leaves the model
+    probabilities unchanged and only reduces effective Kelly aggressiveness
+    when the market strongly disagrees and quote quality is good enough
+    to trust.
+    """
+
+    # Enable dynamic Kelly fraction haircuting.
+    enabled: bool = False
+
+    # Lowest allowed Kelly fraction as a multiplier of the configured base.
+    # 0.50 means the effective Kelly fraction can shrink to at most half
+    # the configured kelly_fraction for that tick.
+    min_fraction_multiplier: float = 0.50
+
+    # Minimum fraction of live bins that must have two-sided quotes.
+    min_coverage_ratio: float = 0.50
+
+    # If average mid spread exceeds this, disable the haircut.
+    max_avg_spread: float = 0.06
+
+    # Half-L1 disagreement scale at which the full haircut is reached.
+    # 0.5 * sum_i |p_model_i - p_mkt_i|
+    disagreement_scale: float = 0.20
+
+
+@dataclass
+class MarketBuyGuardConfig:
+    """
+    Configuration for market-aware buy threshold widening.
+
+    This uses market disagreement only as a guardrail on new buys. It does not
+    change model probabilities, sells, or Kelly fraction globally.
+    """
+
+    # Enable market-aware widening of buy thresholds.
+    enabled: bool = False
+
+    # Maximum extra threshold widening in probability points under full guard.
+    max_threshold_widening: float = 0.03
+
+    # Minimum fraction of live bins that must have two-sided quotes.
+    min_coverage_ratio: float = 0.50
+
+    # If average mid spread exceeds this, disable the guard.
+    max_avg_spread: float = 0.06
+
+    # Half-L1 disagreement scale at which the full guard is reached.
+    disagreement_scale: float = 0.20
+
+
+@dataclass
 class CollateralConfig:
     """Configuration for collateral limits."""
 
@@ -228,6 +310,15 @@ class KellyConfig:
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
+    # Market-aware robust Kelly
+    market_aware: MarketAwareConfig = field(default_factory=MarketAwareConfig)
+
+    # Market-aware Kelly fraction haircuting
+    robust_kelly: RobustKellyConfig = field(default_factory=RobustKellyConfig)
+
+    # Market-aware buy guardrail
+    market_buy_guard: MarketBuyGuardConfig = field(default_factory=MarketBuyGuardConfig)
+
     @classmethod
     def from_dict(cls, data: dict) -> "KellyConfig":
         """Create config from dictionary (e.g., from YAML)."""
@@ -238,6 +329,9 @@ class KellyConfig:
         data.pop("adaptive_delta", None)  # Legacy field, ignored
         collateral_data = data.pop("collateral", {})
         rate_limit_data = data.pop("rate_limit", {})
+        market_aware_data = data.pop("market_aware", {})
+        robust_kelly_data = data.pop("robust_kelly", {})
+        market_buy_guard_data = data.pop("market_buy_guard", {})
 
         # Backward compatibility: convert old c_bin_max (absolute) to c_bin_max_ratio
         if "c_bin_max" in collateral_data and "c_bin_max_ratio" not in collateral_data:
@@ -260,6 +354,9 @@ class KellyConfig:
             market_impact=MarketImpactConfig(**market_impact_data),
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
+            market_aware=MarketAwareConfig(**market_aware_data),
+            robust_kelly=RobustKellyConfig(**robust_kelly_data),
+            market_buy_guard=MarketBuyGuardConfig(**market_buy_guard_data),
             **data,
         )
 

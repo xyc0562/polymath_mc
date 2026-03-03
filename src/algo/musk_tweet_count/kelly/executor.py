@@ -19,8 +19,8 @@ import asyncio
 import logging
 import math
 import time
-from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client.client import ClobClient
@@ -43,6 +43,7 @@ from .candidates import (
     MIN_ORDER_VALUE_USD,
 )
 from .websocket_client import OrderbookManager
+from .market_aware import compute_robust_kelly_fraction
 
 if TYPE_CHECKING:
     from .user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
@@ -2061,6 +2062,7 @@ class KellyExecutor:
         candidate: TradeCandidate,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
+        tick_config: KellyConfig,
         max_iterations: int = 10,
     ) -> float:
         """
@@ -2121,6 +2123,7 @@ class KellyExecutor:
             full_size,
             orderbooks,
             hours_to_settlement,
+            tick_config
         ):
             return full_size
 
@@ -2149,6 +2152,7 @@ class KellyExecutor:
                 mid,
                 orderbooks,
                 hours_to_settlement,
+                tick_config,
             ):
                 hi = mid
             else:
@@ -2172,6 +2176,7 @@ class KellyExecutor:
         test_size: float,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
+        tick_config: KellyConfig,
     ) -> bool:
         """
         Check if filling test_size shares would overshoot Kelly-optimal.
@@ -2205,7 +2210,7 @@ class KellyExecutor:
         new_candidates = generate_candidates(
             portfolio=hyp,
             orderbooks=orderbooks,
-            config=self.config,
+            config=tick_config,
             hours_to_settlement=hours_to_settlement,
             verbose=False,
         )
@@ -2248,6 +2253,7 @@ class KellyExecutor:
         test_size: float,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
+        tick_config: KellyConfig,
     ) -> bool:
         """
         Check if filling test_size shares would overshoot Kelly-optimal.
@@ -2279,7 +2285,7 @@ class KellyExecutor:
         new_candidates = generate_candidates(
             portfolio=hyp,
             orderbooks=orderbooks,
-            config=self.config,
+            config=tick_config,
             hours_to_settlement=hours_to_settlement,
             verbose=False,
         )
@@ -2316,6 +2322,7 @@ class KellyExecutor:
         candidate: TradeCandidate,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
+        tick_config: KellyConfig,
         max_iterations: int = 10,
     ) -> float:
         """
@@ -2376,7 +2383,9 @@ class KellyExecutor:
             return full_size if full_size >= 1.0 else 0.0
 
         # Quick check: does full chunk overshoot?
-        if not self._check_overshoots_on(portfolio, candidate, full_size, orderbooks, hours_to_settlement):
+        if not self._check_overshoots_on(
+            portfolio, candidate, full_size, orderbooks, hours_to_settlement, tick_config
+        ):
             return full_size
 
         br = self._bin_range(candidate.bin_index)
@@ -2396,7 +2405,9 @@ class KellyExecutor:
             if hi - lo < 1.0:
                 break
             mid = (lo + hi) / 2.0
-            if self._check_overshoots_on(portfolio, candidate, mid, orderbooks, hours_to_settlement):
+            if self._check_overshoots_on(
+                portfolio, candidate, mid, orderbooks, hours_to_settlement, tick_config
+            ):
                 hi = mid
             else:
                 best_valid = mid
@@ -2410,6 +2421,22 @@ class KellyExecutor:
         )
 
         return optimal
+
+    def _build_tick_config(
+        self,
+        orderbooks: Dict[int, UnifiedOrderbook],
+    ) -> tuple[KellyConfig, Optional[dict]]:
+        """Build a per-tick Kelly config with optional robust-Kelly haircuting."""
+        effective_fraction, context = compute_robust_kelly_fraction(
+            base_kelly_fraction=self.config.kelly_fraction,
+            probabilities=self.portfolio.probabilities,
+            dead_bins=self.portfolio.dead_bins,
+            orderbooks=orderbooks,
+            robust_config=self.config.robust_kelly,
+        )
+        if abs(effective_fraction - self.config.kelly_fraction) < 1e-12:
+            return self.config, context
+        return replace(self.config, kelly_fraction=effective_fraction), context
 
     def _compute_optimal_trades(
         self,
@@ -2438,13 +2465,26 @@ class KellyExecutor:
         hyp = portfolio._copy()
         hyp.external_capital_limit = portfolio.external_capital_limit
         planned_trades = []
+        tick_config, robust_context = self._build_tick_config(orderbooks)
+
+        if robust_context is not None:
+            logger.debug(
+                "[%s] Robust Kelly haircut: fraction=%.3f (base=%.3f, mult=%.3f, coverage=%.2f, avg_spread=%.3f, disagreement=%.3f)",
+                self.event_name,
+                robust_context["effective_fraction"],
+                self.config.kelly_fraction,
+                robust_context["fraction_multiplier"],
+                robust_context["coverage_ratio"],
+                robust_context["avg_spread"],
+                robust_context["disagreement"],
+            )
 
         for sim_iter in range(self.config.max_iters_per_tick):
             # Generate candidates on hypothetical portfolio
             candidates = generate_candidates(
                 portfolio=hyp,
                 orderbooks=orderbooks,
-                config=self.config,
+                config=tick_config,
                 hours_to_settlement=hours_to_settlement,
                 verbose=(verbose and sim_iter == 0),
             )
@@ -2516,10 +2556,10 @@ class KellyExecutor:
                 hyp_after = self._simulate_trade(hyp, sized_candidate)
                 from .candidates import _compute_portfolio_utility_gain
 
-                actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, self.config)
+                actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, tick_config)
 
                 is_sell = sized_candidate.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
+                min_util = tick_config.min_sell_utility if is_sell else tick_config.min_buy_utility
                 if actual_utility < min_util:
                     rejected.append(
                         self._log_optimizer_rejection(

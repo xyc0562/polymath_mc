@@ -47,6 +47,9 @@ from src.algo.musk_tweet_count.kelly.config import (
     CollateralConfig,
     EventTradingRulesConfig,
     MarketImpactConfig,
+    MarketAwareConfig,
+    RobustKellyConfig,
+    MarketBuyGuardConfig,
 )
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
@@ -841,6 +844,108 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Maximum mixture weight for historical bootstrap samples. Default: 0.35.",
     )
 
+    parser.add_argument(
+        "--market-aware",
+        action="store_true",
+        help="Shrink Kelly probabilities slightly toward market-implied mids when quote quality is good.",
+    )
+
+    parser.add_argument(
+        "--market-aware-max-blend",
+        type=float,
+        default=MarketAwareConfig.max_blend,
+        help=f"Maximum market-aware shrinkage weight. Default: {MarketAwareConfig.max_blend}.",
+    )
+
+    parser.add_argument(
+        "--market-aware-min-coverage",
+        type=float,
+        default=MarketAwareConfig.min_coverage_ratio,
+        help=f"Minimum live-bin quote coverage for market-aware shrinkage. Default: {MarketAwareConfig.min_coverage_ratio}.",
+    )
+
+    parser.add_argument(
+        "--market-aware-max-avg-spread",
+        type=float,
+        default=MarketAwareConfig.max_avg_spread,
+        help=f"Maximum average YES mid spread to allow market-aware shrinkage. Default: {MarketAwareConfig.max_avg_spread}.",
+    )
+
+    parser.add_argument(
+        "--market-aware-disagreement-scale",
+        type=float,
+        default=MarketAwareConfig.disagreement_scale,
+        help=f"Half-L1 model-vs-market disagreement scale for full shrinkage. Default: {MarketAwareConfig.disagreement_scale}.",
+    )
+
+    parser.add_argument(
+        "--robust-kelly",
+        action="store_true",
+        help="Reduce effective Kelly fraction when the market strongly disagrees and quote quality is good.",
+    )
+
+    parser.add_argument(
+        "--robust-kelly-min-fraction-multiplier",
+        type=float,
+        default=RobustKellyConfig.min_fraction_multiplier,
+        help=f"Minimum multiplier on Kelly fraction under full robust-Kelly haircut. Default: {RobustKellyConfig.min_fraction_multiplier}.",
+    )
+
+    parser.add_argument(
+        "--robust-kelly-min-coverage",
+        type=float,
+        default=RobustKellyConfig.min_coverage_ratio,
+        help=f"Minimum live-bin quote coverage for robust Kelly haircuting. Default: {RobustKellyConfig.min_coverage_ratio}.",
+    )
+
+    parser.add_argument(
+        "--robust-kelly-max-avg-spread",
+        type=float,
+        default=RobustKellyConfig.max_avg_spread,
+        help=f"Maximum average YES mid spread to allow robust Kelly haircuting. Default: {RobustKellyConfig.max_avg_spread}.",
+    )
+
+    parser.add_argument(
+        "--robust-kelly-disagreement-scale",
+        type=float,
+        default=RobustKellyConfig.disagreement_scale,
+        help=f"Half-L1 model-vs-market disagreement scale for full robust-Kelly haircut. Default: {RobustKellyConfig.disagreement_scale}.",
+    )
+
+    parser.add_argument(
+        "--market-buy-guard",
+        action="store_true",
+        help="Widen buy-entry thresholds when the market strongly disagrees and quote quality is good.",
+    )
+
+    parser.add_argument(
+        "--market-buy-guard-max-widening",
+        type=float,
+        default=MarketBuyGuardConfig.max_threshold_widening,
+        help=f"Maximum extra buy-threshold widening in probability points. Default: {MarketBuyGuardConfig.max_threshold_widening}.",
+    )
+
+    parser.add_argument(
+        "--market-buy-guard-min-coverage",
+        type=float,
+        default=MarketBuyGuardConfig.min_coverage_ratio,
+        help=f"Minimum live-bin quote coverage for buy guard. Default: {MarketBuyGuardConfig.min_coverage_ratio}.",
+    )
+
+    parser.add_argument(
+        "--market-buy-guard-max-avg-spread",
+        type=float,
+        default=MarketBuyGuardConfig.max_avg_spread,
+        help=f"Maximum average YES mid spread to allow buy guard. Default: {MarketBuyGuardConfig.max_avg_spread}.",
+    )
+
+    parser.add_argument(
+        "--market-buy-guard-disagreement-scale",
+        type=float,
+        default=MarketBuyGuardConfig.disagreement_scale,
+        help=f"Half-L1 model-vs-market disagreement scale for full buy guard. Default: {MarketBuyGuardConfig.disagreement_scale}.",
+    )
+
     # Other
     parser.add_argument(
         "-v", "--verbose",
@@ -951,6 +1056,27 @@ async def main() -> None:
         edge_buffer=edge_buffer_config,
         market_impact=market_impact_config,
         collateral=collateral_config,
+        market_aware=MarketAwareConfig(
+            enabled=args.market_aware,
+            max_blend=args.market_aware_max_blend,
+            min_coverage_ratio=args.market_aware_min_coverage,
+            max_avg_spread=args.market_aware_max_avg_spread,
+            disagreement_scale=args.market_aware_disagreement_scale,
+        ),
+        robust_kelly=RobustKellyConfig(
+            enabled=args.robust_kelly,
+            min_fraction_multiplier=args.robust_kelly_min_fraction_multiplier,
+            min_coverage_ratio=args.robust_kelly_min_coverage,
+            max_avg_spread=args.robust_kelly_max_avg_spread,
+            disagreement_scale=args.robust_kelly_disagreement_scale,
+        ),
+        market_buy_guard=MarketBuyGuardConfig(
+            enabled=args.market_buy_guard,
+            max_threshold_widening=args.market_buy_guard_max_widening,
+            min_coverage_ratio=args.market_buy_guard_min_coverage,
+            max_avg_spread=args.market_buy_guard_max_avg_spread,
+            disagreement_scale=args.market_buy_guard_disagreement_scale,
+        ),
     )
 
     # Kelly collateral cap is the source of truth for both Kelly sizing and
@@ -977,6 +1103,30 @@ async def main() -> None:
             args.bootstrap_start_hours,
             args.bootstrap_full_hours,
             args.bootstrap_max_blend,
+        )
+    if args.market_aware:
+        logger.info(
+            "Market-aware robust Kelly: enabled (max_blend=%.2f, min_coverage=%.2f, max_avg_spread=%.3f, disagreement_scale=%.2f)",
+            args.market_aware_max_blend,
+            args.market_aware_min_coverage,
+            args.market_aware_max_avg_spread,
+            args.market_aware_disagreement_scale,
+        )
+    if args.robust_kelly:
+        logger.info(
+            "Robust Kelly haircut: enabled (min_fraction_mult=%.2f, min_coverage=%.2f, max_avg_spread=%.3f, disagreement_scale=%.2f)",
+            args.robust_kelly_min_fraction_multiplier,
+            args.robust_kelly_min_coverage,
+            args.robust_kelly_max_avg_spread,
+            args.robust_kelly_disagreement_scale,
+        )
+    if args.market_buy_guard:
+        logger.info(
+            "Market buy guard: enabled (max_widening=%.3f, min_coverage=%.2f, max_avg_spread=%.3f, disagreement_scale=%.2f)",
+            args.market_buy_guard_max_widening,
+            args.market_buy_guard_min_coverage,
+            args.market_buy_guard_max_avg_spread,
+            args.market_buy_guard_disagreement_scale,
         )
 
     # Load event trading rules

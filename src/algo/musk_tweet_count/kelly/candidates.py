@@ -14,6 +14,7 @@ import logging
 import math
 
 from .config import KellyConfig, EdgeBufferConfig
+from .market_aware import compute_market_buy_guard
 from .orderbook import (
     UnifiedOrderbook,
     compute_vwap_buy_yes,
@@ -336,6 +337,20 @@ def generate_candidates(
 
     # Get current reservation prices (multi-bin Kelly)
     yes_prices, no_prices = portfolio.get_reservation_prices(config.w_floor, config.kelly_fraction)
+    buy_guard = compute_market_buy_guard(
+        probabilities=portfolio.probabilities,
+        dead_bins=portfolio.dead_bins,
+        orderbooks=orderbooks,
+        guard_config=config.market_buy_guard,
+    )
+    if buy_guard is not None:
+        logger.debug(
+            "Market buy guard active: widen=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
+            buy_guard["threshold_widening"],
+            buy_guard["coverage_ratio"],
+            buy_guard["avg_spread"],
+            buy_guard["disagreement"],
+        )
 
     # Log portfolio state and top reservation prices for debugging
     if verbose:
@@ -413,6 +428,7 @@ def generate_candidates(
                     reservation_price=reservation_yes,
                     config=config,
                     hours_to_settlement=hours_to_settlement,
+                    buy_guard=buy_guard,
                     verbose=verbose,
                     rejection_reasons=rejection_reasons,
                 )
@@ -465,6 +481,7 @@ def generate_candidates(
                     reservation_price=reservation_no,
                     config=config,
                     hours_to_settlement=hours_to_settlement,
+                    buy_guard=buy_guard,
                     verbose=verbose,
                     rejection_reasons=rejection_reasons,
                 )
@@ -546,6 +563,7 @@ def _generate_buy_yes_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    buy_guard: Optional[dict] = None,
     verbose: bool = False,
     rejection_reasons: dict = None,
 ) -> Optional[TradeCandidate]:
@@ -616,9 +634,15 @@ def _generate_buy_yes_candidate(
     trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_YES, config.edge_buffer
     )
+    threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
+    if buy_guard is not None:
+        threshold = max(0.0, threshold - buy_guard["threshold_widening"])
+        trade_ok = vwap <= threshold and threshold > 0
     if not trade_ok:
-        threshold = compute_buy_threshold(reservation_price, config.edge_buffer)
-        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
+        reason = f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})"
+        if buy_guard is not None:
+            reason += f", guard={buy_guard['threshold_widening']:.1%}"
+        reject(reason)
         return None
 
     # Simulate trade and compute utility gain (screening only — require positive)
@@ -787,6 +811,7 @@ def _generate_buy_no_candidate(
     reservation_price: float,
     config: KellyConfig,
     hours_to_settlement: float,
+    buy_guard: Optional[dict] = None,
     verbose: bool = False,
     rejection_reasons: dict = None,
 ) -> Optional[TradeCandidate]:
@@ -857,9 +882,20 @@ def _generate_buy_no_candidate(
     trade_ok, actual_edge = should_trade(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
+    yes_fair_value = 1.0 - reservation_price
+    yes_threshold = compute_buy_no_threshold(yes_fair_value, config.edge_buffer)
+    yes_market_price = 1.0 - vwap
+    if buy_guard is not None:
+        yes_threshold = min(1.0, yes_threshold + buy_guard["threshold_widening"])
+        trade_ok = yes_market_price >= yes_threshold and yes_threshold < 1.0
     if not trade_ok:
-        threshold = 1.0 - compute_buy_no_threshold(1.0 - reservation_price, config.edge_buffer)
-        reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
+        reason = (
+            f"edge failed (yes_mkt={yes_market_price:.1%} < yes_thresh={yes_threshold:.1%}, "
+            f"no_fair={reservation_price:.1%})"
+        )
+        if buy_guard is not None:
+            reason += f", guard={buy_guard['threshold_widening']:.1%}"
+        reject(reason)
         return None
 
     # Simulate trade and compute utility gain (screening only — require positive)
