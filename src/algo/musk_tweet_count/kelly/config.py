@@ -287,6 +287,7 @@ class EventTradingRulesConfig:
     # Default rules if no category matches (weekly-style defaults)
     default_require_counting_started: bool = False
     default_max_hours_before_counting: Optional[float] = 96.0
+    default_max_days_before_settlement: Optional[float] = None
     default_min_hours_before_settlement: float = 1.0
 
     def get_rules_for_event(self, event_duration_days: int) -> EventCategoryRules:
@@ -310,6 +311,7 @@ class EventTradingRulesConfig:
             duration_max_days=9999,
             require_counting_started=self.default_require_counting_started,
             max_hours_before_counting=self.default_max_hours_before_counting,
+            max_days_before_settlement=self.default_max_days_before_settlement,
             min_hours_before_settlement=self.default_min_hours_before_settlement,
         )
 
@@ -328,6 +330,12 @@ class EventTradingRulesConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "EventTradingRulesConfig":
         """Create config from dictionary."""
+        default_rules = data.get("default_rules", {})
+        default_require_counting_started = default_rules.get("require_counting_started", False)
+        default_max_hours_before_counting = default_rules.get("max_hours_before_counting", 96.0)
+        default_max_days_before_settlement = default_rules.get("max_days_before_settlement")
+        default_min_hours_before_settlement = default_rules.get("min_hours_before_settlement", 1.0)
+
         categories = []
 
         for cat_data in data.get("event_categories", []):
@@ -338,20 +346,31 @@ class EventTradingRulesConfig:
                 name=cat_data.get("name", "unnamed"),
                 duration_min_days=duration_range[0],
                 duration_max_days=duration_range[1],
-                require_counting_started=rules_data.get("require_counting_started", True),
-                max_hours_before_counting=rules_data.get("max_hours_before_counting"),
-                max_days_before_settlement=rules_data.get("max_days_before_settlement"),
-                min_hours_before_settlement=rules_data.get("min_hours_before_settlement", 3.0),
+                require_counting_started=rules_data.get(
+                    "require_counting_started",
+                    default_require_counting_started,
+                ),
+                max_hours_before_counting=rules_data.get(
+                    "max_hours_before_counting",
+                    default_max_hours_before_counting,
+                ),
+                max_days_before_settlement=rules_data.get(
+                    "max_days_before_settlement",
+                    default_max_days_before_settlement,
+                ),
+                min_hours_before_settlement=rules_data.get(
+                    "min_hours_before_settlement",
+                    default_min_hours_before_settlement,
+                ),
             )
             categories.append(category)
 
-        default_rules = data.get("default_rules", {})
-
         return cls(
             categories=categories,
-            default_require_counting_started=default_rules.get("require_counting_started", False),
-            default_max_hours_before_counting=default_rules.get("max_hours_before_counting", 96.0),
-            default_min_hours_before_settlement=default_rules.get("min_hours_before_settlement", 1.0),
+            default_require_counting_started=default_require_counting_started,
+            default_max_hours_before_counting=default_max_hours_before_counting,
+            default_max_days_before_settlement=default_max_days_before_settlement,
+            default_min_hours_before_settlement=default_min_hours_before_settlement,
         )
 
     @classmethod
