@@ -1007,9 +1007,6 @@ class GASKellyTradingBot:
         """Idle loop for sync-driven mode — trading is triggered externally."""
         logger.info("Bot started in sync-driven mode (idle until manager triggers tick)")
 
-        # Run initial tick to establish baseline
-        await self.run_sync_driven_tick()
-
         while self._running:
             try:
                 hours_elapsed, hours_remaining = self._get_timing()

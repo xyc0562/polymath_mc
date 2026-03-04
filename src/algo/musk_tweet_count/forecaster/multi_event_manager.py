@@ -61,6 +61,10 @@ class ActiveEvent:
     task: asyncio.Task
     started_at: datetime
     allocated_capital: float
+    stabilization_until: float = 0.0
+    stable_sync_count: int = 0
+    last_position_fingerprint: Optional[Tuple[Any, ...]] = None
+    startup_tick_pending: bool = False
 
 
 @dataclass
@@ -139,6 +143,11 @@ class MultiEventConfig:
 
     # How often to re-sync capital pool from on-chain USDC balance (seconds)
     capital_sync_interval: int = 3600  # 1 hour
+
+    # After restart, events restored with existing positions briefly wait for
+    # one additional stable API sync before trading. This is event-local only.
+    restart_stabilization_seconds: float = 45.0
+    restart_required_stable_syncs: int = 2
 
 
 class MultiEventManager:
@@ -313,6 +322,136 @@ class MultiEventManager:
     def num_active_events(self) -> int:
         """Number of events currently trading."""
         return len(self._active_events)
+
+    def _build_position_fingerprint(self, bot: GASKellyTradingBot) -> Optional[Tuple[Any, ...]]:
+        """Build a compact fingerprint of the bot's synced portfolio state."""
+        if not bot.kelly_bot or not bot.kelly_bot.portfolio:
+            return None
+
+        portfolio = bot.kelly_bot.portfolio
+        positions = []
+        for bin_idx, pos in sorted(portfolio.positions.items()):
+            if pos.yes_shares <= 0.01 and pos.no_shares <= 0.01:
+                continue
+            positions.append(
+                (
+                    bin_idx,
+                    round(pos.yes_shares, 2),
+                    round(pos.no_shares, 2),
+                    round(pos.yes_avg_cost, 4),
+                    round(pos.no_avg_cost, 4),
+                )
+            )
+
+        return (
+            round(portfolio.capital, 2),
+            round(portfolio.total_collateral_used, 2),
+            tuple(positions),
+        )
+
+    async def _maybe_wait_for_event_stabilization(self, event_id: str, active: ActiveEvent) -> bool:
+        """
+        Event-local restart stabilization.
+
+        Returns True when the event is ready to trade. While stabilizing, only this
+        event is skipped; all others continue normally.
+        """
+        if active.stabilization_until <= 0.0 or not active.bot.kelly_bot:
+            return True
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        try:
+            await active.bot.kelly_bot.sync_positions_from_api(self.wallet_address)
+        except Exception as e:
+            if now >= active.stabilization_until:
+                logger.warning(
+                    f"[{active.info.short_name}] Startup stabilization timed out after sync error: {e}. "
+                    "Trading will resume."
+                )
+                active.stabilization_until = 0.0
+                return True
+            logger.info(
+                f"[{active.info.short_name}] Startup stabilization: sync failed ({e}), "
+                "skipping this event until next trigger"
+            )
+            return False
+
+        fingerprint = self._build_position_fingerprint(active.bot)
+        if fingerprint == active.last_position_fingerprint:
+            active.stable_sync_count += 1
+        else:
+            active.last_position_fingerprint = fingerprint
+            active.stable_sync_count = 1
+
+        required = max(1, self.config.restart_required_stable_syncs)
+        if active.stable_sync_count >= required:
+            logger.info(
+                f"[{active.info.short_name}] Startup stabilization complete after "
+                f"{active.stable_sync_count} matching position syncs"
+            )
+            active.stabilization_until = 0.0
+            return True
+
+        if now >= active.stabilization_until:
+            logger.warning(
+                f"[{active.info.short_name}] Startup stabilization timed out after "
+                f"{active.stable_sync_count} sync(s). Trading will resume."
+            )
+            active.stabilization_until = 0.0
+            return True
+
+        logger.info(
+            f"[{active.info.short_name}] Startup stabilization: "
+            f"{active.stable_sync_count}/{required} stable syncs, skipping this event"
+        )
+        return False
+
+    async def _trigger_event_startup_tick(self, event_id: str) -> None:
+        """
+        Trigger the first sync-driven tick for a specific event.
+
+        In sync-driven mode, the manager owns startup tick timing so restored
+        events can finish stabilization first.
+        """
+        while True:
+            async with self._events_lock:
+                active = self._active_events.get(event_id)
+                if not active or not active.startup_tick_pending:
+                    return
+                delay = 0.0
+                if active.stabilization_until > 0.0:
+                    delay = max(0.0, active.stabilization_until - asyncio.get_running_loop().time())
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            async with self._events_lock:
+                active = self._active_events.get(event_id)
+                if not active or not active.startup_tick_pending:
+                    return
+
+            if not await self._maybe_wait_for_event_stabilization(event_id, active):
+                await asyncio.sleep(1.0)
+                continue
+
+            async with self._events_lock:
+                active = self._active_events.get(event_id)
+                if not active or not active.startup_tick_pending:
+                    return
+                active.startup_tick_pending = False
+                bot = active.bot
+                bot_name = active.info.short_name
+
+            try:
+                logger.info(f"[{bot_name}] Running startup tick after stabilization")
+                await asyncio.wait_for(bot.run_sync_driven_tick(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{bot_name}] Startup tick timed out (120s hard limit)")
+            except Exception as e:
+                logger.error(f"[{bot_name}] Error in startup tick: {e}", exc_info=True)
+            return
 
     async def _cleanup_old_data(self) -> None:
         """
@@ -541,18 +680,22 @@ class MultiEventManager:
         await self.validate_all_event_counts()
 
         async with self._events_lock:
-            active_bots = [active.bot for active in self._active_events.values()]
+            active_snapshot = list(self._active_events.items())
 
-        async def _run_bot_tick(bot):
+        async def _run_bot_tick(event_id: str, active: ActiveEvent):
+            bot = active.bot
             bot_name = getattr(bot.bot_config, 'event_name', None) or 'unknown'
             try:
+                if not await self._maybe_wait_for_event_stabilization(event_id, active):
+                    return
+                active.startup_tick_pending = False
                 await asyncio.wait_for(bot.run_sync_driven_tick(), timeout=120.0)
             except asyncio.TimeoutError:
                 logger.warning(f"[{bot_name}] Sync-driven tick timed out (120s hard limit)")
             except Exception as e:
                 logger.error(f"[{bot_name}] Error in sync-driven tick: {e}", exc_info=True)
 
-        await asyncio.gather(*[_run_bot_tick(bot) for bot in active_bots])
+        await asyncio.gather(*[_run_bot_tick(event_id, active) for event_id, active in active_snapshot])
 
     def _handle_global_fill(self, fill_event: FillEvent) -> None:
         """
@@ -1242,11 +1385,23 @@ class MultiEventManager:
         # CRITICAL: Sync existing positions from API into the Kelly portfolio
         # This ensures collateral tracking works correctly for restored positions
         # Do this even in dry_run mode - we need accurate collateral tracking
+        stabilization_until = 0.0
+        stable_sync_count = 0
+        last_position_fingerprint: Optional[Tuple[Any, ...]] = None
         if bot.kelly_bot:
             try:
                 await bot.kelly_bot.sync_positions_from_api(self.wallet_address)
                 collateral = bot.kelly_bot.portfolio.total_collateral_used if bot.kelly_bot.portfolio else 0
                 logger.info(f"Synced existing positions into Kelly portfolio: invested=${collateral:.2f}")
+                if collateral > 0.01 and self.config.restart_stabilization_seconds > 0:
+                    loop = asyncio.get_running_loop()
+                    stabilization_until = loop.time() + self.config.restart_stabilization_seconds
+                    stable_sync_count = 1
+                    last_position_fingerprint = self._build_position_fingerprint(bot)
+                    logger.info(
+                        f"[{event_info.short_name}] Startup stabilization enabled for "
+                        f"{self.config.restart_stabilization_seconds:.0f}s after restoring positions"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to sync existing positions: {e}", exc_info=True)
 
@@ -1271,9 +1426,18 @@ class MultiEventManager:
                 task=task,
                 started_at=datetime.utcnow(),
                 allocated_capital=allocated_capital,
+                stabilization_until=stabilization_until,
+                stable_sync_count=stable_sync_count,
+                last_position_fingerprint=last_position_fingerprint,
+                startup_tick_pending=True,
             )
             num_active = len(self._active_events)
             self._total_events_started += 1
+
+        asyncio.create_task(
+            self._trigger_event_startup_tick(event_id),
+            name=f"startup_tick_{event_id}",
+        )
 
         logger.info(
             f"Event {event_id} started. "
