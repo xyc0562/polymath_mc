@@ -717,11 +717,6 @@ class KellyExecutor:
         # Used to avoid spamming failed orders when liquidity dries up
         self._fak_failure_times: Dict[int, float] = {}
 
-        # Sell-side suppression after "not enough balance / allowance".
-        # Keyed by (TradeAction, bin_index) so only the failing sell is cooled down.
-        self._sell_balance_error_times: Dict[tuple[TradeAction, int], float] = {}
-        self._sell_balance_error_sizes: Dict[tuple[TradeAction, int], float] = {}
-
         # Delay after CONFIRMED before proceeding to next iteration,
         # giving the API time to propagate the fill to positions endpoint.
         self._post_confirm_delay: float = 5.0
@@ -783,86 +778,9 @@ class KellyExecutor:
             f"[{self.event_name}] FAK order failed for {bin_info}, cooldown for {cooldown:.0f}s"
         )
 
-    def _sell_suppression_key(self, candidate: TradeCandidate) -> Optional[tuple[TradeAction, int]]:
-        if candidate.action in (TradeAction.SELL_YES, TradeAction.SELL_NO):
-            return (candidate.action, candidate.bin_index)
-        return None
-
-    def _get_position_shares_for_action(self, action: TradeAction, bin_index: int) -> float:
-        pos = self.portfolio.get_position(bin_index)
-        if not pos:
-            return 0.0
-        if action == TradeAction.SELL_YES:
-            return pos.yes_shares
-        if action == TradeAction.SELL_NO:
-            return pos.no_shares
-        return 0.0
-
     def _is_sell_balance_error(self, error_msg: str) -> bool:
         msg = (error_msg or "").lower()
         return "not enough balance" in msg or "allowance" in msg
-
-    def _clear_sell_balance_error_suppressions_on_position_change(self) -> None:
-        """Clear sell suppressions once synced position size changes or cooldown expires."""
-        if not self._sell_balance_error_times:
-            return
-
-        now = time.time()
-        cooldown = self.config.rate_limit.sell_balance_error_cooldown_seconds
-        cleared: list[tuple[TradeAction, int]] = []
-
-        for key, recorded_at in list(self._sell_balance_error_times.items()):
-            action, bin_index = key
-            recorded_shares = self._sell_balance_error_sizes.get(key, 0.0)
-            current_shares = self._get_position_shares_for_action(action, bin_index)
-
-            if abs(current_shares - recorded_shares) > 0.01 or now - recorded_at >= cooldown:
-                cleared.append(key)
-
-        for action, bin_index in cleared:
-            key = (action, bin_index)
-            self._sell_balance_error_times.pop(key, None)
-            self._sell_balance_error_sizes.pop(key, None)
-            br = self._bin_range(bin_index)
-            bin_info = f"bin={bin_index} ({br})" if br else f"bin={bin_index}"
-            logger.info(
-                f"[{self.event_name}] Cleared sell suppression for {action.value} {bin_info}"
-            )
-
-    def _is_sell_in_balance_error_cooldown(self, candidate: TradeCandidate) -> bool:
-        key = self._sell_suppression_key(candidate)
-        if key is None:
-            return False
-
-        recorded_at = self._sell_balance_error_times.get(key)
-        if recorded_at is None:
-            return False
-
-        cooldown = self.config.rate_limit.sell_balance_error_cooldown_seconds
-        elapsed = time.time() - recorded_at
-        if elapsed >= cooldown:
-            self._sell_balance_error_times.pop(key, None)
-            self._sell_balance_error_sizes.pop(key, None)
-            return False
-        return True
-
-    def _record_sell_balance_error(self, candidate: TradeCandidate) -> None:
-        key = self._sell_suppression_key(candidate)
-        if key is None:
-            return
-
-        self._sell_balance_error_times[key] = time.time()
-        self._sell_balance_error_sizes[key] = self._get_position_shares_for_action(
-            candidate.action, candidate.bin_index
-        )
-
-        cooldown = self.config.rate_limit.sell_balance_error_cooldown_seconds
-        br = self._bin_range(candidate.bin_index)
-        bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
-        logger.warning(
-            f"[{self.event_name}] Sell rejected for {candidate.action.value} {bin_info}; "
-            f"suppressing retries for {cooldown:.0f}s until position sync changes"
-        )
 
     async def run_tick(
         self,
@@ -931,7 +849,6 @@ class KellyExecutor:
             if self.sync_portfolio:
                 try:
                     await self.sync_portfolio()
-                    self._clear_sell_balance_error_suppressions_on_position_change()
                     logger.info(
                         f"[{self.event_name}][KELLY] iter={iteration} Synced from API: "
                         f"capital=${self.portfolio.capital:.2f}, "
@@ -1082,7 +999,6 @@ class KellyExecutor:
                             TradeAction.SELL_YES,
                             TradeAction.SELL_NO,
                         ):
-                            self._record_sell_balance_error(trade)
                             self.order_executor.log_sell_balance_diagnostics(
                                 token_id=token_id,
                                 requested_size=trade.size,
@@ -1138,7 +1054,6 @@ class KellyExecutor:
                 if saw_sell_balance_error and self.sync_portfolio:
                     try:
                         await self.sync_portfolio()
-                        self._clear_sell_balance_error_suppressions_on_position_change()
                         logger.info(
                             f"[{self.event_name}] Re-synced portfolio after sell balance/allowance rejection"
                         )
@@ -1685,11 +1600,6 @@ class KellyExecutor:
                 hours_to_settlement=hours_to_settlement,
                 verbose=(verbose and sim_iter == 0),
             )
-
-            candidates = [
-                c for c in candidates
-                if not self._is_sell_in_balance_error_cooldown(c)
-            ]
 
             if not candidates:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")

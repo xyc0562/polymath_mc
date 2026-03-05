@@ -110,10 +110,6 @@ class RateLimitConfig:
     # This prevents spamming failed orders when liquidity dries up
     fak_failure_cooldown_seconds: float = 60.0
 
-    # Cooldown after a sell fails with "not enough balance / allowance" (seconds).
-    # Applied only to the specific sell side/bin that failed, and cleared early
-    # if API position sync shows the position changed.
-    sell_balance_error_cooldown_seconds: float = 900.0
 
 
 @dataclass
