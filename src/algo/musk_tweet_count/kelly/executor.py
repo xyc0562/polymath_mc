@@ -782,6 +782,20 @@ class KellyExecutor:
         msg = (error_msg or "").lower()
         return "not enough balance" in msg or "allowance" in msg
 
+    def _warm_balance_cache(self, token_id: str) -> None:
+        """Proactively refresh CLOB balance cache for a token after a BUY fill."""
+        if not self.order_executor or not token_id:
+            return
+        try:
+            self.order_executor._fetch_conditional_balance_allowance(
+                token_id=token_id, refresh=True,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[{self.event_name}] Balance cache warm failed for "
+                f"token {token_id[:16]}...: {e}"
+            )
+
     async def run_tick(
         self,
         hours_to_settlement: float,
@@ -1875,6 +1889,14 @@ class KellyExecutor:
             if order_id in self._pending_orders:
                 del self._pending_orders[order_id]
             logger.debug(f"Order {order_id[:16]}... confirmed, signaling and removing from pending")
+
+            # After a BUY fill is confirmed, proactively refresh the CLOB's
+            # cached balance for this token.  BUY orders mint new conditional
+            # tokens on-chain and the CLOB's balance indexer can lag behind,
+            # causing later SELL orders to fail with "not enough balance /
+            # allowance".  Warming the cache here gives it a head start.
+            if candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+                self._warm_balance_cache(token_id)
 
     async def handle_stale_order(self, pending: "PendingOrder") -> None:
         """
