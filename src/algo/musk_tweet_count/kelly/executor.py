@@ -174,6 +174,82 @@ class OrderExecutor:
         # Bin ranges for logging (set by KellyExecutor before each tick)
         self.bin_ranges: Dict[int, str] = {}
 
+    @staticmethod
+    def _parse_conditional_balance_shares(balance_info: dict) -> Optional[float]:
+        """Parse conditional token balance from get_balance_allowance response."""
+        if not isinstance(balance_info, dict):
+            return None
+        raw_balance = balance_info.get("balance")
+        try:
+            # CLOB returns 6-decimal scaled quantity for conditional balances.
+            return float(raw_balance) / 1e6
+        except (TypeError, ValueError):
+            return None
+
+    def _fetch_conditional_balance_allowance(
+        self,
+        token_id: str,
+        refresh: bool = True,
+    ) -> Optional[dict]:
+        """Fetch conditional token balance/allowance for a specific token_id."""
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            )
+            if refresh:
+                try:
+                    # Refresh exchange-side view first to reduce stale balance errors.
+                    self.client.update_balance_allowance(params)
+                except Exception as e:
+                    logger.debug(
+                        f"[{self.event_name}] Conditional allowance refresh failed "
+                        f"for token {token_id[:16]}...: {e}"
+                    )
+            return self.client.get_balance_allowance(params)
+        except Exception as e:
+            logger.warning(
+                f"[{self.event_name}] Failed to fetch conditional balance/allowance "
+                f"for token {token_id[:16]}...: {e}"
+            )
+            return None
+
+    def log_sell_balance_diagnostics(self, token_id: str, requested_size: float) -> None:
+        """
+        Log CLOB conditional balance/allowance snapshot after sell rejection.
+
+        This helps distinguish local-position mismatch from exchange available-balance issues.
+        """
+        balance_info = self._fetch_conditional_balance_allowance(token_id=token_id, refresh=True)
+        if not balance_info:
+            return
+
+        available_shares = self._parse_conditional_balance_shares(balance_info)
+        allowances = balance_info.get("allowances", {}) if isinstance(balance_info, dict) else {}
+        nonzero_spenders = 0
+        if isinstance(allowances, dict):
+            for value in allowances.values():
+                try:
+                    if int(value) > 0:
+                        nonzero_spenders += 1
+                except Exception:
+                    continue
+
+        if available_shares is None:
+            logger.warning(
+                f"[{self.event_name}] Sell rejection diagnostics: token={token_id[:16]}..., "
+                f"requested={requested_size:.2f}, clob_balance=<unknown>, "
+                f"nonzero_allowances={nonzero_spenders}"
+            )
+        else:
+            logger.warning(
+                f"[{self.event_name}] Sell rejection diagnostics: token={token_id[:16]}..., "
+                f"requested={requested_size:.2f}, clob_balance={available_shares:.2f}, "
+                f"nonzero_allowances={nonzero_spenders}"
+            )
+
     def place_limit_order(
         self,
         token_id: str,
@@ -330,6 +406,9 @@ class OrderExecutor:
         results = [dict(SKIP_RESULT) for _ in orders]  # Default: all skipped
         signed_args = []
         signed_indices = []  # Which input indices have signed orders
+        # Track remaining exchange-visible sellable balance per token within this batch.
+        # Prevents submitting multiple SELLs that collectively exceed CLOB available balance.
+        sell_available_cache: Dict[str, Optional[float]] = {}
 
         # Resolve tick_size per token (cached after first call)
         tick_sizes: Dict[str, str] = {}
@@ -354,6 +433,33 @@ class OrderExecutor:
                 if rounded_size < 1:
                     logger.warning(f"[{self.event_name}][BATCH] Sell size {rounded_size} below 1 share, skipping order {i}")
                     continue
+
+                token_id = order["token_id"]
+                if token_id not in sell_available_cache:
+                    balance_info = self._fetch_conditional_balance_allowance(
+                        token_id=token_id,
+                        refresh=True,
+                    )
+                    available_shares = self._parse_conditional_balance_shares(balance_info or {})
+                    sell_available_cache[token_id] = available_shares
+
+                available_shares = sell_available_cache.get(token_id)
+                if available_shares is not None:
+                    max_sellable = math.floor(max(0.0, available_shares))
+                    if max_sellable < 1:
+                        logger.warning(
+                            f"[{self.event_name}][BATCH] SELL token={token_id[:16]}... skipped: "
+                            f"CLOB available balance is {available_shares:.2f} shares"
+                        )
+                        continue
+                    if rounded_size > max_sellable:
+                        logger.warning(
+                            f"[{self.event_name}][BATCH] SELL token={token_id[:16]}... "
+                            f"size capped {rounded_size} -> {max_sellable} "
+                            f"(CLOB available={available_shares:.2f})"
+                        )
+                        rounded_size = max_sellable
+                    sell_available_cache[token_id] = max(0.0, available_shares - rounded_size)
             else:
                 # FAK orders require maker_amount >= $1.00
                 maker_amount = rounded_size * price
@@ -977,6 +1083,10 @@ class KellyExecutor:
                             TradeAction.SELL_NO,
                         ):
                             self._record_sell_balance_error(trade)
+                            self.order_executor.log_sell_balance_diagnostics(
+                                token_id=token_id,
+                                requested_size=trade.size,
+                            )
                             saw_sell_balance_error = True
 
                     if order_id:
