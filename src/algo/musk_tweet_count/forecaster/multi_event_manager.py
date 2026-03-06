@@ -1803,19 +1803,26 @@ class MultiEventManager:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current status for monitoring."""
+        active_events = {}
+        for event_id, active in self._active_events.items():
+            integrity = {}
+            try:
+                integrity = active.bot.get_state_summary().get("integrity", {})
+            except Exception:
+                integrity = {}
+            active_events[event_id] = {
+                "short_name": active.info.short_name,
+                "settlement_date": active.info.settlement_date.isoformat(),
+                "allocated_capital": active.allocated_capital,
+                "started_at": active.started_at.isoformat(),
+                "integrity": integrity,
+            }
+
         return {
             "running": self._running,
             "capital_pool": self.capital_pool.get_summary(),
             "performance": self.capital_pool.get_performance_summary(),
-            "active_events": {
-                event_id: {
-                    "short_name": active.info.short_name,
-                    "settlement_date": active.info.settlement_date.isoformat(),
-                    "allocated_capital": active.allocated_capital,
-                    "started_at": active.started_at.isoformat(),
-                }
-                for event_id, active in self._active_events.items()
-            },
+            "active_events": active_events,
             "pending_events": list(self._pending_events.keys()),
             "completed_events": self._completed_events,
         }
@@ -1869,6 +1876,17 @@ class MultiEventManager:
         if self._last_cleanup_time:
             time_since_cleanup = (now - self._last_cleanup_time).total_seconds() / 3600
 
+        frozen_event_names = []
+        frozen_events = 0
+        for active in self._active_events.values():
+            try:
+                integrity = active.bot.get_state_summary().get("integrity", {})
+            except Exception:
+                integrity = {}
+            if integrity.get("frozen"):
+                frozen_events += 1
+                frozen_event_names.append(active.info.short_name)
+
         return {
             # Overall health
             "status": "healthy" if self._running else "stopped",
@@ -1906,6 +1924,8 @@ class MultiEventManager:
             "active_event_names": [
                 active.info.short_name for active in self._active_events.values()
             ],
+            "frozen_events": frozen_events,
+            "frozen_event_names": frozen_event_names,
 
             # User stream status - get detailed status if available
             "user_stream": self._get_user_stream_status(),

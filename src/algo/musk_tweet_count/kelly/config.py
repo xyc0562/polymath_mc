@@ -79,9 +79,10 @@ class RateLimitConfig:
     Prevents runaway execution and respects API rate limits.
 
     Flow per tick:
-    1. Sync portfolio from API (get true state)
-    2. Loop: generate candidates → execute → optimistic update → repeat
-    3. Stop when capital exhausted or no more utility gains
+    1. Sync portfolio from API (authoritative base state)
+    2. Reconcile confirmed-fill overlay against API deltas
+    3. Loop: generate candidates on effective state → execute → wait → repeat
+    4. Stop when capital exhausted or no more utility gains
     """
 
     # Maximum orders per optimization tick
@@ -109,6 +110,16 @@ class RateLimitConfig:
     # When a FAK order fails due to no liquidity, don't retry that bin for this duration
     # This prevents spamming failed orders when liquidity dries up
     fak_failure_cooldown_seconds: float = 60.0
+
+    # Freeze if confirmed fills remain unreconciled for longer than this.
+    # This catches stale or contradictory local overlay state while allowing
+    # ordinary API propagation lag to resolve naturally.
+    overlay_reconciliation_grace_seconds: float = 90.0
+
+    # Hard deadline for an event integrity freeze. Once exceeded, the executor
+    # drops any residual overlay, trusts the latest API snapshot, logs a
+    # critical recovery event, and resumes trading from API state.
+    integrity_freeze_max_seconds: float = 300.0
 
 
 

@@ -6,12 +6,13 @@ Implements the greedy execution loop:
 2. Pick best candidate by utility gain
 3. Execute trade (place order)
 4. Wait for fill confirmation via WebSocket
-5. Update portfolio on confirmed fill
+5. Reconcile confirmed fills against the positions API
 6. Repeat until no profitable trades or max iterations
 
 Order execution via py_clob_client.
-Portfolio updates happen ONLY on WebSocket fill confirmation, NOT on order placement.
-This ensures portfolio state matches actual on-chain positions.
+The positions API remains the only authoritative portfolio state. Confirmed
+WebSocket fills are stored in a temporary overlay for planning until the API
+catches up, which prevents duplicate rebuys when API propagation lags.
 """
 
 import asyncio
@@ -19,6 +20,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client.client import ClobClient
@@ -144,6 +146,64 @@ class TickResult:
     total_utility_gain: float
     executions: List[ExecutionResult] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+
+
+@dataclass
+class OverlayFillFragment:
+    """Confirmed fill awaiting reconciliation with the positions API."""
+
+    fill_key: str
+    order_id: str
+    token_id: str
+    action: TradeAction
+    bin_index: int
+    price: float
+    original_size: float
+    remaining_size: float
+    confirmed_at: float
+
+    @property
+    def is_buy(self) -> bool:
+        return self.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+
+    @property
+    def position_kind(self) -> str:
+        return "YES" if self.action in (TradeAction.BUY_YES, TradeAction.SELL_YES) else "NO"
+
+
+@dataclass
+class RecentConfirmedFillRecord:
+    """Recent confirmed fill used for duplicate detection."""
+
+    fill_key: str
+    order_id: str
+    token_id: str
+    action: TradeAction
+    price: float
+    size: float
+    recorded_at: float
+
+
+@dataclass
+class RecentOrderContext:
+    """Cached order context so late duplicate CONFIRMED fills stay attributable."""
+
+    order_id: str
+    candidate: TradeCandidate
+    token_id: str
+    created_at: float
+
+
+@dataclass
+class IntegrityState:
+    """Per-event integrity state for overlay reconciliation."""
+
+    frozen: bool = False
+    reason: Optional[str] = None
+    frozen_at: Optional[float] = None
+    deadline_at: Optional[float] = None
+    last_forced_api_recovery_at: Optional[float] = None
+    unmatched_api_delta_count: int = 0
 
 
 class OrderExecutor:
@@ -626,12 +686,15 @@ class KellyExecutor:
     Runs the greedy optimization loop:
     1. Generate candidates
     2. Execute best candidate (place order)
-    3. Track as pending order (DO NOT update portfolio yet)
-    4. Portfolio updates happen via fill callback when WebSocket confirms fill
-    5. Repeat
+    3. Track as pending order
+    4. Record confirmed fills in an overlay ledger
+    5. Reconcile the overlay against API position deltas
+    6. Repeat
 
-    IMPORTANT: Portfolio is NOT updated on order placement. Updates happen only
-    when fills are confirmed via the UserStreamClient WebSocket connection.
+    IMPORTANT:
+    - `self.portfolio` is the authoritative API-synced base portfolio.
+    - Confirmed WebSocket fills never mutate the base portfolio directly.
+    - Planning uses an effective portfolio derived from `API base + overlay`.
 
     Includes rate limiting to prevent runaway execution and respect API limits.
     """
@@ -674,6 +737,7 @@ class KellyExecutor:
         """
         self.config = config
         self.portfolio = portfolio
+        self.api_base_portfolio = portfolio
         self.orderbook_manager = orderbook_manager
         self.order_executor = order_executor
         self.token_ids = token_ids or {}
@@ -720,6 +784,29 @@ class KellyExecutor:
         # Delay after CONFIRMED before proceeding to next iteration,
         # giving the API time to propagate the fill to positions endpoint.
         self._post_confirm_delay: float = 5.0
+
+        # Authoritative API snapshot from the previous sync. Used to compute
+        # observed API deltas and reconcile confirmed local fills.
+        self._last_api_snapshot: Optional[Portfolio] = None
+
+        # Confirmed-but-unreconciled fills. These are replayed on top of the
+        # API base portfolio when sizing the next iteration.
+        self._overlay_ledger: List[OverlayFillFragment] = []
+
+        # Duplicate confirmed fill protection survives beyond pending-order
+        # lifetime because the user stream can resend late CONFIRMED messages.
+        self._recent_confirmed_fill_keys: Dict[str, RecentConfirmedFillRecord] = {}
+
+        # Order context also outlives pending-order lifetime so late duplicate
+        # CONFIRMED fills can be attributed and deduped instead of being noisy.
+        self._recent_order_context: Dict[str, RecentOrderContext] = {}
+
+        # Integrity state is event-local and runtime-only.
+        self._integrity_state = IntegrityState()
+
+        self._recent_tracking_ttl_seconds = 30.0 * 60.0
+        self._recent_tracking_cap = 10_000
+        self._overlay_size_epsilon = 1e-6
 
     def _check_rate_limit(self) -> bool:
         """
@@ -796,6 +883,450 @@ class KellyExecutor:
                 f"token {token_id[:16]}...: {e}"
             )
 
+    @staticmethod
+    def _clone_candidate(candidate: TradeCandidate) -> TradeCandidate:
+        """Clone a trade candidate for durable order/fill bookkeeping."""
+        return TradeCandidate(
+            bin_index=candidate.bin_index,
+            action=candidate.action,
+            size=candidate.size,
+            price=candidate.price,
+            utility_gain=candidate.utility_gain,
+            reservation_price=candidate.reservation_price,
+            edge=candidate.edge,
+            limit_price=candidate.limit_price,
+        )
+
+    @staticmethod
+    def _format_timestamp(ts: Optional[float]) -> Optional[str]:
+        """Render a UNIX timestamp as an ISO-8601 UTC string."""
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def _prune_recent_tracking(self, now: Optional[float] = None) -> None:
+        """Drop expired entries from dedup/context caches and trim to size cap."""
+        now = now or time.time()
+        cutoff = now - self._recent_tracking_ttl_seconds
+
+        self._recent_confirmed_fill_keys = {
+            key: record
+            for key, record in self._recent_confirmed_fill_keys.items()
+            if record.recorded_at >= cutoff
+        }
+        self._recent_order_context = {
+            order_id: ctx
+            for order_id, ctx in self._recent_order_context.items()
+            if ctx.created_at >= cutoff
+        }
+
+        if len(self._recent_confirmed_fill_keys) > self._recent_tracking_cap:
+            trimmed = sorted(
+                self._recent_confirmed_fill_keys.items(),
+                key=lambda item: item[1].recorded_at,
+            )[-self._recent_tracking_cap:]
+            self._recent_confirmed_fill_keys = dict(trimmed)
+
+        if len(self._recent_order_context) > self._recent_tracking_cap:
+            trimmed = sorted(
+                self._recent_order_context.items(),
+                key=lambda item: item[1].created_at,
+            )[-self._recent_tracking_cap:]
+            self._recent_order_context = dict(trimmed)
+
+    def _remember_order_context(
+        self,
+        order_id: str,
+        candidate: TradeCandidate,
+        token_id: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Cache order context past pending-order lifetime for late duplicate fills."""
+        now = now or time.time()
+        self._recent_order_context[order_id] = RecentOrderContext(
+            order_id=order_id,
+            candidate=self._clone_candidate(candidate),
+            token_id=token_id,
+            created_at=now,
+        )
+        self._prune_recent_tracking(now)
+
+    def _confirmed_fill_key(
+        self,
+        fill_event: "FillEvent",
+        token_id: str,
+    ) -> str:
+        """Build a stable idempotency key for confirmed fills."""
+        if fill_event.match_id:
+            return fill_event.match_id
+        token = fill_event.token_id or token_id
+        return (
+            f"{fill_event.order_id}|{token}|{fill_event.size:.8f}|{fill_event.price:.8f}"
+        )
+
+    @staticmethod
+    def _float_close(left: float, right: float, tol: float = 1e-6) -> bool:
+        """Floating-point comparison helper."""
+        return abs(left - right) <= tol
+
+    def _freeze_integrity(self, reason: str, now: Optional[float] = None) -> None:
+        """Freeze trading for this event until overlay reconciles or deadline hits."""
+        now = now or time.time()
+        was_frozen = self._integrity_state.frozen
+        self._integrity_state.frozen = True
+        self._integrity_state.reason = reason
+        if self._integrity_state.frozen_at is None:
+            self._integrity_state.frozen_at = now
+        if self._integrity_state.deadline_at is None:
+            self._integrity_state.deadline_at = (
+                self._integrity_state.frozen_at
+                + self.config.rate_limit.integrity_freeze_max_seconds
+            )
+        if was_frozen:
+            logger.error(f"[{self.event_name}][INTEGRITY] Still frozen: {reason}")
+        else:
+            logger.error(
+                f"[{self.event_name}][INTEGRITY] Event frozen: {reason} | "
+                f"deadline={self._format_timestamp(self._integrity_state.deadline_at)}"
+            )
+
+    def _clear_integrity_freeze(self, reason: str, now: Optional[float] = None) -> None:
+        """Clear an event-local freeze after reconciliation or forced recovery."""
+        now = now or time.time()
+        if self._integrity_state.frozen:
+            logger.warning(f"[{self.event_name}][INTEGRITY] Event unfrozen: {reason}")
+        self._integrity_state.frozen = False
+        self._integrity_state.reason = None
+        self._integrity_state.frozen_at = None
+        self._integrity_state.deadline_at = None
+        self._prune_recent_tracking(now)
+
+    def _force_api_recovery(self, now: Optional[float] = None) -> None:
+        """Drop residual overlay after the hard deadline and trust the API base."""
+        now = now or time.time()
+        if not self._integrity_state.frozen:
+            return
+        dropped_entries = len(self._overlay_ledger)
+        dropped_size = sum(fragment.remaining_size for fragment in self._overlay_ledger)
+        self._overlay_ledger.clear()
+        self._integrity_state.last_forced_api_recovery_at = now
+        logger.critical(
+            f"[{self.event_name}][INTEGRITY] Forced API recovery after "
+            f"{self.config.rate_limit.integrity_freeze_max_seconds:.0f}s: "
+            f"dropped {dropped_entries} overlay fragment(s), {dropped_size:.2f} residual shares"
+        )
+        self._clear_integrity_freeze("forced_api_recovery", now=now)
+
+    def _maybe_force_api_recovery(self, now: Optional[float] = None) -> None:
+        """Trigger hard recovery once the freeze deadline has elapsed."""
+        now = now or time.time()
+        deadline = self._integrity_state.deadline_at
+        if self._integrity_state.frozen and deadline is not None and now >= deadline:
+            self._force_api_recovery(now)
+
+    def _oldest_overlay_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
+        """Get age in seconds of the oldest residual overlay fragment."""
+        if not self._overlay_ledger:
+            return None
+        now = now or time.time()
+        oldest = min(fragment.confirmed_at for fragment in self._overlay_ledger)
+        return max(0.0, now - oldest)
+
+    def _prune_overlay_ledger(self) -> None:
+        """Remove fully reconciled overlay fragments."""
+        self._overlay_ledger = [
+            fragment
+            for fragment in self._overlay_ledger
+            if fragment.remaining_size > self._overlay_size_epsilon
+        ]
+
+    def _maybe_freeze_for_stale_overlay(self, now: Optional[float] = None) -> None:
+        """Freeze the event if residual overlay has gone stale."""
+        if not self._overlay_ledger:
+            if self._integrity_state.frozen:
+                self._clear_integrity_freeze("overlay_reconciled", now=now)
+            return
+
+        now = now or time.time()
+        oldest_age = self._oldest_overlay_age_seconds(now)
+        grace = self.config.rate_limit.overlay_reconciliation_grace_seconds
+        if oldest_age is not None and oldest_age >= grace:
+            self._freeze_integrity(
+                f"overlay unreconciled for {oldest_age:.1f}s (grace {grace:.0f}s)",
+                now=now,
+            )
+
+    def _compute_api_deltas(
+        self,
+        previous_snapshot: Optional[Portfolio],
+        current_snapshot: Portfolio,
+    ) -> List[tuple[int, str, float]]:
+        """Compute per-bin YES/NO share deltas between API snapshots."""
+        if previous_snapshot is None:
+            return []
+
+        deltas: List[tuple[int, str, float]] = []
+        tracked_bins = set(previous_snapshot.positions) | set(current_snapshot.positions)
+        for bin_index in tracked_bins:
+            prev_pos = previous_snapshot.get_position(bin_index)
+            curr_pos = current_snapshot.get_position(bin_index)
+
+            prev_yes = prev_pos.yes_shares if prev_pos else 0.0
+            curr_yes = curr_pos.yes_shares if curr_pos else 0.0
+            if not self._float_close(prev_yes, curr_yes, tol=0.01):
+                deltas.append((bin_index, "YES", curr_yes - prev_yes))
+
+            prev_no = prev_pos.no_shares if prev_pos else 0.0
+            curr_no = curr_pos.no_shares if curr_pos else 0.0
+            if not self._float_close(prev_no, curr_no, tol=0.01):
+                deltas.append((bin_index, "NO", curr_no - prev_no))
+        return deltas
+
+    def _consume_overlay_delta(
+        self,
+        *,
+        bin_index: int,
+        position_kind: str,
+        is_buy_delta: bool,
+        amount: float,
+    ) -> float:
+        """Consume matching overlay fragments FIFO and return consumed share count."""
+        consumed = 0.0
+        remaining = amount
+        for fragment in self._overlay_ledger:
+            if fragment.remaining_size <= self._overlay_size_epsilon:
+                continue
+            if fragment.bin_index != bin_index:
+                continue
+            if fragment.position_kind != position_kind:
+                continue
+            if fragment.is_buy != is_buy_delta:
+                continue
+
+            take = min(fragment.remaining_size, remaining)
+            if take <= self._overlay_size_epsilon:
+                continue
+            fragment.remaining_size -= take
+            remaining -= take
+            consumed += take
+            if remaining <= self._overlay_size_epsilon:
+                break
+
+        self._prune_overlay_ledger()
+        return consumed
+
+    def _reconcile_overlay_against_api(
+        self,
+        previous_snapshot: Optional[Portfolio],
+        current_snapshot: Portfolio,
+    ) -> None:
+        """Consume overlay entries that the latest API snapshot has absorbed."""
+        deltas = self._compute_api_deltas(previous_snapshot, current_snapshot)
+        for bin_index, position_kind, delta in deltas:
+            if abs(delta) <= self._overlay_size_epsilon:
+                continue
+
+            is_buy_delta = delta > 0
+            magnitude = abs(delta)
+            matching_total = sum(
+                fragment.remaining_size
+                for fragment in self._overlay_ledger
+                if fragment.bin_index == bin_index
+                and fragment.position_kind == position_kind
+                and fragment.is_buy == is_buy_delta
+            )
+            conflicting_total = sum(
+                fragment.remaining_size
+                for fragment in self._overlay_ledger
+                if fragment.bin_index == bin_index
+                and fragment.position_kind == position_kind
+                and fragment.is_buy != is_buy_delta
+            )
+
+            if matching_total <= self._overlay_size_epsilon:
+                if conflicting_total > self._overlay_size_epsilon:
+                    self._freeze_integrity(
+                        f"API delta {delta:+.2f} {position_kind} shares on bin {bin_index} "
+                        f"conflicts with residual overlay",
+                    )
+                    return
+
+                self._integrity_state.unmatched_api_delta_count += 1
+                logger.warning(
+                    f"[{self.event_name}][INTEGRITY] Unmatched API delta accepted: "
+                    f"bin={bin_index} {position_kind} {delta:+.2f} shares "
+                    f"(possible missed WS fill or manual trade)"
+                )
+                continue
+
+            consumed = self._consume_overlay_delta(
+                bin_index=bin_index,
+                position_kind=position_kind,
+                is_buy_delta=is_buy_delta,
+                amount=magnitude,
+            )
+
+            if consumed + self._overlay_size_epsilon < magnitude:
+                unmatched = magnitude - consumed
+                if conflicting_total > self._overlay_size_epsilon:
+                    self._freeze_integrity(
+                        f"API delta {delta:+.2f} {position_kind} shares on bin {bin_index} "
+                        f"exceeded matching overlay while opposite residual overlay exists",
+                    )
+                    return
+
+                self._integrity_state.unmatched_api_delta_count += 1
+                logger.warning(
+                    f"[{self.event_name}][INTEGRITY] API delta exceeded overlay by "
+                    f"{unmatched:.2f} shares on bin={bin_index} {position_kind}; "
+                    f"accepting remainder as authoritative API move"
+                )
+
+        self._prune_overlay_ledger()
+        if not self._overlay_ledger and self._integrity_state.frozen:
+            self._clear_integrity_freeze("overlay_reconciled")
+
+    def _build_effective_portfolio(self) -> Portfolio:
+        """Build the planning portfolio as API base plus residual overlay."""
+        effective = self.api_base_portfolio._copy()
+        effective.external_capital_limit = self.api_base_portfolio.external_capital_limit
+
+        for fragment in self._overlay_ledger:
+            if fragment.remaining_size <= self._overlay_size_epsilon:
+                continue
+
+            size = fragment.remaining_size
+            bin_index = fragment.bin_index
+            price = fragment.price
+            yes_token_id = self.token_ids.get(bin_index, fragment.token_id)
+
+            if fragment.action == TradeAction.BUY_YES:
+                effective.execute_buy_yes(bin_index, size, price, yes_token_id)
+            elif fragment.action == TradeAction.BUY_NO:
+                effective.execute_buy_no(bin_index, size, price, yes_token_id)
+            elif fragment.action == TradeAction.SELL_YES:
+                position = effective.get_position(bin_index)
+                held = position.yes_shares if position else 0.0
+                if held + self._overlay_size_epsilon < size:
+                    self._freeze_integrity(
+                        f"overlay SELL_YES exceeds effective YES shares on bin {bin_index}: "
+                        f"held={held:.2f}, sell={size:.2f}"
+                    )
+                    return self.api_base_portfolio._copy()
+                effective.execute_sell_yes(bin_index, size, price)
+            elif fragment.action == TradeAction.SELL_NO:
+                position = effective.get_position(bin_index)
+                held = position.no_shares if position else 0.0
+                if held + self._overlay_size_epsilon < size:
+                    self._freeze_integrity(
+                        f"overlay SELL_NO exceeds effective NO shares on bin {bin_index}: "
+                        f"held={held:.2f}, sell={size:.2f}"
+                    )
+                    return self.api_base_portfolio._copy()
+                effective.execute_sell_no(bin_index, size, price)
+
+            if effective.capital < -self._overlay_size_epsilon:
+                self._freeze_integrity(
+                    f"overlay replay produced negative capital ${effective.capital:.2f}"
+                )
+                return self.api_base_portfolio._copy()
+
+        return effective
+
+    def _integrate_api_sync(self) -> Portfolio:
+        """Reconcile overlay against the latest API sync and derive planning state."""
+        now = time.time()
+        self._prune_recent_tracking(now)
+        current_snapshot = self.api_base_portfolio._copy()
+        current_snapshot.external_capital_limit = self.api_base_portfolio.external_capital_limit
+
+        self._reconcile_overlay_against_api(self._last_api_snapshot, current_snapshot)
+        self._last_api_snapshot = current_snapshot._copy()
+
+        self._maybe_freeze_for_stale_overlay(now)
+        self._maybe_force_api_recovery(now)
+
+        effective = self._build_effective_portfolio()
+        self._maybe_force_api_recovery(now)
+        if self._integrity_state.frozen:
+            return self.api_base_portfolio._copy()
+        return effective
+
+    def _record_confirmed_fill(
+        self,
+        *,
+        fill_key: str,
+        order_id: str,
+        candidate: TradeCandidate,
+        token_id: str,
+        fill_event: "FillEvent",
+        now: Optional[float] = None,
+    ) -> bool:
+        """Record a confirmed fill into the overlay ledger if it is new."""
+        now = now or time.time()
+        existing = self._recent_confirmed_fill_keys.get(fill_key)
+        if existing:
+            same_fill = (
+                existing.order_id == order_id
+                and existing.token_id == token_id
+                and existing.action == candidate.action
+                and self._float_close(existing.price, fill_event.price)
+                and self._float_close(existing.size, fill_event.size)
+            )
+            if not same_fill:
+                self._freeze_integrity(
+                    f"duplicate confirmed fill key {fill_key} arrived with conflicting economics",
+                    now=now,
+                )
+            else:
+                logger.info(
+                    f"[{self.event_name}][INTEGRITY] Duplicate CONFIRMED fill ignored: "
+                    f"order={order_id[:16]}..., key={fill_key}"
+                )
+            return False
+
+        self._recent_confirmed_fill_keys[fill_key] = RecentConfirmedFillRecord(
+            fill_key=fill_key,
+            order_id=order_id,
+            token_id=token_id,
+            action=candidate.action,
+            price=fill_event.price,
+            size=fill_event.size,
+            recorded_at=now,
+        )
+        self._overlay_ledger.append(
+            OverlayFillFragment(
+                fill_key=fill_key,
+                order_id=order_id,
+                token_id=token_id,
+                action=candidate.action,
+                bin_index=candidate.bin_index,
+                price=fill_event.price,
+                original_size=fill_event.size,
+                remaining_size=fill_event.size,
+                confirmed_at=now,
+            )
+        )
+        self._prune_recent_tracking(now)
+        return True
+
+    def _mark_order_confirmed(
+        self,
+        order_id: str,
+        candidate: TradeCandidate,
+        token_id: str,
+    ) -> None:
+        """Advance local confirmation bookkeeping for a confirmed order."""
+        if order_id in self._confirmation_events:
+            self._confirmation_events[order_id].set()
+            del self._confirmation_events[order_id]
+        if order_id in self._pending_orders:
+            del self._pending_orders[order_id]
+        self._remember_order_context(order_id, candidate, token_id)
+
+        if candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+            self._warm_balance_cache(token_id)
+
     async def run_tick(
         self,
         hours_to_settlement: float,
@@ -841,10 +1372,11 @@ class KellyExecutor:
 
         rate_config = self.config.rate_limit
 
-        # Iterative loop: sync → compute → execute → wait CONFIRMED + delay → repeat
-        # Each iteration syncs portfolio from API for authoritative state,
-        # computes optimal trades, executes a batch, waits for CONFIRMED,
-        # then pauses briefly for API propagation before the next iteration.
+        # Iterative loop: sync API base → reconcile overlay → compute on
+        # effective state → execute → wait CONFIRMED + delay → repeat.
+        # Each iteration starts from authoritative API data, augments it with
+        # any unreconciled confirmed fills, then sizes trades from that
+        # effective portfolio.
         max_orders = rate_config.max_orders_per_tick
         iteration = 0
 
@@ -859,24 +1391,41 @@ class KellyExecutor:
                 logger.info(f"[{self.event_name}] Reached max_orders_per_tick={max_orders}")
                 break
 
-            # Sync portfolio from API for up-to-date state
+            effective_portfolio = self.api_base_portfolio._copy()
+
+            # Sync API base portfolio and derive the effective planning state
             if self.sync_portfolio:
                 try:
                     await self.sync_portfolio()
+                    effective_portfolio = self._integrate_api_sync()
                     logger.info(
                         f"[{self.event_name}][KELLY] iter={iteration} Synced from API: "
-                        f"capital=${self.portfolio.capital:.2f}, "
-                        f"invested=${self.portfolio.total_collateral_used:.2f}"
+                        f"base_capital=${self.api_base_portfolio.capital:.2f}, "
+                        f"base_invested=${self.api_base_portfolio.total_collateral_used:.2f}, "
+                        f"effective_capital=${effective_portfolio.capital:.2f}, "
+                        f"overlay_entries={len(self._overlay_ledger)}"
                     )
                 except Exception as e:
                     logger.warning(f"[{self.event_name}] Failed to sync portfolio: {e}")
+                    effective_portfolio = self.api_base_portfolio._copy()
+
+            if self._integrity_state.frozen:
+                logger.warning(
+                    f"[{self.event_name}][INTEGRITY] iter={iteration}: trading paused while frozen | "
+                    f"reason={self._integrity_state.reason} | "
+                    f"deadline={self._format_timestamp(self._integrity_state.deadline_at)}"
+                )
+                break
 
             # Refresh orderbooks
             orderbooks = self._get_orderbooks()
 
-            # Compute optimal trades on current (freshly synced) portfolio
+            # Compute optimal trades on the current effective portfolio
             planned_trades = self._compute_optimal_trades(
-                orderbooks, hours_to_settlement, verbose=(verbose and iteration == 1)
+                portfolio=effective_portfolio,
+                orderbooks=orderbooks,
+                hours_to_settlement=hours_to_settlement,
+                verbose=(verbose and iteration == 1),
             )
 
             if not planned_trades:
@@ -908,7 +1457,12 @@ class KellyExecutor:
                         filled_price=trade.price,
                     )
 
-                    self._log_trade_placed(trade, token_id, f"dry_run_{self._trade_count}")
+                    self._log_trade_placed(
+                        trade,
+                        token_id,
+                        f"dry_run_{self._trade_count}",
+                        portfolio=self.api_base_portfolio,
+                    )
                     self._record_order()
 
                     result = ExecutionResult(
@@ -1020,7 +1574,9 @@ class KellyExecutor:
                             saw_sell_balance_error = True
 
                     if order_id:
-                        self._pending_orders[order_id] = (trade, token_id)
+                        tracked_trade = self._clone_candidate(trade)
+                        self._pending_orders[order_id] = (tracked_trade, token_id)
+                        self._remember_order_context(order_id, tracked_trade, token_id)
                         confirm_event = asyncio.Event()
                         self._confirmation_events[order_id] = confirm_event
 
@@ -1037,7 +1593,12 @@ class KellyExecutor:
                             )
                             asyncio.create_task(self.user_stream.add_pending_order(pending))
 
-                        self._log_trade_placed(trade, token_id, order_id)
+                        self._log_trade_placed(
+                            tracked_trade,
+                            token_id,
+                            order_id,
+                            portfolio=effective_portfolio,
+                        )
                         self._record_order()
                         num_submitted_this_iter += 1
                         iter_results.append((trade, "SUBMITTED"))
@@ -1174,7 +1735,10 @@ class KellyExecutor:
 
             # Compute optimal trades (greedy simulation on portfolio copy with binary search)
             planned_trades = self._compute_optimal_trades(
-                orderbooks, hours_to_settlement, verbose=(verbose and iteration == 1)
+                portfolio=self.portfolio,
+                orderbooks=orderbooks,
+                hours_to_settlement=hours_to_settlement,
+                verbose=(verbose and iteration == 1),
             )
 
             if not planned_trades:
@@ -1238,6 +1802,7 @@ class KellyExecutor:
 
     def _find_optimal_size(
         self,
+        portfolio: Portfolio,
         candidate: TradeCandidate,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
@@ -1269,10 +1834,10 @@ class KellyExecutor:
         # Clamp full_size to what's actually available
         if is_buy:
             if price > 0:
-                max_buy_shares = self.portfolio.available_capital / price
+                max_buy_shares = portfolio.available_capital / price
                 full_size = min(full_size, max_buy_shares)
         else:
-            position = self.portfolio.get_position(candidate.bin_index)
+            position = portfolio.get_position(candidate.bin_index)
             if position:
                 if candidate.action == TradeAction.SELL_YES:
                     full_size = min(full_size, position.yes_shares)
@@ -1295,7 +1860,13 @@ class KellyExecutor:
             return full_size
 
         # Quick check: does full chunk overshoot?
-        if not self._check_overshoots(candidate, full_size, orderbooks, hours_to_settlement):
+        if not self._check_overshoots(
+            portfolio,
+            candidate,
+            full_size,
+            orderbooks,
+            hours_to_settlement,
+        ):
             return full_size
 
         br = self._bin_range(candidate.bin_index)
@@ -1317,7 +1888,13 @@ class KellyExecutor:
             if hi - lo < 1.0:
                 break
 
-            if self._check_overshoots(candidate, mid, orderbooks, hours_to_settlement):
+            if self._check_overshoots(
+                portfolio,
+                candidate,
+                mid,
+                orderbooks,
+                hours_to_settlement,
+            ):
                 hi = mid
             else:
                 best_valid = mid
@@ -1335,6 +1912,7 @@ class KellyExecutor:
 
     def _check_overshoots(
         self,
+        portfolio: Portfolio,
         candidate: TradeCandidate,
         test_size: float,
         orderbooks: Dict[int, UnifiedOrderbook],
@@ -1355,18 +1933,18 @@ class KellyExecutor:
 
         # Simulate the fill
         if action == TradeAction.BUY_YES:
-            hyp = self.portfolio.simulate_buy_yes(bin_index, test_size, price)
+            hyp = portfolio.simulate_buy_yes(bin_index, test_size, price)
         elif action == TradeAction.BUY_NO:
-            hyp = self.portfolio.simulate_buy_no(bin_index, test_size, price)
+            hyp = portfolio.simulate_buy_no(bin_index, test_size, price)
         elif action == TradeAction.SELL_YES:
-            hyp = self.portfolio.simulate_sell_yes(bin_index, test_size, price)
+            hyp = portfolio.simulate_sell_yes(bin_index, test_size, price)
         elif action == TradeAction.SELL_NO:
-            hyp = self.portfolio.simulate_sell_no(bin_index, test_size, price)
+            hyp = portfolio.simulate_sell_no(bin_index, test_size, price)
         else:
             return False
 
         # Preserve external capital limit
-        hyp.external_capital_limit = self.portfolio.external_capital_limit
+        hyp.external_capital_limit = portfolio.external_capital_limit
 
         # Regenerate candidates on hypothetical portfolio
         new_candidates = generate_candidates(
@@ -1580,6 +2158,7 @@ class KellyExecutor:
 
     def _compute_optimal_trades(
         self,
+        portfolio: Portfolio,
         orderbooks: Dict[int, UnifiedOrderbook],
         hours_to_settlement: float,
         verbose: bool = False,
@@ -1587,7 +2166,7 @@ class KellyExecutor:
         """
         Compute all optimal trades via greedy simulation on a HYPOTHETICAL portfolio.
 
-        Creates a deep copy of self.portfolio and runs a simulation loop:
+        Creates a deep copy of the provided portfolio and runs a simulation loop:
         1. Generate candidates on hypothetical portfolio
         2. Pick best (sells first, then buys by utility)
         3. Binary search for optimal size (upper bound = c_bin_max for buys)
@@ -1595,14 +2174,14 @@ class KellyExecutor:
         5. Accumulate in planned_trades
         6. Repeat until no positive-utility trades remain
 
-        IMPORTANT: self.portfolio is NEVER modified. All simulation happens on copies.
+        IMPORTANT: the input portfolio is NEVER modified. All simulation happens on copies.
 
         Returns:
             List of TradeCandidate with optimized sizes, ready for batch execution.
         """
-        # Deep copy the portfolio for simulation — self.portfolio stays untouched
-        hyp = self.portfolio._copy()
-        hyp.external_capital_limit = self.portfolio.external_capital_limit
+        # Deep copy the portfolio for simulation — the caller's portfolio stays untouched
+        hyp = portfolio._copy()
+        hyp.external_capital_limit = portfolio.external_capital_limit
         planned_trades = []
 
         for sim_iter in range(self.config.max_iters_per_tick):
@@ -1807,10 +2386,11 @@ class KellyExecutor:
 
     def _update_portfolio(self, candidate: TradeCandidate, token_id: str, filled_size: float, filled_price: float) -> None:
         """
-        Update portfolio after confirmed fill.
+        Update the authoritative base portfolio.
 
-        Called from handle_fill() when WebSocket confirms trade execution.
-        This is the ONLY place portfolio is updated during active trading.
+        This is used only in dry-run / simulated execution paths. Live trading
+        keeps the API snapshot authoritative and applies confirmed fills via the
+        overlay ledger until the API catches up.
         """
         action = candidate.action
         bin_index = candidate.bin_index
@@ -1849,9 +2429,9 @@ class KellyExecutor:
 
         Called by UserStreamClient when a trade fill is confirmed.
 
-        Logs fill events and signals confirmation on CONFIRMED status.
-        Portfolio state is NOT updated here — we rely on API sync before
-        each iteration for authoritative state.
+        Logs fill events and records CONFIRMED fills in the overlay ledger.
+        The authoritative base portfolio is not updated here; it is refreshed
+        from the positions API before each iteration.
 
         Args:
             fill_event: FillEvent from WebSocket
@@ -1861,14 +2441,24 @@ class KellyExecutor:
             logger.warning(f"[{self.event_name}] Received fill event with no order_id")
             return
 
-        # Look up the pending order
-        pending_info = self._pending_orders.get(order_id)
-        if not pending_info:
-            # This fill might be from a previous session or manual order
-            logger.info(f"[{self.event_name}] Fill for unknown order {order_id[:16]}... - may be from previous session or manual trade")
-            return
+        now = time.time()
+        self._prune_recent_tracking(now)
 
-        candidate, token_id = pending_info
+        pending_info = self._pending_orders.get(order_id)
+        if pending_info:
+            candidate, token_id = pending_info
+        else:
+            cached = self._recent_order_context.get(order_id)
+            if not cached:
+                logger.info(
+                    f"[{self.event_name}] Fill for unknown order {order_id[:16]}... "
+                    f"- may be from previous session or manual trade"
+                )
+                return
+            candidate, token_id = cached.candidate, cached.token_id
+
+        if not candidate:
+            return
 
         from .user_stream import OrderStatus
         status_str = fill_event.status.name if hasattr(fill_event.status, 'name') else str(fill_event.status)
@@ -1879,24 +2469,22 @@ class KellyExecutor:
             f"{fill_event.size:.1f} @ {fill_event.price:.4f} = ${fill_event.size * fill_event.price:.2f}"
         )
 
-        # Signal confirmation on CONFIRMED (final status).
-        # We wait for CONFIRMED (not MINED) so the API has more time
-        # to propagate the fill before we sync portfolio state.
         if fill_event.status == OrderStatus.CONFIRMED:
-            if order_id in self._confirmation_events:
-                self._confirmation_events[order_id].set()
-                del self._confirmation_events[order_id]
-            if order_id in self._pending_orders:
-                del self._pending_orders[order_id]
-            logger.debug(f"Order {order_id[:16]}... confirmed, signaling and removing from pending")
-
-            # After a BUY fill is confirmed, proactively refresh the CLOB's
-            # cached balance for this token.  BUY orders mint new conditional
-            # tokens on-chain and the CLOB's balance indexer can lag behind,
-            # causing later SELL orders to fail with "not enough balance /
-            # allowance".  Warming the cache here gives it a head start.
-            if candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
-                self._warm_balance_cache(token_id)
+            fill_key = self._confirmed_fill_key(fill_event, token_id)
+            recorded = self._record_confirmed_fill(
+                fill_key=fill_key,
+                order_id=order_id,
+                candidate=candidate,
+                token_id=token_id,
+                fill_event=fill_event,
+                now=now,
+            )
+            self._mark_order_confirmed(order_id, candidate, token_id)
+            if recorded:
+                logger.debug(
+                    f"[{self.event_name}] Recorded CONFIRMED fill overlay for "
+                    f"order {order_id[:16]}..., key={fill_key}"
+                )
 
     async def handle_stale_order(self, pending: "PendingOrder") -> None:
         """
@@ -2000,14 +2588,18 @@ class KellyExecutor:
                 f"edge={trade.edge:+.1%} | {status}"
             )
 
-    def _log_trade_placed(self, candidate: TradeCandidate, token_id: str, order_id: str) -> None:
+    def _log_trade_placed(
+        self,
+        candidate: TradeCandidate,
+        token_id: str,
+        order_id: str,
+        portfolio: Optional[Portfolio] = None,
+    ) -> None:
         """
         Log detailed trade info when order is placed (pending fill).
 
         Format: #N ACTION bin=X (range) | size @ price = $collateral | model=X% mkt=Y% edge=Z% | portfolio: $capital
         """
-        from datetime import datetime
-
         self._trade_count += 1
         ctx = self._log_context
 
@@ -2045,8 +2637,9 @@ class KellyExecutor:
         action = candidate.action.value
 
         # Portfolio state
-        capital = self.portfolio.capital if self.portfolio else 0
-        total_collateral = self.portfolio.total_collateral_used if self.portfolio else 0
+        portfolio = portfolio or self.api_base_portfolio
+        capital = portfolio.capital if portfolio else 0
+        total_collateral = portfolio.total_collateral_used if portfolio else 0
 
         # Time info
         now = datetime.now().strftime("%H:%M:%S")
@@ -2071,13 +2664,13 @@ class KellyExecutor:
         filled_size: float,
         filled_price: float,
         order_id: str,
+        portfolio: Optional[Portfolio] = None,
     ) -> None:
         """
         Log when fill is confirmed via WebSocket.
 
         Shows actual fill details vs requested.
         """
-        from datetime import datetime
         now = datetime.now().strftime("%H:%M:%S")
 
         # Calculate actual collateral
@@ -2091,8 +2684,9 @@ class KellyExecutor:
         slippage_bps = abs(price_diff) * 10000
 
         # Portfolio state after fill
-        capital = self.portfolio.capital if self.portfolio else 0
-        total_collateral = self.portfolio.total_collateral_used if self.portfolio else 0
+        portfolio = portfolio or self.api_base_portfolio
+        capital = portfolio.capital if portfolio else 0
+        total_collateral = portfolio.total_collateral_used if portfolio else 0
 
         br = self._bin_range(candidate.bin_index)
         bin_label = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
@@ -2159,6 +2753,23 @@ class KellyExecutor:
         """Signal executor to stop."""
         self._running = False
 
+    def get_integrity_summary(self) -> dict:
+        """Get event-local overlay/integrity status for monitoring."""
+        now = time.time()
+        self._prune_recent_tracking(now)
+        return {
+            "frozen": self._integrity_state.frozen,
+            "reason": self._integrity_state.reason,
+            "frozen_at": self._format_timestamp(self._integrity_state.frozen_at),
+            "deadline_at": self._format_timestamp(self._integrity_state.deadline_at),
+            "overlay_entries": len(self._overlay_ledger),
+            "oldest_overlay_age_seconds": self._oldest_overlay_age_seconds(now),
+            "last_forced_api_recovery_at": self._format_timestamp(
+                self._integrity_state.last_forced_api_recovery_at
+            ),
+            "unmatched_api_delta_count": self._integrity_state.unmatched_api_delta_count,
+        }
+
     def get_portfolio_summary(self) -> dict:
         """Get current portfolio summary."""
-        return self.portfolio.to_summary()
+        return self.api_base_portfolio.to_summary()

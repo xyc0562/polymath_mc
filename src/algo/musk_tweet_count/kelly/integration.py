@@ -5,9 +5,9 @@ Provides a KellyTradingBot that integrates the Kelly optimizer with
 the existing PolymarketTradingBot infrastructure.
 
 Key design decisions:
-- Portfolio is ONLY updated on WebSocket fill confirmation, not on order placement
-- Sync from API happens before each tick, not periodically
-- UserStreamClient provides real-time fill notifications
+- Portfolio base state is updated only from the positions API
+- Sync from API happens before every Kelly iteration, not periodically
+- Confirmed WebSocket fills feed a temporary planning overlay until the API catches up
 """
 
 import asyncio
@@ -42,9 +42,9 @@ class KellyTradingBot:
     Kelly criterion optimization for position sizing.
 
     Key architecture:
-    - Portfolio updates happen ONLY on WebSocket fill confirmation
-    - Sync from API before each tick (not periodic)
-    - UserStreamClient provides real-time fill/order notifications
+    - Portfolio base state comes from the positions API only
+    - Sync from API before each Kelly iteration
+    - Confirmed fills feed a temporary overlay for planning, not base-state mutation
     """
 
     def __init__(
@@ -273,7 +273,7 @@ class KellyTradingBot:
         """
         Handle fill confirmation from WebSocket.
 
-        Forwards to Kelly executor which updates the portfolio.
+        Forwards to Kelly executor which records the confirmed fill overlay.
         """
         if self.kelly_executor:
             self.kelly_executor.handle_fill(fill_event)
@@ -514,6 +514,16 @@ class KellyTradingBot:
             "running": self._running,
             "dry_run": self.dry_run,
             "portfolio": self.get_portfolio_summary(),
+            "integrity": {
+                "frozen": False,
+                "reason": None,
+                "frozen_at": None,
+                "deadline_at": None,
+                "overlay_entries": 0,
+                "oldest_overlay_age_seconds": None,
+                "last_forced_api_recovery_at": None,
+                "unmatched_api_delta_count": 0,
+            },
             "pending_orders": {
                 "count": 0,
                 "collateral": 0.0,
@@ -527,6 +537,7 @@ class KellyTradingBot:
         if self.kelly_executor:
             status["pending_orders"]["count"] = self.kelly_executor.get_pending_count()
             status["pending_orders"]["collateral"] = self.kelly_executor.get_pending_collateral()
+            status["integrity"] = self.kelly_executor.get_integrity_summary()
 
         if self.user_stream:
             status["user_stream"]["connected"] = self.user_stream._ws is not None
@@ -639,10 +650,9 @@ class KellyTradingBot:
         - Clears positions the API no longer reports (sold/closed)
         - Recalculates collateral_used from synced positions
 
-        Note: The API has some latency (seconds to minutes), so within a
-        single tick we use local state for iterative Kelly optimization.
-        WebSocket fills are logged but don't update portfolio (avoids
-        double-counting from MATCHED/MINED/CONFIRMED callbacks).
+        Note: The API has some latency (seconds to minutes). Confirmed
+        WebSocket fills are tracked separately in the executor as a temporary
+        planning overlay, but this API snapshot remains the authoritative base.
 
         Args:
             wallet_address: The wallet address to sync positions for

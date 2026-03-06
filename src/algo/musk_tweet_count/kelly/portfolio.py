@@ -408,6 +408,7 @@ class Portfolio:
             total_realized_pnl=self.total_realized_pnl,
             last_update_time=self.last_update_time,
             phantom_capital=self.phantom_capital,
+            external_capital_limit=self.external_capital_limit,
         )
 
     def execute_buy_yes(

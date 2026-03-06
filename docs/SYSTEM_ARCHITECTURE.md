@@ -778,17 +778,18 @@ Places FAK (Fill and Kill) orders via Polymarket CLOB.
 2. Get current orderbooks
 3. Loop (max `max_iters_per_tick`):
    a. Check rate limits (per-minute sliding window)
-   b. Sync portfolio from API on first iteration (trusts WebSocket after)
-   c. Generate candidates
+   b. Sync portfolio from API on every iteration
+   c. Reconcile any confirmed-fill overlay against API deltas
+   d. Generate candidates on `API base + residual confirmed overlay`
    d. Get best candidate
    e. Check utility threshold (sells execute unconditionally; buys require ≥ min_utility)
    f. Check FAK cooldown for bin
    g. Execute trade
-   h. If success: track pending order → register with UserStreamClient → wait for confirmation (30s timeout) → API sync (2s wait)
+   h. If success: track pending order → register with UserStreamClient → wait for confirmation (30s timeout) → API sync (5s wait)
    i. If failed: check for FAK failure → add to cooldown
    j. Refresh orderbooks for next iteration
 
-**Portfolio update model**: Portfolio is **NOT** updated on order placement. Updates happen via API sync before each Kelly decision. This avoids double-counting from multiple WebSocket callbacks (MATCHED, MINED, CONFIRMED).
+**Portfolio update model**: Portfolio base state is **NOT** updated on order placement or WebSocket fill callback. The positions API remains authoritative. Confirmed WebSocket fills are stored in a temporary overlay until API position deltas consume them. This avoids duplicate rebuys when `CONFIRMED` arrives before the positions API catches up, while still tolerating missed or duplicated WebSocket messages.
 
 ### 3.6 Integration (KellyTradingBot)
 
@@ -805,8 +806,8 @@ Places FAK (Fill and Kill) orders via Polymarket CLOB.
 #### Portfolio Sync
 - Uses event budget (`c_event_max`), NOT wallet USDC balance
 - `event_capital = budget - collateral_used`
-- Updates from API only if API shows MORE shares than local (never clears local state)
-- API has latency (seconds to minutes); WebSocket fills are primary real-time source
+- Overwrites local base state with the latest API snapshot, including clears
+- API has latency (seconds to minutes); confirmed WebSocket fills are only a temporary planning overlay
 
 #### Tick Flow
 ```python
