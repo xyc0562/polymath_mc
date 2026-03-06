@@ -721,8 +721,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--realtime-poll-interval",
         type=float,
-        default=10.0,
-        help="Seconds between twikit polls for provisional tweet detection (default: 10).",
+        default=20.0,
+        help="Seconds between twikit polls for provisional tweet detection (default: 20).",
     )
     parser.add_argument(
         "--realtime-fetch-count",
