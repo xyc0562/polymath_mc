@@ -27,6 +27,7 @@ class TweetEvent:
     timestamp: datetime
     event_type: str = "tweet"  # "tweet" or "retweet"
     event_id: Optional[str] = None
+    source: str = "xtracker"
 
     def __post_init__(self):
         # Ensure timestamp is timezone-aware
@@ -168,6 +169,7 @@ class XTrackerClient:
         """
         self.session = requests.Session()
         self.timeout = timeout
+        self._warned_missing_platform_id = False
 
     def fetch_all_posts(
         self,
@@ -251,11 +253,16 @@ class XTrackerClient:
             # Determine event type from content
             content = post.get("content", "")
             event_type = "retweet" if content.startswith("RT @") else "tweet"
+            platform_id = post.get("platformId")
+            if not platform_id and not self._warned_missing_platform_id:
+                logger.warning("XTracker post missing platformId; falling back to legacy post id")
+                self._warned_missing_platform_id = True
 
             return TweetEvent(
                 timestamp=timestamp,
                 event_type=event_type,
-                event_id=post.get("id"),
+                event_id=platform_id or post.get("id"),
+                source="xtracker",
             )
 
         except (ValueError, TypeError) as e:
@@ -491,6 +498,7 @@ def load_events_from_csv(
                     timestamp=timestamp,
                     event_type=event_type,
                     event_id=row.get('tweet_id'),
+                    source="xtracker",
                 )
 
                 # Group by contract-day
@@ -540,45 +548,146 @@ class EventStore:
         self.contract_utils = contract_utils
         self.xtracker_client = xtracker_client or XTrackerClient()
 
-        # Storage: contract_date -> List[TweetEvent]
-        self._events: Dict[date, List[TweetEvent]] = {}
+        # Storage split into authoritative XTracker data and provisional realtime overlay.
+        self._official_events: Dict[date, List[TweetEvent]] = {}
+        self._provisional_events: Dict[date, List[TweetEvent]] = {}
 
         # Cache for contract-day counts
         self._counts_cache: Dict[date, int] = {}
+        self._merged_cache: Dict[date, List[TweetEvent]] = {}
 
         # Lock for thread-safe access
         import threading
         self._lock = threading.RLock()
 
-    def add_event(self, event: TweetEvent) -> None:
+    def _invalidate_day(self, contract_date: date) -> None:
+        self._counts_cache.pop(contract_date, None)
+        self._merged_cache.pop(contract_date, None)
+
+    def _dedupe_and_sort(self, events: List[TweetEvent]) -> List[TweetEvent]:
+        unique_by_id: Dict[str, TweetEvent] = {}
+        without_id: List[TweetEvent] = []
+
+        for event in events:
+            if event.event_id:
+                unique_by_id[event.event_id] = event
+            else:
+                without_id.append(event)
+
+        deduped = list(unique_by_id.values()) + without_id
+        return sorted(deduped, key=lambda e: e.timestamp)
+
+    def _add_to_layer(
+        self,
+        layer: Dict[date, List[TweetEvent]],
+        event: TweetEvent,
+        *,
+        source: str,
+    ) -> bool:
+        contract_date = self.contract_utils.get_contract_date(event.timestamp)
+        normalized = TweetEvent(
+            timestamp=event.timestamp,
+            event_type=event.event_type,
+            event_id=event.event_id,
+            source=source,
+        )
+
+        if contract_date not in layer:
+            layer[contract_date] = []
+
+        if normalized.event_id:
+            existing_ids = {e.event_id for e in layer[contract_date] if e.event_id}
+            if normalized.event_id in existing_ids:
+                return False
+
+        layer[contract_date].append(normalized)
+        layer[contract_date] = self._dedupe_and_sort(layer[contract_date])
+        self._invalidate_day(contract_date)
+        return True
+
+    def _merged_events_for_day(self, contract_date: date) -> List[TweetEvent]:
+        cached = self._merged_cache.get(contract_date)
+        if cached is not None:
+            return cached
+
+        official = self._official_events.get(contract_date, [])
+        provisional = self._provisional_events.get(contract_date, [])
+
+        merged: List[TweetEvent] = list(official)
+        official_ids = {event.event_id for event in official if event.event_id}
+        for event in provisional:
+            if event.event_id and event.event_id in official_ids:
+                continue
+            merged.append(event)
+
+        merged = self._dedupe_and_sort(merged)
+        self._merged_cache[contract_date] = merged
+        return merged
+
+    def add_event(self, event: TweetEvent) -> bool:
         """
-        Add a single event (with deduplication by event_id).
+        Add a single authoritative event (with deduplication by event_id).
 
         If an event with the same event_id already exists, it won't be added again.
         Thread-safe.
         """
-        contract_date = self.contract_utils.get_contract_date(event.timestamp)
+        with self._lock:
+            return self._add_to_layer(self._official_events, event, source="xtracker")
+
+    def add_provisional_event(self, event: TweetEvent) -> bool:
+        """Add a provisional realtime event. Thread-safe."""
+        with self._lock:
+            contract_date = self.contract_utils.get_contract_date(event.timestamp)
+            merged_ids = {
+                existing.event_id
+                for existing in self._merged_events_for_day(contract_date)
+                if existing.event_id
+            }
+            if event.event_id and event.event_id in merged_ids:
+                return False
+            return self._add_to_layer(self._provisional_events, event, source="twikit")
+
+    def add_events(self, events: List[TweetEvent]) -> int:
+        """Add multiple authoritative events (with deduplication). Thread-safe."""
+        inserted = 0
+        for event in events:
+            inserted += int(self.add_event(event))
+        return inserted
+
+    def replace_official_day(self, contract_date: date, events: List[TweetEvent]) -> bool:
+        """
+        Replace all authoritative events for a contract day.
+
+        Returns True if the effective merged view changed.
+        """
+        filtered = [
+            TweetEvent(
+                timestamp=e.timestamp,
+                event_type=e.event_type,
+                event_id=e.event_id,
+                source="xtracker",
+            )
+            for e in events
+            if self.contract_utils.get_contract_date(e.timestamp) == contract_date
+        ]
+        filtered = self._dedupe_and_sort(filtered)
 
         with self._lock:
-            if contract_date not in self._events:
-                self._events[contract_date] = []
+            before = list(self._merged_events_for_day(contract_date))
+            self._official_events[contract_date] = filtered
+            self._invalidate_day(contract_date)
+            after = list(self._merged_events_for_day(contract_date))
+            return before != after
 
-            # Check for duplicate by event_id
-            if event.event_id:
-                existing_ids = {e.event_id for e in self._events[contract_date] if e.event_id}
-                if event.event_id in existing_ids:
-                    return  # Already exists, skip
-
-            self._events[contract_date].append(event)
-            self._events[contract_date].sort(key=lambda e: e.timestamp)
-
-            # Invalidate cache
-            self._counts_cache.pop(contract_date, None)
-
-    def add_events(self, events: List[TweetEvent]) -> None:
-        """Add multiple events (with deduplication). Thread-safe."""
-        for event in events:
-            self.add_event(event)
+    def clear_provisional_day(self, contract_date: date) -> bool:
+        """Clear provisional overlay for a contract day. Returns True if anything changed."""
+        with self._lock:
+            before = list(self._merged_events_for_day(contract_date))
+            removed = bool(self._provisional_events.get(contract_date))
+            self._provisional_events.pop(contract_date, None)
+            self._invalidate_day(contract_date)
+            after = list(self._merged_events_for_day(contract_date))
+            return removed and before != after
 
     def set_contract_day_events(
         self,
@@ -600,27 +709,12 @@ class EventStore:
         Returns:
             True if events were updated, False if rejected due to regression
         """
-        # Filter events to only those belonging to this contract day
-        filtered = [
-            e for e in events
-            if self.contract_utils.get_contract_date(e.timestamp) == contract_date
-        ]
-
-        with self._lock:
-            old_count = len(self._events.get(contract_date, []))
-            new_count = len(filtered)
-
-            # Prevent regression unless explicitly allowed
-            if not allow_regression and new_count < old_count:
-                logger.warning(
-                    f"Rejecting event update for {contract_date}: "
-                    f"new count ({new_count}) < old count ({old_count})"
-                )
-                return False
-
-            self._events[contract_date] = sorted(filtered, key=lambda e: e.timestamp)
-            self._counts_cache.pop(contract_date, None)
-            return True
+        if not allow_regression:
+            logger.debug(
+                "set_contract_day_events() now delegates to authoritative replacement; "
+                "authoritative rebases are allowed by design"
+            )
+        return self.replace_official_day(contract_date, events)
 
     def get_events(
         self,
@@ -646,10 +740,9 @@ class EventStore:
         with self._lock:
             current = start_date
             while current <= end_date:
-                if current in self._events:
-                    for event in self._events[current]:
-                        if start <= event.timestamp < end:
-                            result.append(event)
+                for event in self._merged_events_for_day(current):
+                    if start <= event.timestamp < end:
+                        result.append(event)
                 current += timedelta(days=1)
 
         return sorted(result, key=lambda e: e.timestamp)
@@ -657,8 +750,40 @@ class EventStore:
     def get_contract_day_events(self, contract_date: date) -> List[TweetEvent]:
         """Get all events for a contract-day. Thread-safe."""
         with self._lock:
-            # Return a copy to prevent modification of internal state
-            return list(self._events.get(contract_date, []))
+            return list(self._merged_events_for_day(contract_date))
+
+    def get_official_contract_day_events(self, contract_date: date) -> List[TweetEvent]:
+        """Get authoritative XTracker events for a contract-day. Thread-safe."""
+        with self._lock:
+            return list(self._official_events.get(contract_date, []))
+
+    def get_provisional_contract_day_events(self, contract_date: date) -> List[TweetEvent]:
+        """Get provisional realtime events for a contract-day. Thread-safe."""
+        with self._lock:
+            return list(self._provisional_events.get(contract_date, []))
+
+    def has_event_id(self, event_id: str, contract_date: Optional[date] = None) -> bool:
+        """Check whether an event id exists in the merged effective view."""
+        with self._lock:
+            dates = [contract_date] if contract_date is not None else sorted(
+                set(self._official_events) | set(self._provisional_events)
+            )
+            for day in dates:
+                for event in self._merged_events_for_day(day):
+                    if event.event_id == event_id:
+                        return True
+        return False
+
+    def get_latest_official_timestamp(self, contract_dates: Optional[List[date]] = None) -> Optional[datetime]:
+        """Get latest authoritative timestamp, optionally restricted to specific contract days."""
+        with self._lock:
+            dates = contract_dates or sorted(self._official_events.keys())
+            latest: Optional[datetime] = None
+            for contract_date in dates:
+                for event in self._official_events.get(contract_date, []):
+                    if latest is None or event.timestamp > latest:
+                        latest = event.timestamp
+            return latest
 
     def get_contract_day_count(self, contract_date: date) -> int:
         """Get tweet count for a contract-day. Thread-safe."""
@@ -666,7 +791,7 @@ class EventStore:
             if contract_date in self._counts_cache:
                 return self._counts_cache[contract_date]
 
-            count = len(self._events.get(contract_date, []))
+            count = len(self._merged_events_for_day(contract_date))
             self._counts_cache[contract_date] = count
         return count
 
@@ -721,24 +846,24 @@ class EventStore:
             logger.warning("Refresh returned no data, keeping cached data")
             return False
 
-        new_total = sum(len(events) for events in history.values())
-
-        # Check for regression
         with self._lock:
-            old_total = sum(len(e) for e in self._events.values())
+            all_dates = set(self._official_events) | set(history)
+            for contract_date in all_dates:
+                authoritative = history.get(contract_date, [])
+                self._official_events[contract_date] = self._dedupe_and_sort([
+                    TweetEvent(
+                        timestamp=e.timestamp,
+                        event_type=e.event_type,
+                        event_id=e.event_id,
+                        source="xtracker",
+                    )
+                    for e in authoritative
+                    if self.contract_utils.get_contract_date(e.timestamp) == contract_date
+                ])
+                self._provisional_events.pop(contract_date, None)
+                self._invalidate_day(contract_date)
 
-            if new_total < old_total * 0.9:  # Allow 10% tolerance for edge cases
-                logger.warning(
-                    f"Refresh would cause major regression: "
-                    f"old={old_total}, new={new_total}. Keeping cached data."
-                )
-                return False
-
-            for contract_date, events in history.items():
-                self._events[contract_date] = events
-                self._counts_cache[contract_date] = len(events)
-
-            total = sum(len(e) for e in self._events.values())
+            total = sum(len(self._merged_events_for_day(d)) for d in all_dates)
 
         logger.info(f"Loaded {total} total events")
         return True
@@ -792,14 +917,17 @@ class EventStore:
     def has_data_for_date(self, contract_date: date) -> bool:
         """Check if we have data for a contract-day. Thread-safe."""
         with self._lock:
-            return contract_date in self._events
+            return (
+                contract_date in self._official_events or
+                contract_date in self._provisional_events
+            )
 
     def get_date_range(self) -> Tuple[Optional[date], Optional[date]]:
         """Get the range of dates with data. Thread-safe."""
         with self._lock:
-            if not self._events:
+            dates = sorted(set(self._official_events) | set(self._provisional_events))
+            if not dates:
                 return None, None
-            dates = sorted(self._events.keys())
             return dates[0], dates[-1]
 
     def cleanup_old_data(self, keep_days: int = 60) -> int:
@@ -818,10 +946,14 @@ class EventStore:
         cutoff = today - timedelta(days=keep_days)
 
         with self._lock:
-            old_dates = [d for d in self._events.keys() if d < cutoff]
+            old_dates = [
+                d for d in sorted(set(self._official_events) | set(self._provisional_events))
+                if d < cutoff
+            ]
 
             for old_date in old_dates:
-                del self._events[old_date]
-                self._counts_cache.pop(old_date, None)
+                self._official_events.pop(old_date, None)
+                self._provisional_events.pop(old_date, None)
+                self._invalidate_day(old_date)
 
         return len(old_dates)

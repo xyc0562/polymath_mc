@@ -25,6 +25,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import requests
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv(*args, **kwargs):
+        return False
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent.parent.parent
@@ -52,6 +57,7 @@ from src.algo.musk_tweet_count.kelly.config import (
     MarketBuyGuardConfig,
 )
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
+from src.algo.musk_tweet_count.notifications import SlackNotifier
 
 logger = logging.getLogger(__name__)
 CONTRACT_UTILS = ContractDayUtils()
@@ -142,6 +148,12 @@ def log_config_summary(
     w(f"    Event scan interval:     {multi_event_config.event_scan_interval}s")
     w(f"    Max data age:            {multi_event_config.max_data_age_seconds}s")
     w(f"    Count validation:        every {multi_event_config.count_validation_interval}s")
+    w(f"    Realtime tracker:        {multi_event_config.realtime_tracker_enabled}")
+    if multi_event_config.realtime_tracker_enabled:
+        w(f"    Realtime poll interval:  {multi_event_config.realtime_poll_interval_seconds}s")
+        w(f"    Realtime fetch count:    {multi_event_config.realtime_fetch_count}")
+        w(f"    Realtime late grace:     {multi_event_config.realtime_late_tweet_grace_seconds}s")
+        w(f"    Realtime cookies path:   {multi_event_config.realtime_cookies_path or 'config/twitter_cookies.json'}")
     w("")
 
     # Event trading rules
@@ -701,6 +713,35 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to event trading rules YAML config (default: config/event_trading_rules.yaml). "
              "Controls when trading is allowed based on event duration and counting status.",
     )
+    parser.add_argument(
+        "--disable-realtime-tracker",
+        action="store_true",
+        help="Disable provisional twikit polling. Default: enabled.",
+    )
+    parser.add_argument(
+        "--realtime-poll-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between twikit polls for provisional tweet detection (default: 10).",
+    )
+    parser.add_argument(
+        "--realtime-fetch-count",
+        type=int,
+        default=40,
+        help="Number of tweets to fetch per twikit poll (default: 40).",
+    )
+    parser.add_argument(
+        "--realtime-late-tweet-grace",
+        type=float,
+        default=120.0,
+        help="Seconds of grace for slightly late/out-of-order tweets from twikit (default: 120).",
+    )
+    parser.add_argument(
+        "--realtime-cookies-path",
+        type=str,
+        default=None,
+        help="Optional override for twikit cookies JSON path. Default: config/twitter_cookies.json.",
+    )
 
     # Kelly configuration
     parser.add_argument(
@@ -965,6 +1006,9 @@ async def main() -> None:
     """Main entry point."""
     args = parse_args()
     setup_logging(args.verbose)
+    load_dotenv()
+    manager: Optional[MultiEventManager] = None
+    slack_notifier: Optional[SlackNotifier] = None
 
     # Handle --list-events: list events and exit
     if args.list_events:
@@ -1160,8 +1204,23 @@ async def main() -> None:
         projection_model=args.projection,
         min_event_duration_days=args.min_event_days,
         max_event_duration_days=args.max_event_days,
+        realtime_tracker_enabled=not args.disable_realtime_tracker,
+        realtime_poll_interval_seconds=args.realtime_poll_interval,
+        realtime_fetch_count=args.realtime_fetch_count,
+        realtime_late_tweet_grace_seconds=args.realtime_late_tweet_grace,
+        realtime_cookies_path=args.realtime_cookies_path,
     )
     logger.info(f"Event duration filter: {args.min_event_days}-{args.max_event_days} days (inclusive)")
+    if multi_event_config.realtime_tracker_enabled:
+        logger.info(
+            "Realtime twikit tracker enabled: poll_interval=%.1fs fetch_count=%d late_grace=%.1fs cookies=%s",
+            multi_event_config.realtime_poll_interval_seconds,
+            multi_event_config.realtime_fetch_count,
+            multi_event_config.realtime_late_tweet_grace_seconds,
+            multi_event_config.realtime_cookies_path or "config/twitter_cookies.json",
+        )
+    else:
+        logger.info("Realtime twikit tracker disabled")
 
     # Get wallet address for position fetching
     # IMPORTANT: Use proxy wallet if configured (positions are held there)
@@ -1198,81 +1257,109 @@ async def main() -> None:
             sys.exit(1)
 
     # Create manager with initial events or discovery callback
-    manager = MultiEventManager(
-        clob_client=clob_client,
-        kelly_config=kelly_config,
-        forecaster_config=forecaster_config,
-        config=multi_event_config,
-        wallet_address=wallet_address,
-        event_discovery_callback=discovery_callback,
-        initial_events=initial_events if initial_events else None,
-    )
-
-    # Reconstruct state from Polymarket API (positions, balances)
-    # This recovers state after a crash/restart
-    logger.info("Reconstructing state from Polymarket API...")
-    await manager.reconstruct_state_from_api()
-
-    # Log full config summary
-    log_config_summary(
-        kelly_config=kelly_config,
-        multi_event_config=multi_event_config,
-        forecaster_config=forecaster_config,
-        capital_pool_config=capital_pool_config,
-        dry_run=dry_run,
-    )
-
-    # Run manager
-    async with manager._events_lock:
-        num_events = len(manager._pending_events) + len(manager._active_events)
-    logger.info(f"Starting multi-event manager with {num_events} events")
-
-    # Setup signal handlers for graceful shutdown
-    import signal
-    loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-
-    def signal_handler():
-        logger.info("Received shutdown signal (Ctrl+C)")
-        manager.stop()
-        shutdown_event.set()
-
-    # Register signal handlers
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
-
     try:
-        await manager.run()
-    except asyncio.CancelledError:
-        logger.info("Manager cancelled")
-    except Exception as e:
-        logger.error(f"Manager error: {e}", exc_info=True)
-    finally:
-        # Remove signal handlers
+        slack_notifier = SlackNotifier.from_env(dry_run=dry_run)
+        await slack_notifier.start()
+
+        manager = MultiEventManager(
+            clob_client=clob_client,
+            kelly_config=kelly_config,
+            forecaster_config=forecaster_config,
+            config=multi_event_config,
+            wallet_address=wallet_address,
+            event_discovery_callback=discovery_callback,
+            initial_events=initial_events if initial_events else None,
+            slack_notifier=slack_notifier,
+        )
+
+        # Reconstruct state from Polymarket API (positions, balances)
+        # This recovers state after a crash/restart
+        logger.info("Reconstructing state from Polymarket API...")
+        await manager.reconstruct_state_from_api()
+
+        # Log full config summary
+        log_config_summary(
+            kelly_config=kelly_config,
+            multi_event_config=multi_event_config,
+            forecaster_config=forecaster_config,
+            capital_pool_config=capital_pool_config,
+            dry_run=dry_run,
+        )
+
+        # Run manager
+        async with manager._events_lock:
+            num_events = len(manager._pending_events) + len(manager._active_events)
+        logger.info(f"Starting multi-event manager with {num_events} events")
+
+        # Setup signal handlers for graceful shutdown
+        import signal
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received shutdown signal (Ctrl+C)")
+            manager.stop()
+            shutdown_event.set()
+
+        # Register signal handlers
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)
+            loop.add_signal_handler(sig, signal_handler)
 
-        # Ensure manager is stopped
-        manager.stop()
-
-        # Give tasks time to clean up
-        await asyncio.sleep(0.5)
-
-        # Log final status
         try:
-            status = manager.get_status()
-            logger.info(f"Final status: {status}")
-
-            performance = manager.capital_pool.get_performance_summary()
-            logger.info(
-                f"Performance: {performance['num_events']} events, "
-                f"total P&L: ${performance['total_pnl']:.2f}, "
-                f"win rate: {performance['win_rate']:.1%}"
-            )
+            await manager.run()
+        except asyncio.CancelledError:
+            logger.info("Manager cancelled")
         except Exception as e:
-            logger.debug(f"Error logging final status: {e}")
+            logger.error(f"Manager error: {e}", exc_info=True)
+            if slack_notifier:
+                slack_notifier.notify_error(
+                    "Manager error",
+                    [str(e)],
+                    dedupe_key="manager_run_error",
+                    cooldown_seconds=300.0,
+                )
+                await slack_notifier.flush()
+        finally:
+            # Remove signal handlers
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.remove_signal_handler(sig)
 
-        logger.info("Shutdown complete")
+            # Ensure manager is stopped
+            manager.stop()
+
+            # Give tasks time to clean up
+            await asyncio.sleep(0.5)
+
+            # Log final status
+            try:
+                status = manager.get_status()
+                logger.info(f"Final status: {status}")
+
+                performance = manager.capital_pool.get_performance_summary()
+                logger.info(
+                    f"Performance: {performance['num_events']} events, "
+                    f"total P&L: ${performance['total_pnl']:.2f}, "
+                    f"win rate: {performance['win_rate']:.1%}"
+                )
+
+                if slack_notifier:
+                    health = manager.get_health()
+                    slack_notifier.notify_info(
+                        "Multi-event manager stopped",
+                        [
+                            f"status={health['status']} uptime={health['uptime_hours']:.1f}h",
+                            f"events={performance['num_events']} pnl=${performance['total_pnl']:.2f} win_rate={performance['win_rate']:.1%}",
+                            f"capital_available=${health['available_capital']:.2f} errors={health['errors_count']}",
+                        ],
+                    )
+                    await slack_notifier.flush()
+            except Exception as e:
+                logger.debug(f"Error logging final status: {e}")
+
+            logger.info("Shutdown complete")
+    finally:
+        if slack_notifier:
+            await slack_notifier.stop()
 
 
 if __name__ == "__main__":

@@ -113,6 +113,19 @@ ENCRYPTED_POLYMARKET_PRIVATE_KEY_FILE=.encrypted_key
 
 See the [Security Warning](#security-warning) section below.
 
+Optional Slack notifications for the multi-event runner:
+```bash
+SLACK_ENABLED=true
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_CHANNEL_ID=C0123456789
+SLACK_NOTIFY_DRY_RUN=false
+SLACK_HEALTH_INTERVAL_SECONDS=21600
+SLACK_HEALTH_ON_CHANGE_ONLY=true
+SLACK_FILL_SUMMARY_INTERVAL_SECONDS=3600
+SLACK_FILL_SUMMARY_MAX_EXAMPLES=5
+SLACK_BALANCE_ALLOWANCE_COOLDOWN_SECONDS=3600
+```
+
 ### 4. Run an Algorithm
 
 ```bash

@@ -947,7 +947,8 @@ class UnifiedBacktestRunner:
                 tweet_event = TweetEvent(
                     timestamp=dt,
                     event_type=event_type,
-                    event_id=post.get("id"),
+                    event_id=post.get("platformId") or post.get("id"),
+                    source="xtracker",
                 )
 
                 # Only add training period posts to EventStore initially

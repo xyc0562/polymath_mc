@@ -16,7 +16,8 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta, timezone
-from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Any
 from zoneinfo import ZoneInfo
 
 import requests
@@ -28,15 +29,31 @@ POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 from .config import ForecasterConfig
 from .trading_bot import GASKellyTradingBot, TradingBotConfig
 from .data import EventStore, ContractDayUtils, XTrackerClient as PostsXTrackerClient
+from .realtime_tracker import RealtimeTweetTracker, RealtimePollResult
+from ..notifications import SlackNotifier
 from ..musk_tweet_count import XTrackerClient as TrackingsXTrackerClient
 from ..kelly.config import KellyConfig, EventTradingRulesConfig
 from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
-from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder
+from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
+from ..kelly.executor import BalanceAllowanceErrorContext
+
+try:
+    from src.twitter_scraper import get_cookies_path as get_default_twitter_cookies_path
+except Exception:  # pragma: no cover - fallback for stripped environments
+    def get_default_twitter_cookies_path() -> Path:
+        return Path("config/twitter_cookies.json")
 
 logger = logging.getLogger(__name__)
 
 # Count validation threshold - warn if computed vs API count differs by more than this
 COUNT_MISMATCH_THRESHOLD = 5
+
+TICK_SOURCE_PRIORITY = {
+    "startup": 0,
+    "realtime": 1,
+    "xtracker": 2,
+    "authoritative_rebase": 3,
+}
 
 
 @dataclass
@@ -65,6 +82,31 @@ class ActiveEvent:
     stable_sync_count: int = 0
     last_position_fingerprint: Optional[Tuple[Any, ...]] = None
     startup_tick_pending: bool = False
+
+
+@dataclass
+class RefreshOutcome:
+    """Outcome from applying authoritative XTracker data."""
+
+    effective_changed: bool = False
+    new_events: int = 0
+    affected_days: Set[date] = field(default_factory=set)
+    authoritative_rebase: bool = False
+
+
+@dataclass
+class FillNotification:
+    """Buffered fill notification for Slack summaries."""
+
+    event_short_name: str
+    bin_index: int
+    bin_range: str
+    side: str
+    status: str
+    size: float
+    price: float
+    notional: float
+    timestamp: datetime
 
 
 @dataclass
@@ -100,6 +142,13 @@ class MultiEventConfig:
     # How often to refresh posts data (seconds) — used as fallback
     # In sync-driven mode, posts are refreshed on lastSync change instead
     posts_refresh_interval: int = 150  # 2.5 minutes
+
+    # Realtime twikit polling for provisional edge detection
+    realtime_tracker_enabled: bool = True
+    realtime_poll_interval_seconds: float = 10.0
+    realtime_fetch_count: int = 40
+    realtime_late_tweet_grace_seconds: float = 120.0
+    realtime_cookies_path: Optional[str] = None
 
     # Maximum age of data before it's considered stale (seconds)
     # If data is older than this, skip trading until refreshed
@@ -189,6 +238,7 @@ class MultiEventManager:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
+        slack_notifier: Optional[SlackNotifier] = None,
     ):
         """
         Initialize multi-event manager.
@@ -206,6 +256,7 @@ class MultiEventManager:
             api_key: Polymarket API key for user stream (auto-detects from env if not provided)
             api_secret: Polymarket API secret for user stream
             api_passphrase: Polymarket API passphrase for user stream
+            slack_notifier: Optional async Slack notifier for state updates
         """
         import os
 
@@ -216,6 +267,7 @@ class MultiEventManager:
         self.kelly_config = kelly_config
         self.forecaster_config = forecaster_config
         self.config = config
+        self.slack_notifier = slack_notifier
 
         # API credentials for user stream (auto-detect from env if not provided)
         self._api_key = api_key or os.getenv("CLOB_API_KEY", "")
@@ -246,6 +298,8 @@ class MultiEventManager:
             contract_utils=self.contract_utils,
             xtracker_client=self.posts_xtracker_client,
         )
+        self._data_update_lock = asyncio.Lock()
+        self.shared_data_version: int = 0
 
         # Sync-driven polling: last known XTracker sync timestamp
         self._last_known_sync: Optional[datetime] = None
@@ -261,6 +315,20 @@ class MultiEventManager:
 
         # Track when data was last successfully refreshed (for freshness check)
         self._last_data_refresh_time: Optional[datetime] = None
+        self._last_data_refresh_source: Optional[str] = None
+        self._last_xtracker_refresh_time: Optional[datetime] = None
+
+        self.realtime_tracker: Optional[RealtimeTweetTracker] = None
+        if self.config.realtime_tracker_enabled:
+            cookies_path = Path(self.config.realtime_cookies_path) if self.config.realtime_cookies_path else get_default_twitter_cookies_path()
+            self.realtime_tracker = RealtimeTweetTracker(
+                event_store=self.shared_event_store,
+                contract_utils=self.contract_utils,
+                cookies_path=cookies_path,
+                poll_interval=self.config.realtime_poll_interval_seconds,
+                fetch_count=self.config.realtime_fetch_count,
+                late_tweet_grace_seconds=self.config.realtime_late_tweet_grace_seconds,
+            )
 
         # Global UserStreamClient for fill confirmations (shared across all bots)
         # This is more efficient than one UserStreamClient per bot since
@@ -303,6 +371,10 @@ class MultiEventManager:
         self._start_time: Optional[datetime] = None
         self._last_cleanup_time: Optional[datetime] = None
         self._last_health_log_time: Optional[datetime] = None
+        self._last_slack_health_notification: Optional[datetime] = None
+        self._last_slack_health_signature: Optional[Tuple[Any, ...]] = None
+        self._pending_fill_notifications: List[FillNotification] = []
+        self._first_pending_fill_at: Optional[datetime] = None
         self._total_events_started: int = 0
         self._total_events_completed: int = 0
         self._total_trades_executed: int = 0
@@ -322,6 +394,251 @@ class MultiEventManager:
     def num_active_events(self) -> int:
         """Number of events currently trading."""
         return len(self._active_events)
+
+    @staticmethod
+    def _fmt_usd(value: float) -> str:
+        return f"${value:.2f}"
+
+    def _notify_slack(
+        self,
+        level: str,
+        title: str,
+        lines: Optional[List[str]] = None,
+        *,
+        dedupe_key: Optional[str] = None,
+        cooldown_seconds: float = 0.0,
+    ) -> None:
+        if not self.slack_notifier:
+            return
+        if level == "error":
+            self.slack_notifier.notify_error(
+                title,
+                lines,
+                dedupe_key=dedupe_key,
+                cooldown_seconds=cooldown_seconds,
+            )
+        elif level == "warning":
+            self.slack_notifier.notify_warning(
+                title,
+                lines,
+                dedupe_key=dedupe_key,
+                cooldown_seconds=cooldown_seconds,
+            )
+        else:
+            self.slack_notifier.notify_info(
+                title,
+                lines,
+                dedupe_key=dedupe_key,
+                cooldown_seconds=cooldown_seconds,
+            )
+
+    def _notify_startup(self) -> None:
+        health = self.get_health()
+        lines = [
+            f"mode={'DRY RUN' if self.config.dry_run else 'LIVE'} active={health['active_events']} pending={health['pending_events']}",
+            f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
+            f"data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')} refreshed_at={health.get('last_data_refresh_time') or 'n/a'}",
+        ]
+        if health["active_event_names"]:
+            lines.append("events=" + ", ".join(health["active_event_names"][:5]))
+        self._notify_slack("info", "Multi-event manager started", lines)
+        self._last_slack_health_notification = datetime.now(self._tz)
+        self._last_slack_health_signature = self._health_digest_signature(health)
+
+    @staticmethod
+    def _health_digest_signature(health: Dict[str, Any]) -> Tuple[Any, ...]:
+        """Build a coarse health signature for change-driven Slack digests."""
+        user_stream = health.get("user_stream", {})
+        realtime = health.get("realtime_tracker", {})
+        return (
+            health.get("status"),
+            health.get("errors_count"),
+            user_stream.get("connected", False),
+            realtime.get("enabled", False),
+            bool(realtime.get("backoff_until")),
+            min(int(realtime.get("consecutive_errors", 0) or 0), 3),
+        )
+
+    def _maybe_notify_health(self, *, force: bool = False) -> None:
+        if not self.slack_notifier:
+            return
+        interval = max(0, self.slack_notifier.health_interval_seconds)
+
+        now = datetime.now(self._tz)
+        health = self.get_health()
+        signature = self._health_digest_signature(health)
+        changed = signature != self._last_slack_health_signature
+        interval_elapsed = (
+            self._last_slack_health_notification is None or
+            (
+                interval > 0 and
+                (now - self._last_slack_health_notification).total_seconds() >= interval
+            )
+        )
+
+        if not force:
+            if self.slack_notifier.health_on_change_only:
+                if not changed and not interval_elapsed:
+                    return
+            elif interval <= 0 or not interval_elapsed:
+                return
+
+        lines = [
+            f"status={health['status']} uptime={health['uptime_hours']:.1f}h active={health['active_events']} pending={health['pending_events']}",
+            f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
+            f"errors={health['errors_count']} data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')}",
+        ]
+        user_stream = health.get("user_stream", {})
+        lines.append(
+            f"user_stream connected={user_stream.get('connected', False)} pending_orders={user_stream.get('pending_orders', 0)} fills={user_stream.get('fill_count', 0)}"
+        )
+        realtime = health.get("realtime_tracker", {})
+        if realtime.get("enabled", False):
+            lines.append(
+                f"realtime errors={realtime.get('consecutive_errors', 0)} last_poll={realtime.get('last_poll_time') or 'n/a'}"
+            )
+        if health["active_event_names"]:
+            lines.append("events=" + ", ".join(health["active_event_names"][:5]))
+
+        self._notify_slack("info", "Health digest", lines)
+        self._last_slack_health_notification = now
+        self._last_slack_health_signature = signature
+
+    def _notify_event_started(
+        self,
+        event_info: EventInfo,
+        allocated_capital: float,
+        num_active: int,
+    ) -> None:
+        self._notify_slack(
+            "info",
+            f"Event started: {event_info.short_name}",
+            [
+                f"event_id={event_info.event_id}",
+                f"dates={event_info.market_start_date} -> {event_info.settlement_date}",
+                f"allocated={self._fmt_usd(allocated_capital)} active_events={num_active}",
+                f"pool_available={self._fmt_usd(self.capital_pool.available_capital)}",
+            ],
+        )
+
+    def _notify_event_completed(
+        self,
+        event_info: EventInfo,
+        final_value: float,
+        num_active: int,
+    ) -> None:
+        self._notify_slack(
+            "info",
+            f"Event completed: {event_info.short_name}",
+            [
+                f"event_id={event_info.event_id}",
+                f"returned={self._fmt_usd(final_value)} active_events={num_active}",
+                f"pool_available={self._fmt_usd(self.capital_pool.available_capital)}",
+            ],
+        )
+
+    def _notify_fill(
+        self,
+        event_info: EventInfo,
+        bin_index: int,
+        fill_event: FillEvent,
+        *,
+        bin_range: str = "",
+    ) -> None:
+        if fill_event.status != OrderStatus.CONFIRMED:
+            return
+        self._pending_fill_notifications.append(
+            FillNotification(
+                event_short_name=event_info.short_name,
+                bin_index=bin_index,
+                bin_range=bin_range,
+                side=fill_event.side,
+                status=fill_event.status.value,
+                size=fill_event.size,
+                price=fill_event.price,
+                notional=fill_event.size * fill_event.price,
+                timestamp=fill_event.timestamp,
+            )
+        )
+        if self._first_pending_fill_at is None:
+            self._first_pending_fill_at = datetime.now(self._tz)
+
+    def _maybe_flush_fill_summaries(self, *, force: bool = False) -> None:
+        if not self.slack_notifier or not self._pending_fill_notifications:
+            return
+
+        now = datetime.now(self._tz)
+        interval = self.slack_notifier.fill_summary_interval_seconds
+        started_at = self._first_pending_fill_at or now
+        if not force and interval > 0 and (now - started_at).total_seconds() < interval:
+            return
+
+        fills = self._pending_fill_notifications
+        self._pending_fill_notifications = []
+        self._first_pending_fill_at = None
+
+        event_totals: Dict[str, Tuple[int, float]] = {}
+        for fill in fills:
+            count, total_notional = event_totals.get(fill.event_short_name, (0, 0.0))
+            event_totals[fill.event_short_name] = (count + 1, total_notional + fill.notional)
+
+        lines = [
+            f"window={started_at.isoformat()} -> {now.isoformat()} fills={len(fills)} total_notional={self._fmt_usd(sum(fill.notional for fill in fills))} events={len(event_totals)}",
+        ]
+        for event_name, (count, total_notional) in sorted(
+            event_totals.items(),
+            key=lambda item: (-item[1][0], item[0]),
+        )[: self.slack_notifier.fill_summary_max_examples]:
+            lines.append(
+                f"{event_name}: fills={count} notional={self._fmt_usd(total_notional)}"
+            )
+
+        lines.append("samples:")
+        for fill in fills[: self.slack_notifier.fill_summary_max_examples]:
+            bin_label = (
+                f"{fill.bin_index} ({fill.bin_range})"
+                if fill.bin_range else str(fill.bin_index)
+            )
+            lines.append(
+                f"{fill.event_short_name}: {fill.side} bin={bin_label} size={fill.size:.2f} price={fill.price:.4f} notional={self._fmt_usd(fill.notional)}"
+            )
+
+        self._notify_slack("info", "Fill summary", lines)
+
+    def _notify_balance_allowance_error(
+        self,
+        event_info: EventInfo,
+        context: BalanceAllowanceErrorContext,
+    ) -> None:
+        bin_label = (
+            f"{context.bin_index} ({context.bin_range})"
+            if context.bin_range else str(context.bin_index)
+        )
+        clob_balance = (
+            f"{context.clob_available_shares:.2f}"
+            if context.clob_available_shares is not None else "unknown"
+        )
+        lines = [
+            f"event_id={event_info.event_id} action={context.action} side={context.side} token_type={context.token_type}",
+            f"bin={bin_label} token={context.token_id}",
+            f"requested_size={context.requested_size:.2f} requested_price={context.requested_price:.4f} limit_price={context.requested_limit_price:.4f} notional={self._fmt_usd(context.requested_notional)}",
+            f"fair={context.reservation_price:.4f} edge={context.edge:+.2%} utility={context.utility_gain:.6f}",
+            f"local_yes={context.local_yes_shares:.2f} @ {context.local_yes_avg_cost:.4f} local_no={context.local_no_shares:.2f} @ {context.local_no_avg_cost:.4f}",
+            f"portfolio_available={self._fmt_usd(context.portfolio_available_capital or 0.0)} collateral={self._fmt_usd(context.portfolio_total_collateral or 0.0)} pending_orders={context.pending_orders_count}",
+            f"clob_balance={clob_balance} raw_balance={context.raw_balance or 'n/a'} nonzero_allowances={context.nonzero_allowances if context.nonzero_allowances is not None else 'unknown'}",
+            f"allowances={context.allowances if context.allowances is not None else 'n/a'}",
+            f"error={context.error}",
+        ]
+        self._notify_slack(
+            "warning",
+            f"Balance / allowance rejection: {event_info.short_name}",
+            lines,
+            dedupe_key=f"balance_allowance:{event_info.event_id}:{context.bin_index}:{context.token_id}",
+            cooldown_seconds=(
+                self.slack_notifier.balance_allowance_cooldown_seconds
+                if self.slack_notifier else 0.0
+            ),
+        )
 
     def _build_position_fingerprint(self, bot: GASKellyTradingBot) -> Optional[Tuple[Any, ...]]:
         """Build a compact fingerprint of the bot's synced portfolio state."""
@@ -445,10 +762,12 @@ class MultiEventManager:
                 bot_name = active.info.short_name
 
             try:
-                logger.info(f"[{bot_name}] Running startup tick after stabilization")
-                await asyncio.wait_for(bot.run_sync_driven_tick(), timeout=120.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"[{bot_name}] Startup tick timed out (120s hard limit)")
+                logger.info(f"[{bot_name}] Queueing startup tick after stabilization")
+                bot.request_sync_tick(
+                    source="startup",
+                    data_version=self.shared_data_version,
+                    allow_authoritative_rebase=False,
+                )
             except Exception as e:
                 logger.error(f"[{bot_name}] Error in startup tick: {e}", exc_info=True)
             return
@@ -561,7 +880,9 @@ class MultiEventManager:
         logger.info(f"Pre-fetching {n_days} days of tweet data for all events...")
 
         # Fetch all tweet history once
-        self.shared_event_store.refresh_from_api(n_days)
+        if not self.shared_event_store.refresh_from_api(n_days):
+            logger.warning("Pre-fetch from XTracker returned no usable data")
+            return
 
         # Get data range for logging
         date_range = self.shared_event_store.get_date_range()
@@ -571,7 +892,13 @@ class MultiEventManager:
             )
 
         self._data_prefetched = True
-        self._last_data_refresh_time = datetime.now(self._tz)
+        now = datetime.now(self._tz)
+        self._last_refresh_contract_date = self.contract_utils.get_current_contract_date()
+        self._mark_data_fresh("xtracker", now)
+        self.shared_data_version += 1
+
+        if self.realtime_tracker:
+            self.realtime_tracker.seed_from_official_store(self._last_xtracker_refresh_time)
 
     def is_data_fresh(self) -> Tuple[bool, float]:
         """
@@ -590,7 +917,139 @@ class MultiEventManager:
 
         return is_fresh, age
 
-    async def refresh_shared_data(self) -> int:
+    def _mark_data_fresh(self, source: str, timestamp: Optional[datetime] = None) -> None:
+        ts = timestamp or datetime.now(self._tz)
+        self._last_data_refresh_time = ts
+        self._last_data_refresh_source = source
+        if source == "xtracker":
+            self._last_xtracker_refresh_time = ts
+
+    def _next_shared_data_version(self) -> int:
+        self.shared_data_version += 1
+        return self.shared_data_version
+
+    def _event_overlaps_days(self, event_info: EventInfo, days: Set[date]) -> bool:
+        if not days:
+            return False
+        for contract_day in days:
+            if event_info.market_start_date <= contract_day < event_info.settlement_date:
+                return True
+        return False
+
+    async def _notify_bots_of_fresh_data(self) -> None:
+        """
+        Notify all active trading bots that fresh data is available.
+
+        Bots use this in legacy mode and as a cache invalidation hint.
+        """
+        async with self._events_lock:
+            active_bots = [active.bot for active in self._active_events.values()]
+
+        for bot in active_bots:
+            try:
+                bot.notify_data_refreshed()
+            except Exception as e:
+                logger.debug(f"Error notifying bot of fresh data: {e}")
+
+    def _collect_recent_refresh_days(self) -> Set[date]:
+        contract_today = self.contract_utils.get_current_contract_date()
+        return {contract_today - timedelta(days=1), contract_today}
+
+    def _apply_authoritative_refresh(
+        self,
+        events_by_day: Dict[date, List],
+        affected_days: Set[date],
+    ) -> RefreshOutcome:
+        outcome = RefreshOutcome(affected_days=set(affected_days))
+
+        for contract_day in sorted(affected_days):
+            before = self.shared_event_store.get_contract_day_events(contract_day)
+            before_count = len(before)
+            replaced = self.shared_event_store.replace_official_day(
+                contract_day,
+                events_by_day.get(contract_day, []),
+            )
+            cleared = self.shared_event_store.clear_provisional_day(contract_day)
+            after = self.shared_event_store.get_contract_day_events(contract_day)
+            after_count = len(after)
+            if replaced or cleared or before != after:
+                outcome.effective_changed = True
+            if after_count < before_count:
+                outcome.authoritative_rebase = True
+            outcome.new_events += (after_count - before_count)
+
+        return outcome
+
+    async def _do_full_refresh(self) -> RefreshOutcome:
+        """Do a full authoritative refresh of official tweet data."""
+        n_days = self.config.training_days
+        logger.info(f"Full refresh: fetching {n_days} days of authoritative tweet data...")
+
+        history = self.posts_xtracker_client.fetch_historical(n_days, self.contract_utils)
+        if not history:
+            logger.warning("Full refresh returned no authoritative data")
+            return RefreshOutcome()
+
+        cutoff = self.contract_utils.get_current_contract_date() - timedelta(days=n_days)
+        affected_days = {
+            contract_day
+            for contract_day in (
+                set(self.shared_event_store._official_events) |
+                set(self.shared_event_store._provisional_events) |
+                set(history)
+            )
+            if contract_day >= cutoff
+        }
+        outcome = self._apply_authoritative_refresh(history, affected_days)
+
+        date_range = self.shared_event_store.get_date_range()
+        if date_range[0] and date_range[1]:
+            total_events = sum(
+                len(self.shared_event_store.get_contract_day_events(d))
+                for d in self._date_range_iter(date_range[0], date_range[1])
+            )
+            logger.info(
+                f"Full refresh complete: {total_events} events from "
+                f"{date_range[0]} to {date_range[1]}"
+            )
+
+        return outcome
+
+    async def _do_incremental_refresh(self) -> RefreshOutcome:
+        """
+        Refresh current and previous contract days from authoritative XTracker data.
+        """
+        contract_today = self.contract_utils.get_current_contract_date()
+        api_end_date = contract_today + timedelta(days=1)
+        yesterday = contract_today - timedelta(days=1)
+        contract_days_to_update = {yesterday, contract_today}
+
+        events = self.posts_xtracker_client.fetch_all_events(
+            start_date=yesterday,
+            end_date=api_end_date,
+        )
+        if not events:
+            logger.warning("Incremental refresh returned no authoritative data; keeping provisional overlay")
+            return RefreshOutcome()
+
+        events_by_day: Dict[date, List] = {d: [] for d in contract_days_to_update}
+        for event in events:
+            event_contract_date = self.contract_utils.get_contract_date(event.timestamp)
+            if event_contract_date in events_by_day:
+                events_by_day[event_contract_date].append(event)
+
+        outcome = self._apply_authoritative_refresh(events_by_day, contract_days_to_update)
+        if outcome.effective_changed:
+            logger.info(
+                "Incremental refresh applied for %s (delta=%+d, rebase=%s)",
+                sorted(contract_days_to_update),
+                outcome.new_events,
+                outcome.authoritative_rebase,
+            )
+
+        return outcome
+
+    async def refresh_shared_data(self) -> RefreshOutcome:
         """
         Refresh shared tweet data with latest from API.
 
@@ -601,101 +1060,152 @@ class MultiEventManager:
         After refresh, notifies all active bots that fresh data is available.
 
         Returns:
-            Number of new events added
+            RefreshOutcome describing whether the effective snapshot changed.
         """
         now = datetime.now(self._tz)
         current_contract_date = self.contract_utils.get_current_contract_date()
 
-        # Check if contract day changed (noon ET boundary crossed)
-        contract_day_changed = (
-            self._last_refresh_contract_date is not None and
-            current_contract_date != self._last_refresh_contract_date
-        )
-
-        if contract_day_changed:
-            logger.info(
-                f"Contract day changed: {self._last_refresh_contract_date} -> {current_contract_date}. "
-                f"Triggering full refresh and model refit."
+        async with self._data_update_lock:
+            contract_day_changed = (
+                self._last_refresh_contract_date is not None and
+                current_contract_date != self._last_refresh_contract_date
             )
-            # Do full refresh to capture complete previous day
-            new_events = await self._do_full_refresh()
+            if contract_day_changed:
+                logger.info(
+                    f"Contract day changed: {self._last_refresh_contract_date} -> {current_contract_date}. "
+                    "Triggering full authoritative refresh and model refit."
+                )
+                outcome = await self._do_full_refresh()
+            else:
+                outcome = await self._do_incremental_refresh()
 
-            # Refit models for all active events
+            self._last_refresh_contract_date = current_contract_date
+            self._last_full_refresh = now
+            self._mark_data_fresh("xtracker", now)
+            if outcome.effective_changed:
+                self._next_shared_data_version()
+
+        if contract_day_changed and outcome.affected_days:
             await self._refit_active_event_models()
-        else:
-            # Incremental refresh - just recent data
-            new_events = await self._do_incremental_refresh()
 
-        self._last_refresh_contract_date = current_contract_date
-        self._last_full_refresh = now
+        await self._notify_bots_of_fresh_data()
+        return outcome
 
-        # Only update freshness timestamp if we actually got data
-        # (new_events can be 0 if fetch succeeded but no new posts)
-        # We check for >= 0 because 0 is valid (no new posts), but the fetch
-        # would return early with 0 if it failed
-        if new_events >= 0:
-            self._last_data_refresh_time = now  # Track successful refresh for freshness check
+    async def _queue_sync_tick_requests(
+        self,
+        source: str,
+        affected_days: Set[date],
+        *,
+        allow_authoritative_rebase: bool = False,
+    ) -> None:
+        if not affected_days:
+            return
 
-            # Notify all active bots that fresh data is available
-            # This signals them to recompute Monte Carlo on their next slow tick
-            await self._notify_bots_of_fresh_data()
-
-        return new_events
-
-    async def _notify_bots_of_fresh_data(self) -> None:
-        """
-        Notify all active trading bots that fresh data is available.
-
-        Bots will use this signal to recompute Monte Carlo forecasts
-        on their next slow tick.
-        """
-        # Get snapshot of active bots under lock
-        async with self._events_lock:
-            active_bots = [active.bot for active in self._active_events.values()]
-
-        for bot in active_bots:
-            try:
-                bot.notify_data_refreshed()
-            except Exception as e:
-                logger.debug(f"Error notifying bot of fresh data: {e}")
-
-    async def _trigger_immediate_trading(self) -> None:
-        """
-        Trigger immediate recompute + trade on all active bots IN PARALLEL.
-
-        Unlike _notify_bots_of_fresh_data() which just sets a flag for the next
-        slow tick, this directly calls run_sync_driven_tick() to trade NOW.
-
-        IMPORTANT: Fetches authoritative counts FIRST so bots use the real
-        XTracker count (not just the posts-based count, which can lag).
-
-        Safety: asyncio.gather is safe here because:
-        - Single-threaded asyncio: no true data races, coroutines interleave only at await points
-        - Each bot has its own _tick_lock preventing overlapping ticks
-        - Each event has its own capital pool allocation (no shared mutable state)
-        - Shared clob_client uses synchronous HTTP (one request at a time per await)
-        """
-        # Fetch authoritative counts from trackings API before trading.
-        # This ensures effective_count = max(posts, authoritative) is accurate.
-        await self.validate_all_event_counts()
+        queue_source = "authoritative_rebase" if allow_authoritative_rebase else source
 
         async with self._events_lock:
             active_snapshot = list(self._active_events.items())
 
-        async def _run_bot_tick(event_id: str, active: ActiveEvent):
-            bot = active.bot
-            bot_name = getattr(bot.bot_config, 'event_name', None) or 'unknown'
-            try:
-                if not await self._maybe_wait_for_event_stabilization(event_id, active):
-                    return
-                active.startup_tick_pending = False
-                await asyncio.wait_for(bot.run_sync_driven_tick(), timeout=120.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"[{bot_name}] Sync-driven tick timed out (120s hard limit)")
-            except Exception as e:
-                logger.error(f"[{bot_name}] Error in sync-driven tick: {e}", exc_info=True)
+        async def _queue_for_event(event_id: str, active: ActiveEvent) -> None:
+            if not self._event_overlaps_days(active.info, affected_days):
+                return
+            if not await self._maybe_wait_for_event_stabilization(event_id, active):
+                return
+            active.startup_tick_pending = False
+            active.bot.request_sync_tick(
+                source=queue_source,
+                data_version=self.shared_data_version,
+                allow_authoritative_rebase=allow_authoritative_rebase,
+            )
 
-        await asyncio.gather(*[_run_bot_tick(event_id, active) for event_id, active in active_snapshot])
+        await asyncio.gather(*[_queue_for_event(event_id, active) for event_id, active in active_snapshot])
+
+    async def ingest_realtime_events(self, events: List) -> Tuple[int, Set[date], Optional[RefreshOutcome]]:
+        """
+        Add provisional realtime events and queue affected ticks.
+
+        Returns:
+            Tuple of (inserted_count, affected_days, rollover_refresh_outcome)
+        """
+        inserted = 0
+        affected_days: Set[date] = set()
+        rollover_outcome: Optional[RefreshOutcome] = None
+        now = datetime.now(self._tz)
+
+        async with self._data_update_lock:
+            current_contract_date = self.contract_utils.get_current_contract_date()
+            contract_day_changed = (
+                self._last_refresh_contract_date is not None and
+                current_contract_date != self._last_refresh_contract_date
+            )
+            if contract_day_changed:
+                logger.info("Realtime ingest detected contract-day rollover; refreshing authoritative data first")
+                rollover_outcome = await self._do_full_refresh()
+                self._last_refresh_contract_date = current_contract_date
+                self._last_full_refresh = now
+                self._mark_data_fresh("xtracker", now)
+                if rollover_outcome.effective_changed:
+                    self._next_shared_data_version()
+
+            for event in events:
+                if self.shared_event_store.add_provisional_event(event):
+                    inserted += 1
+                    affected_days.add(self.contract_utils.get_contract_date(event.timestamp))
+
+            if inserted > 0:
+                self._mark_data_fresh("twikit", now)
+                self._next_shared_data_version()
+
+        if rollover_outcome and rollover_outcome.affected_days:
+            await self._refit_active_event_models()
+            await self._notify_bots_of_fresh_data()
+            if rollover_outcome.effective_changed:
+                await self._queue_sync_tick_requests(
+                    "xtracker",
+                    rollover_outcome.affected_days,
+                    allow_authoritative_rebase=rollover_outcome.authoritative_rebase,
+                )
+
+        if inserted > 0:
+            await self._notify_bots_of_fresh_data()
+            await self._queue_sync_tick_requests("realtime", affected_days)
+
+        return inserted, affected_days, rollover_outcome
+
+    async def poll_realtime_tracker(self) -> RealtimePollResult:
+        """Poll the realtime tracker once and apply any provisional events."""
+        if not self.realtime_tracker:
+            return RealtimePollResult(events=[])
+
+        result = await self.realtime_tracker.poll_once()
+        if result.gap_detected:
+            logger.warning("Realtime gap detected; forcing authoritative XTracker refresh")
+            self._notify_slack(
+                "warning",
+                "Realtime gap detected",
+                ["Forcing authoritative XTracker refresh."],
+                dedupe_key="realtime_gap_detected",
+                cooldown_seconds=300.0,
+            )
+            refresh_outcome = await self.refresh_shared_data()
+            if refresh_outcome.effective_changed:
+                await self._queue_sync_tick_requests(
+                    "xtracker",
+                    refresh_outcome.affected_days,
+                    allow_authoritative_rebase=refresh_outcome.authoritative_rebase,
+                )
+            return RealtimePollResult(events=[], gap_detected=True, newest_timestamp=result.newest_timestamp)
+
+        if result.events:
+            inserted, affected_days, _ = await self.ingest_realtime_events(result.events)
+            if inserted > 0:
+                logger.info(
+                    "Realtime tracker inserted %d provisional tweet(s) across %s",
+                    inserted,
+                    sorted(affected_days),
+                )
+
+        return result
 
     async def _enforce_integrity_deadlines(self) -> None:
         """
@@ -744,13 +1254,27 @@ class MultiEventManager:
         # Route fill to the bot's Kelly executor
         try:
             if active.bot.kelly_bot and active.bot.kelly_bot.kelly_executor:
-                active.bot.kelly_bot.kelly_executor.handle_fill(fill_event)
+                kelly_executor = active.bot.kelly_bot.kelly_executor
+                kelly_executor.handle_fill(fill_event)
                 logger.info(
                     f"[{active.info.short_name}][FILL ROUTED] bin={bin_index} | "
                     f"size={fill_event.size:.1f} @ {fill_event.price:.3f}"
                 )
+                self._notify_fill(
+                    active.info,
+                    bin_index,
+                    fill_event,
+                    bin_range=kelly_executor._bin_range(bin_index),
+                )
         except Exception as e:
             logger.error(f"[{active.info.short_name}] Error routing fill bin={bin_index}: {e}", exc_info=True)
+            self._notify_slack(
+                "error",
+                f"Fill routing failed: {active.info.short_name}",
+                [f"bin={bin_index}", str(e)],
+                dedupe_key=f"fill_routing_error:{event_id}:{bin_index}",
+                cooldown_seconds=300.0,
+            )
 
     async def _handle_global_stale_order(self, pending: PendingOrder) -> None:
         """
@@ -779,6 +1303,13 @@ class MultiEventManager:
                 await active.bot.kelly_bot.kelly_executor.handle_stale_order(pending)
         except Exception as e:
             logger.error(f"[{active.info.short_name}] Error handling stale order bin={bin_index}: {e}", exc_info=True)
+            self._notify_slack(
+                "error",
+                f"Stale order handling failed: {active.info.short_name}",
+                [f"bin={bin_index}", str(e)],
+                dedupe_key=f"stale_order_error:{event_id}:{bin_index}",
+                cooldown_seconds=300.0,
+            )
 
     def _register_event_tokens(self, event_info: EventInfo) -> None:
         """
@@ -933,112 +1464,6 @@ class MultiEventManager:
 
         # All checks passed
         return False, ""
-
-    async def _do_full_refresh(self) -> int:
-        """Do a full refresh of tweet data."""
-        n_days = self.config.training_days
-
-        logger.info(f"Full refresh: fetching {n_days} days of tweet data...")
-
-        # Clear and refetch (returns False if rejected due to regression)
-        success = self.shared_event_store.refresh_from_api(n_days)
-        if not success:
-            logger.warning("Full refresh rejected due to data regression")
-            return 0
-
-        date_range = self.shared_event_store.get_date_range()
-        if date_range[0] and date_range[1]:
-            total_events = sum(
-                len(self.shared_event_store.get_contract_day_events(d))
-                for d in self._date_range_iter(date_range[0], date_range[1])
-            )
-            logger.info(
-                f"Full refresh complete: {total_events} events from "
-                f"{date_range[0]} to {date_range[1]}"
-            )
-            return total_events
-
-        return 0
-
-    async def _do_incremental_refresh(self) -> int:
-        """
-        Do incremental refresh of recent tweet data.
-
-        Fetches posts for the last 2-3 calendar days to ensure we capture all posts
-        that might fall into the current or previous contract days.
-
-        Note: Contract days use noon ET boundary, but XTracker API uses UTC calendar dates.
-        So if it's before noon ET, we need to fetch today's calendar date to capture
-        posts from midnight UTC to now.
-
-        Returns:
-            Number of new events compared to before refresh
-        """
-        contract_today = self.contract_utils.get_current_contract_date()
-        # Use contract_today + 1 for API endDate to avoid timezone mismatch.
-        # The XTracker API uses UTC timestamps, so posts from late ET hours
-        # have UTC dates of "tomorrow". Adding 1 day ensures we always capture them.
-        api_end_date = contract_today + timedelta(days=1)
-        yesterday = contract_today - timedelta(days=1)
-
-        # Determine which contract days we're updating
-        contract_days_to_update = [yesterday, contract_today]
-
-        # Get count before refresh for comparison
-        initial_count = sum(
-            len(self.shared_event_store.get_contract_day_events(d))
-            for d in contract_days_to_update
-        )
-
-        # Fetch all posts in date range
-        events = self.posts_xtracker_client.fetch_all_events(
-            start_date=yesterday,
-            end_date=api_end_date,
-        )
-
-        # IMPORTANT: Don't replace cache if fetch failed or returned empty
-        # This prevents count regression when network is unavailable
-        if not events:
-            logger.warning(
-                f"Incremental refresh: no events fetched, keeping cached data. "
-                f"Initial count: {initial_count}"
-            )
-            return 0
-
-        # Group events by contract day
-        events_by_day: Dict[date, List] = {d: [] for d in contract_days_to_update}
-        for event in events:
-            event_contract_date = self.contract_utils.get_contract_date(event.timestamp)
-            if event_contract_date in events_by_day:
-                events_by_day[event_contract_date].append(event)
-
-        # Sanity check: count should never decrease (monotonic tweets)
-        new_total = sum(len(day_events) for day_events in events_by_day.values())
-        if new_total < initial_count:
-            logger.warning(
-                f"Incremental refresh: new count ({new_total}) < old count ({initial_count}). "
-                f"This is suspicious - keeping cached data to avoid regression."
-            )
-            return 0
-
-        # Replace data for each day (not append - avoids duplicates)
-        for contract_date, day_events in events_by_day.items():
-            self.shared_event_store.set_contract_day_events(contract_date, day_events)
-
-        # Count after refresh
-        final_count = sum(
-            len(self.shared_event_store.get_contract_day_events(d))
-            for d in contract_days_to_update
-        )
-
-        new_events = final_count - initial_count
-        if new_events != 0:
-            logger.info(
-                f"Incremental refresh: {'+' if new_events > 0 else ''}{new_events} events "
-                f"(fetched {yesterday} to {api_end_date}, contract days: {contract_days_to_update})"
-            )
-
-        return max(0, new_events)
 
     def _date_range_iter(self, start: date, end: date):
         """Iterate over dates in range."""
@@ -1444,6 +1869,16 @@ class MultiEventManager:
 
         # Setup bot (expensive, do outside lock)
         await bot.setup(event_info.bins)
+        if (
+            bot.kelly_bot and
+            bot.kelly_bot.kelly_executor is not None
+        ):
+            bot.kelly_bot.kelly_executor.on_balance_allowance_error = (
+                lambda context, event_info=event_info: self._notify_balance_allowance_error(
+                    event_info,
+                    context,
+                )
+            )
 
         # CRITICAL: Sync existing positions from API into the Kelly portfolio
         # This ensures collateral tracking works correctly for restored positions
@@ -1507,6 +1942,7 @@ class MultiEventManager:
             f"Active events: {num_active}, "
             f"Pool available: ${self.capital_pool.available_capital:.2f}"
         )
+        self._notify_event_started(event_info, allocated_capital, num_active)
 
     async def _run_event(
         self,
@@ -1527,6 +1963,14 @@ class MultiEventManager:
         except Exception as e:
             logger.error(f"Event {event_id} error: {e}", exc_info=True)
             self._errors_count += 1
+            event_name = getattr(bot.bot_config, "event_name", event_id)
+            self._notify_slack(
+                "error",
+                f"Event runtime error: {event_name}",
+                [str(e)],
+                dedupe_key=f"event_runtime_error:{event_id}",
+                cooldown_seconds=300.0,
+            )
         finally:
             await self._cleanup_event(event_id, bot)
 
@@ -1543,11 +1987,13 @@ class MultiEventManager:
             bot: Trading bot for this event
         """
         final_value = 0.0
+        event_info: Optional[EventInfo] = None
 
         # Unregister token_ids for fill routing
         async with self._events_lock:
             if event_id in self._active_events:
-                self._unregister_event_tokens(self._active_events[event_id].info)
+                event_info = self._active_events[event_id].info
+                self._unregister_event_tokens(event_info)
 
         try:
             # Get the original allocation for this event
@@ -1605,6 +2051,8 @@ class MultiEventManager:
                 f"Active events: {num_active}, "
                 f"Pool available: ${self.capital_pool.available_capital:.2f}"
             )
+            if event_info is not None:
+                self._notify_event_completed(event_info, final_value, num_active)
 
             # Try to start pending events with freed capital
             if self._running:
@@ -1666,6 +2114,7 @@ class MultiEventManager:
 
         # Log initial health status
         self._log_health()
+        self._notify_startup()
 
         # Main loop: poll lastSync + periodic tasks
         while self._running:
@@ -1727,13 +2176,17 @@ class MultiEventManager:
                             f"(debounced {(sync_detected_at - debounce_start).total_seconds():.1f}s)"
                         )
 
-                        # 1. Refresh posts
-                        await self.refresh_shared_data()
+                        refresh_outcome = await self.refresh_shared_data()
+                        if refresh_outcome.effective_changed:
+                            await self._queue_sync_tick_requests(
+                                "xtracker",
+                                refresh_outcome.affected_days,
+                                allow_authoritative_rebase=refresh_outcome.authoritative_rebase,
+                            )
+                        else:
+                            logger.info("Authoritative refresh made no effective event-store changes")
 
-                        # 2. Trigger immediate trading on all bots
-                        await self._trigger_immediate_trading()
-
-                        # 3. Log cycle timing (soft deadline — always completes)
+                        # 2. Log cycle timing (soft deadline — always completes)
                         elapsed = (datetime.now(self._tz) - sync_detected_at).total_seconds()
                         logger.info(f"Sync→trade cycle completed in {elapsed:.1f}s")
                         if elapsed > self.config.sync_trade_deadline_seconds:
@@ -1744,6 +2197,10 @@ class MultiEventManager:
 
                 # --- Periodic tasks (timer-based, unchanged) ---
                 now = datetime.now(self._tz)
+
+                if self.realtime_tracker and self.realtime_tracker.should_poll(now):
+                    await self.poll_realtime_tracker()
+                    now = datetime.now(self._tz)
 
                 # Count validation (15 min)
                 if (now - last_count_validation).total_seconds() >= self.config.count_validation_interval:
@@ -1774,6 +2231,8 @@ class MultiEventManager:
                 # Capital values + status (every poll cycle)
                 await self._update_capital_values()
                 self._log_status()
+                self._maybe_notify_health()
+                self._maybe_flush_fill_summaries()
 
                 # --- Sleep until next poll (interruptible by stop_event) ---
                 try:
@@ -1789,6 +2248,13 @@ class MultiEventManager:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 self._errors_count += 1
+                self._notify_slack(
+                    "error",
+                    "Main loop error",
+                    [str(e)],
+                    dedupe_key="multi_event_manager_main_loop",
+                    cooldown_seconds=300.0,
+                )
                 await asyncio.sleep(60)  # Back off on error
 
         # Shutdown
@@ -1800,6 +2266,13 @@ class MultiEventManager:
             await self._initialize_capital_from_api()
         except Exception as e:
             logger.warning(f"Capital re-sync failed: {e}")
+            self._notify_slack(
+                "warning",
+                "Capital re-sync failed",
+                [str(e)],
+                dedupe_key="capital_resync_failed",
+                cooldown_seconds=1800.0,
+            )
 
     async def _update_capital_values(self) -> None:
         """Update capital pool with current portfolio values."""
@@ -1858,6 +2331,7 @@ class MultiEventManager:
             await self.user_stream.stop()
             logger.info("Global UserStreamClient stopped")
 
+        self._maybe_flush_fill_summaries(force=True)
         self._running = False
         logger.info("MultiEventManager shutdown complete")
 
@@ -1891,6 +2365,16 @@ class MultiEventManager:
             "running": self._running,
             "capital_pool": self.capital_pool.get_summary(),
             "performance": self.capital_pool.get_performance_summary(),
+            "shared_data_version": self.shared_data_version,
+            "last_data_refresh_time": (
+                self._last_data_refresh_time.isoformat()
+                if self._last_data_refresh_time else None
+            ),
+            "last_data_refresh_source": self._last_data_refresh_source,
+            "last_xtracker_refresh_time": (
+                self._last_xtracker_refresh_time.isoformat()
+                if self._last_xtracker_refresh_time else None
+            ),
             "active_events": active_events,
             "pending_events": list(self._pending_events.keys()),
             "completed_events": self._completed_events,
@@ -1929,12 +2413,46 @@ class MultiEventManager:
 
         # EventStore stats
         event_store_dates = 0
-        event_store_total_events = 0
+        event_store_official_events = 0
+        event_store_provisional_events = 0
+        event_store_effective_events = 0
         with self.shared_event_store._lock:
-            event_store_dates = len(self.shared_event_store._events)
-            event_store_total_events = sum(
-                len(events) for events in self.shared_event_store._events.values()
+            all_dates = (
+                set(self.shared_event_store._official_events) |
+                set(self.shared_event_store._provisional_events)
             )
+            event_store_dates = len(all_dates)
+            event_store_official_events = sum(
+                len(events) for events in self.shared_event_store._official_events.values()
+            )
+            event_store_provisional_events = sum(
+                len(events) for events in self.shared_event_store._provisional_events.values()
+            )
+            event_store_effective_events = sum(
+                len(self.shared_event_store._merged_events_for_day(contract_date))
+                for contract_date in all_dates
+            )
+
+        realtime_status = None
+        if self.realtime_tracker is not None:
+            realtime_status = {
+                "enabled": True,
+                "last_poll_time": (
+                    self.realtime_tracker.last_poll_time.isoformat()
+                    if self.realtime_tracker.last_poll_time else None
+                ),
+                "watermark": (
+                    self.realtime_tracker.watermark.isoformat()
+                    if self.realtime_tracker.watermark else None
+                ),
+                "consecutive_errors": self.realtime_tracker.consecutive_errors,
+                "backoff_until": (
+                    self.realtime_tracker.backoff_until.isoformat()
+                    if self.realtime_tracker.backoff_until else None
+                ),
+            }
+        else:
+            realtime_status = {"enabled": False}
 
         # Capital pool stats
         pool_summary = self.capital_pool.get_summary()
@@ -1977,7 +2495,9 @@ class MultiEventManager:
             # Resource usage
             "memory_mb": round(memory_mb, 2) if memory_mb else None,
             "event_store_days": event_store_dates,
-            "event_store_total_tweets": event_store_total_events,
+            "event_store_official_tweets": event_store_official_events,
+            "event_store_provisional_tweets": event_store_provisional_events,
+            "event_store_total_tweets": event_store_effective_events,
 
             # Capital
             "total_capital": pool_summary.get("total_capital", 0),
@@ -1988,6 +2508,16 @@ class MultiEventManager:
             # Maintenance
             "last_cleanup_hours_ago": round(time_since_cleanup, 2) if time_since_cleanup else None,
             "errors_count": self._errors_count,
+            "shared_data_version": self.shared_data_version,
+            "last_data_refresh_time": (
+                self._last_data_refresh_time.isoformat()
+                if self._last_data_refresh_time else None
+            ),
+            "last_data_refresh_source": self._last_data_refresh_source,
+            "last_xtracker_refresh_time": (
+                self._last_xtracker_refresh_time.isoformat()
+                if self._last_xtracker_refresh_time else None
+            ),
 
             # Active event details
             "active_event_names": [
@@ -1998,6 +2528,7 @@ class MultiEventManager:
 
             # User stream status - get detailed status if available
             "user_stream": self._get_user_stream_status(),
+            "realtime_tracker": realtime_status,
         }
 
     def _get_user_stream_status(self) -> Dict[str, Any]:
@@ -2052,11 +2583,25 @@ class MultiEventManager:
         logger.info("  RESOURCES:")
         if health['memory_mb']:
             logger.info(f"    Memory: {health['memory_mb']:.1f} MB")
-        logger.info(f"    EventStore: {health['event_store_days']} days, {health['event_store_total_tweets']} tweets")
+        logger.info(
+            "    EventStore: %s days, %s effective tweets (%s official, %s provisional)",
+            health['event_store_days'],
+            health['event_store_total_tweets'],
+            health['event_store_official_tweets'],
+            health['event_store_provisional_tweets'],
+        )
         logger.info(f"    Completed history: {health['completed_events_in_history']} events")
         if health['last_cleanup_hours_ago']:
             logger.info(f"    Last cleanup: {health['last_cleanup_hours_ago']:.1f} hours ago")
         logger.info(f"    Errors: {health['errors_count']}")
+        logger.info(
+            "    Data freshness: source=%s version=%s refreshed_at=%s",
+            health.get('last_data_refresh_source'),
+            health.get('shared_data_version'),
+            health.get('last_data_refresh_time'),
+        )
+        if health.get('last_xtracker_refresh_time'):
+            logger.info(f"    Last XTracker refresh: {health['last_xtracker_refresh_time']}")
         logger.info("")
         logger.info("  USER STREAM:")
         user_stream = health.get('user_stream', {})
@@ -2068,6 +2613,16 @@ class MultiEventManager:
         last_msg = user_stream.get('last_message_age_seconds')
         if last_msg is not None:
             logger.info(f"    Last message: {last_msg:.0f}s ago")
+        logger.info("")
+        logger.info("  REALTIME TRACKER:")
+        realtime = health.get('realtime_tracker', {})
+        logger.info(f"    Enabled: {realtime.get('enabled', False)}")
+        if realtime.get('enabled', False):
+            logger.info(f"    Last poll: {realtime.get('last_poll_time')}")
+            logger.info(f"    Watermark: {realtime.get('watermark')}")
+            logger.info(f"    Consecutive errors: {realtime.get('consecutive_errors')}")
+            if realtime.get('backoff_until'):
+                logger.info(f"    Backoff until: {realtime.get('backoff_until')}")
         logger.info("=" * 70)
 
     async def fetch_all_positions(self) -> Dict[str, dict]:

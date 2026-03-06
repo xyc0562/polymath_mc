@@ -21,7 +21,7 @@ import math
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Callable, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
@@ -213,6 +213,38 @@ class IntegrityState:
     unmatched_api_delta_count: int = 0
 
 
+@dataclass
+class BalanceAllowanceErrorContext:
+    """Structured context for balance / allowance order rejections."""
+
+    event_name: str
+    action: str
+    side: str
+    token_type: str
+    bin_index: int
+    bin_range: str
+    token_id: str
+    requested_size: float
+    requested_price: float
+    requested_limit_price: float
+    requested_notional: float
+    reservation_price: float
+    edge: float
+    utility_gain: float
+    error: str
+    portfolio_available_capital: Optional[float] = None
+    portfolio_total_collateral: Optional[float] = None
+    pending_orders_count: int = 0
+    local_yes_shares: float = 0.0
+    local_no_shares: float = 0.0
+    local_yes_avg_cost: float = 0.0
+    local_no_avg_cost: float = 0.0
+    clob_available_shares: Optional[float] = None
+    nonzero_allowances: Optional[int] = None
+    raw_balance: Optional[str] = None
+    allowances: Optional[Dict[str, Any]] = None
+
+
 class OrderExecutor:
     """
     Handles order execution via Polymarket CLOB.
@@ -283,18 +315,26 @@ class OrderExecutor:
             )
             return None
 
-    def log_sell_balance_diagnostics(self, token_id: str, requested_size: float) -> None:
-        """
-        Log CLOB conditional balance/allowance snapshot after sell rejection.
-
-        This helps distinguish local-position mismatch from exchange available-balance issues.
-        """
+    def get_sell_balance_diagnostics(
+        self,
+        token_id: str,
+        requested_size: float,
+    ) -> Dict[str, Any]:
+        """Return exchange-side diagnostics for sell balance / allowance failures."""
+        diagnostics: Dict[str, Any] = {
+            "token_id": token_id,
+            "requested_size": requested_size,
+            "clob_available_shares": None,
+            "nonzero_allowances": None,
+            "raw_balance": None,
+            "allowances": None,
+        }
         balance_info = self._fetch_conditional_balance_allowance(token_id=token_id, refresh=True)
-        if not balance_info:
-            return
+        if not isinstance(balance_info, dict):
+            return diagnostics
 
         available_shares = self._parse_conditional_balance_shares(balance_info)
-        allowances = balance_info.get("allowances", {}) if isinstance(balance_info, dict) else {}
+        allowances = balance_info.get("allowances", {})
         nonzero_spenders = 0
         if isinstance(allowances, dict):
             for value in allowances.values():
@@ -304,6 +344,28 @@ class OrderExecutor:
                 except Exception:
                     continue
 
+        diagnostics.update(
+            {
+                "clob_available_shares": available_shares,
+                "nonzero_allowances": nonzero_spenders,
+                "raw_balance": balance_info.get("balance"),
+                "allowances": allowances if isinstance(allowances, dict) else None,
+            }
+        )
+        return diagnostics
+
+    def log_sell_balance_diagnostics(self, token_id: str, requested_size: float) -> Dict[str, Any]:
+        """
+        Log CLOB conditional balance/allowance snapshot after sell rejection.
+
+        This helps distinguish local-position mismatch from exchange available-balance issues.
+        """
+        diagnostics = self.get_sell_balance_diagnostics(
+            token_id=token_id,
+            requested_size=requested_size,
+        )
+        available_shares = diagnostics.get("clob_available_shares")
+        nonzero_spenders = diagnostics.get("nonzero_allowances")
         if available_shares is None:
             logger.warning(
                 f"[{self.event_name}] Sell rejection diagnostics: token={token_id[:16]}..., "
@@ -316,6 +378,7 @@ class OrderExecutor:
                 f"requested={requested_size:.2f}, clob_balance={available_shares:.2f}, "
                 f"nonzero_allowances={nonzero_spenders}"
             )
+        return diagnostics
 
     def place_limit_order(
         self,
@@ -715,6 +778,7 @@ class KellyExecutor:
         token_ids: Dict[int, str] = None,
         no_token_ids: Optional[Dict[int, str]] = None,
         on_trade: Optional[Callable[[ExecutionResult], None]] = None,
+        on_balance_allowance_error: Optional[Callable[[BalanceAllowanceErrorContext], None]] = None,
         user_stream: Optional["UserStreamClient"] = None,
         sync_portfolio: Optional[Callable[[], None]] = None,
         event_name: Optional[str] = None,
@@ -736,6 +800,7 @@ class KellyExecutor:
             token_ids: Map of bin_index -> YES token_id
             no_token_ids: Map of bin_index -> NO token_id (for BUY_NO/SELL_NO)
             on_trade: Optional callback for trade notifications
+            on_balance_allowance_error: Optional callback for balance / allowance rejections
             user_stream: Optional UserStreamClient for fill confirmations
             sync_portfolio: Callback to sync portfolio from API before each decision
             event_name: Optional event name for logging (e.g., "Feb 03 - Feb 10")
@@ -750,6 +815,7 @@ class KellyExecutor:
         self.token_ids = token_ids or {}
         self.no_token_ids = no_token_ids or {}  # NO token IDs
         self.on_trade = on_trade
+        self.on_balance_allowance_error = on_balance_allowance_error
         self.user_stream = user_stream
         self.sync_portfolio = sync_portfolio  # Callback to sync from API before each decision
         self.event_name = event_name or "unknown"
@@ -890,6 +956,55 @@ class KellyExecutor:
     def _is_sell_balance_error(self, error_msg: str) -> bool:
         msg = (error_msg or "").lower()
         return "not enough balance" in msg or "allowance" in msg
+
+    def _emit_balance_allowance_error(
+        self,
+        candidate: TradeCandidate,
+        token_id: str,
+        error_msg: str,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit structured context for balance / allowance rejections."""
+        if not self.on_balance_allowance_error:
+            return
+
+        position = self.portfolio.get_position(candidate.bin_index) if self.portfolio else None
+        side = "BUY" if candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+        token_type = "YES" if candidate.action in (TradeAction.BUY_YES, TradeAction.SELL_YES) else "NO"
+        context = BalanceAllowanceErrorContext(
+            event_name=self.event_name,
+            action=candidate.action.value,
+            side=side,
+            token_type=token_type,
+            bin_index=candidate.bin_index,
+            bin_range=self._bin_range(candidate.bin_index),
+            token_id=token_id,
+            requested_size=candidate.size,
+            requested_price=candidate.price,
+            requested_limit_price=candidate.limit_price if candidate.limit_price > 0 else candidate.price,
+            requested_notional=candidate.size * candidate.price,
+            reservation_price=candidate.reservation_price,
+            edge=candidate.edge,
+            utility_gain=candidate.utility_gain,
+            error=error_msg,
+            portfolio_available_capital=self.portfolio.available_capital if self.portfolio else None,
+            portfolio_total_collateral=self.portfolio.total_collateral_used if self.portfolio else None,
+            pending_orders_count=len(self._pending_orders),
+            local_yes_shares=position.yes_shares if position else 0.0,
+            local_no_shares=position.no_shares if position else 0.0,
+            local_yes_avg_cost=position.yes_avg_cost if position else 0.0,
+            local_no_avg_cost=position.no_avg_cost if position else 0.0,
+            clob_available_shares=(diagnostics or {}).get("clob_available_shares"),
+            nonzero_allowances=(diagnostics or {}).get("nonzero_allowances"),
+            raw_balance=(diagnostics or {}).get("raw_balance"),
+            allowances=(diagnostics or {}).get("allowances"),
+        )
+        try:
+            self.on_balance_allowance_error(context)
+        except Exception as e:
+            logger.warning(
+                f"[{self.event_name}] Balance/allowance error callback failed: {e}"
+            )
 
     def _warm_balance_cache(self, token_id: str) -> None:
         """Proactively refresh CLOB balance cache for a token after a BUY fill."""
@@ -1819,15 +1934,23 @@ class KellyExecutor:
 
                     if not order_id and error_msg:
                         self._record_fak_failure(trade.bin_index)
-                        if self._is_sell_balance_error(error_msg) and trade.action in (
-                            TradeAction.SELL_YES,
-                            TradeAction.SELL_NO,
-                        ):
-                            self.order_executor.log_sell_balance_diagnostics(
+                        if self._is_sell_balance_error(error_msg):
+                            diagnostics = None
+                            if trade.action in (
+                                TradeAction.SELL_YES,
+                                TradeAction.SELL_NO,
+                            ):
+                                diagnostics = self.order_executor.log_sell_balance_diagnostics(
+                                    token_id=token_id,
+                                    requested_size=trade.size,
+                                )
+                                saw_sell_balance_error = True
+                            self._emit_balance_allowance_error(
+                                candidate=trade,
                                 token_id=token_id,
-                                requested_size=trade.size,
+                                error_msg=error_msg,
+                                diagnostics=diagnostics,
                             )
-                            saw_sell_balance_error = True
 
                     if order_id:
                         tracked_trade = self._clone_candidate(trade)

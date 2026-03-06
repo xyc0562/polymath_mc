@@ -28,6 +28,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+SYNC_TICK_SOURCE_PRIORITY = {
+    "startup": 0,
+    "realtime": 1,
+    "xtracker": 2,
+    "authoritative_rebase": 3,
+}
+
 
 def _get_wallet_for_positions() -> Optional[str]:
     """
@@ -88,13 +95,22 @@ class TradingBotConfig:
 
     # Sync-driven mode: bot is idle between XTracker sync updates.
     # When True, run() becomes an idle loop; trading is driven by
-    # manager calling run_sync_driven_tick().
+    # manager queueing TickRequest objects via request_sync_tick().
     sync_driven: bool = False
 
     # Legacy alias for slow_tick_interval_seconds
     @property
     def tick_interval_seconds(self) -> int:
         return self.slow_tick_interval_seconds
+
+
+@dataclass
+class TickRequest:
+    """Queued sync-driven tick request from the manager."""
+
+    source: str
+    data_version: int
+    allow_authoritative_rebase: bool = False
 
 
 class GASKellyTradingBot:
@@ -176,6 +192,10 @@ class GASKellyTradingBot:
         # Lock to prevent concurrent tick execution
         self._tick_lock = asyncio.Lock()
         self._tick_in_progress = False
+        self._sync_tick_event = asyncio.Event()
+        self._pending_sync_tick: Optional[TickRequest] = None
+        self._last_processed_data_version: int = 0
+        self._last_processed_tick_source: Optional[str] = None
 
         # WebSocket-triggered trading
         self._pending_ws_tick = False  # Flag to schedule a tick from WS callback
@@ -214,7 +234,7 @@ class GASKellyTradingBot:
         """
         self._data_freshness_checker = checker
 
-    def set_authoritative_count(self, count: int) -> None:
+    def set_authoritative_count(self, count: int) -> bool:
         """
         Set the authoritative count from XTracker trackings API.
 
@@ -230,9 +250,11 @@ class GASKellyTradingBot:
                 f"Authoritative count regressed: {self._authoritative_count} -> {count}. "
                 f"Keeping higher value."
             )
-            return
+            return False
+        changed = self._authoritative_count != count
         self._authoritative_count = count
         logger.debug(f"Updated authoritative count: {count}")
+        return changed
 
     def get_effective_count_for_dead_bins(self, computed_count: int) -> int:
         """
@@ -266,6 +288,82 @@ class GASKellyTradingBot:
         """
         self._fresh_data_available = True
         logger.debug("Bot notified of fresh data from upstream manager")
+
+    @staticmethod
+    def _sync_tick_priority(source: Optional[str]) -> int:
+        if source is None:
+            return -1
+        return SYNC_TICK_SOURCE_PRIORITY.get(source, -1)
+
+    def request_sync_tick(
+        self,
+        source: str,
+        data_version: int,
+        *,
+        allow_authoritative_rebase: bool = False,
+    ) -> None:
+        """
+        Queue a sync-driven tick request.
+
+        Requests are coalesced so the bot will process at most one follow-up tick
+        after any in-flight execution, using the newest data version and the
+        highest-priority source that arrived in the meantime.
+        """
+        request = TickRequest(
+            source=source,
+            data_version=data_version,
+            allow_authoritative_rebase=allow_authoritative_rebase,
+        )
+        self._fresh_data_available = True
+
+        pending = self._pending_sync_tick
+        if pending is None:
+            self._pending_sync_tick = request
+        else:
+            pending_priority = self._sync_tick_priority(pending.source)
+            request_priority = self._sync_tick_priority(request.source)
+            merged = TickRequest(
+                source=pending.source,
+                data_version=max(pending.data_version, request.data_version),
+                allow_authoritative_rebase=(
+                    pending.allow_authoritative_rebase or
+                    request.allow_authoritative_rebase
+                ),
+            )
+            if (
+                request.data_version > pending.data_version or
+                request_priority > pending_priority
+            ):
+                merged.source = request.source
+            self._pending_sync_tick = merged
+
+        self._sync_tick_event.set()
+
+    def _pop_pending_sync_tick(self) -> Optional[TickRequest]:
+        request = self._pending_sync_tick
+        self._pending_sync_tick = None
+        if self._pending_sync_tick is None:
+            self._sync_tick_event.clear()
+        return request
+
+    async def _execute_tick(
+        self,
+        *,
+        log_header: bool,
+        recompute: bool,
+        allow_authoritative_rebase: bool = False,
+    ) -> Optional[TickResult]:
+        async with self._tick_lock:
+            self._tick_in_progress = True
+            try:
+                if recompute:
+                    self._recompute_monte_carlo()
+                return await self._run_tick_impl(
+                    log_header=log_header,
+                    allow_authoritative_rebase=allow_authoritative_rebase,
+                )
+            finally:
+                self._tick_in_progress = False
 
     def _get_probabilities(
         self,
@@ -392,7 +490,7 @@ class GASKellyTradingBot:
         if self._tick_in_progress:
             return
 
-        # In sync-driven mode, trading is triggered by the manager (run_sync_driven_tick),
+        # In sync-driven mode, trading is triggered by the manager's tick queue,
         # not by orderbook updates. Skip WS-triggered ticks entirely.
         if self.bot_config.sync_driven:
             return
@@ -422,6 +520,51 @@ class GASKellyTradingBot:
 
         # Run the tick (uses cached probabilities, minimal logging)
         await self.run_tick(log_header=False)
+
+    async def _execute_sync_tick_request(self, request: TickRequest) -> Optional[TickResult]:
+        """Process one coalesced sync-driven tick request."""
+        if request.data_version < self._last_processed_data_version:
+            logger.debug(
+                "Skipping stale sync tick request: source=%s version=%s last_processed=%s",
+                request.source,
+                request.data_version,
+                self._last_processed_data_version,
+            )
+            return None
+
+        if (
+            request.data_version == self._last_processed_data_version and
+            not request.allow_authoritative_rebase and
+            self._sync_tick_priority(request.source) <=
+            self._sync_tick_priority(self._last_processed_tick_source)
+        ):
+            logger.debug(
+                "Skipping duplicate sync tick request: source=%s version=%s",
+                request.source,
+                request.data_version,
+            )
+            return None
+
+        self._tick_count += 1
+        logger.info(
+            "=== Sync-Driven Tick %s (%s, data_version=%s) ===",
+            self._tick_count,
+            request.source,
+            request.data_version,
+        )
+
+        result = await self._execute_tick(
+            log_header=True,
+            recompute=True,
+            allow_authoritative_rebase=request.allow_authoritative_rebase,
+        )
+        self._last_processed_data_version = max(
+            self._last_processed_data_version,
+            request.data_version,
+        )
+        self._last_processed_tick_source = request.source
+        self._fresh_data_available = False
+        return result
 
     async def setup(self, bins: List[Dict]) -> None:
         """
@@ -517,6 +660,9 @@ class GASKellyTradingBot:
         """Shutdown the trading bot."""
         logger.info("Shutting down GAS-Kelly trading bot...")
         self._running = False
+        self._sync_tick_event.set()
+        if self._stop_event:
+            self._stop_event.set()
 
         if self.kelly_bot:
             await self.kelly_bot.shutdown()
@@ -627,14 +773,16 @@ class GASKellyTradingBot:
             logger.debug("Tick already in progress, skipping")
             return None
 
-        async with self._tick_lock:
-            self._tick_in_progress = True
-            try:
-                return await self._run_tick_impl(log_header=log_header)
-            finally:
-                self._tick_in_progress = False
+        return await self._execute_tick(
+            log_header=log_header,
+            recompute=False,
+        )
 
-    async def _run_tick_impl(self, log_header: bool = True) -> Optional[TickResult]:
+    async def _run_tick_impl(
+        self,
+        log_header: bool = True,
+        allow_authoritative_rebase: bool = False,
+    ) -> Optional[TickResult]:
         """
         Internal tick implementation (called with lock held).
 
@@ -653,7 +801,6 @@ class GASKellyTradingBot:
                         f"Waiting for fresh data..."
                     )
                     return TickResult(
-                        tick_start_time=tick_start,
                         num_candidates=0,
                         num_executed=0,
                         total_utility_gain=0.0,
@@ -669,18 +816,25 @@ class GASKellyTradingBot:
 
             # 2b. Check for count regression (impossible for tweets - indicates stale data)
             if self._last_known_count is not None and current_count < self._last_known_count:
-                logger.warning(
-                    f"Count regressed from {self._last_known_count} to {current_count}! "
-                    f"This indicates stale/corrupted data. Skipping trading tick."
-                )
-                return TickResult(
-                    tick_start_time=tick_start,
-                    num_candidates=0,
-                    num_executed=0,
-                    total_utility_gain=0.0,
-                    executions=[],
-                    elapsed_seconds=0.0,
-                )
+                if allow_authoritative_rebase:
+                    logger.info(
+                        "Authoritative rebase accepted: count %s -> %s",
+                        self._last_known_count,
+                        current_count,
+                    )
+                    self._last_known_count = current_count
+                else:
+                    logger.warning(
+                        f"Count regressed from {self._last_known_count} to {current_count}! "
+                        f"This indicates stale/corrupted data. Skipping trading tick."
+                    )
+                    return TickResult(
+                        num_candidates=0,
+                        num_executed=0,
+                        total_utility_gain=0.0,
+                        executions=[],
+                        elapsed_seconds=0.0,
+                    )
 
             # Update last known count
             if current_count > (self._last_known_count or 0):
@@ -708,7 +862,6 @@ class GASKellyTradingBot:
             if self._cached_forecast_mean is None:
                 logger.warning("Forecast not available, skipping trading tick")
                 return TickResult(
-                    tick_start_time=tick_start,
                     num_candidates=0,
                     num_executed=0,
                     total_utility_gain=0.0,
@@ -969,21 +1122,19 @@ class GASKellyTradingBot:
         This is called by MultiEventManager when lastSync changes.
         Always recomputes Monte Carlo and runs full Kelly optimization.
         """
-        self._tick_count += 1
-        logger.info(f"=== Sync-Driven Tick {self._tick_count} ===")
-
-        # Always recompute Monte Carlo (we know data is fresh)
-        self._recompute_monte_carlo()
-
-        # Run full trading tick with logging
-        return await self.run_tick(log_header=True)
+        request = TickRequest(
+            source="xtracker",
+            data_version=self._last_processed_data_version + 1,
+            allow_authoritative_rebase=False,
+        )
+        return await self._execute_sync_tick_request(request)
 
     async def run(self) -> None:
         """
         Main trading loop.
 
         In sync-driven mode (sync_driven=True):
-        - Bot is idle, waiting for manager to call run_sync_driven_tick()
+        - Bot is idle, waiting for manager to queue TickRequest updates
         - Only checks for settlement/stop periodically
 
         In legacy mode (sync_driven=False):
@@ -1014,12 +1165,28 @@ class GASKellyTradingBot:
                     logger.info("Past settlement time, stopping")
                     break
 
-                # Idle — just wait for stop signal or periodic check (60s)
+                request = self._pop_pending_sync_tick()
+                if request is not None:
+                    await self._execute_sync_tick_request(request)
+                    continue
+
+                stop_wait = asyncio.create_task(self._stop_event.wait())
+                tick_wait = asyncio.create_task(self._sync_tick_event.wait())
+                done = set()
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=60)
-                    break  # Stop requested
-                except asyncio.TimeoutError:
-                    pass
+                    done, pending = await asyncio.wait(
+                        {stop_wait, tick_wait},
+                        timeout=60.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in (stop_wait, tick_wait):
+                        if task not in done:
+                            task.cancel()
+                    await asyncio.gather(stop_wait, tick_wait, return_exceptions=True)
+
+                if self._stop_event.is_set():
+                    break
 
             except asyncio.CancelledError:
                 logger.info("Sync-driven loop cancelled")
@@ -1104,16 +1271,17 @@ class GASKellyTradingBot:
 
         logger.info(f"=== Slow Tick {self._tick_count} at {tick_start.isoformat()} ===")
 
-        # Recompute Monte Carlo only if upstream manager signaled fresh data
-        if self._fresh_data_available:
+        recompute = self._fresh_data_available
+        if recompute:
             logger.info("Fresh data available from upstream manager")
             self._fresh_data_available = False  # Reset flag
-            self._recompute_monte_carlo()
         else:
             logger.debug("No fresh data, using cached probabilities")
 
-        # Run the tick (will use cached probabilities)
-        return await self.run_tick()
+        return await self._execute_tick(
+            log_header=True,
+            recompute=recompute,
+        )
 
     async def _run_fast_tick(self) -> Optional[TickResult]:
         """
@@ -1242,6 +1410,7 @@ class GASKellyTradingBot:
         self._running = False
         if hasattr(self, '_stop_event') and self._stop_event:
             self._stop_event.set()
+        self._sync_tick_event.set()
 
     def get_state_summary(self) -> Dict:
         """
