@@ -612,7 +612,22 @@ async def fetch_event_details(
     )
 
 
-def parse_args() -> argparse.Namespace:
+def build_collateral_config(
+    *,
+    max_per_event: Optional[float],
+    capital_multiplier: float,
+) -> CollateralConfig:
+    """Build Kelly collateral config from CLI values."""
+    return CollateralConfig(
+        c_event_max=(
+            max_per_event
+            if max_per_event is not None else CollateralConfig.c_event_max
+        ),
+        capital_multiplier=capital_multiplier,
+    )
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Run multi-event trading bot with shared capital pool"
@@ -627,9 +642,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-per-event",
+        "--c-event-max",
+        dest="max_per_event",
         type=float,
         default=None,
-        help="Maximum capital per event (default: from KellyConfig.collateral.c_event_max)",
+        help="Maximum capital per event / Kelly c_event_max (default: KellyConfig.collateral.c_event_max)",
     )
     parser.add_argument(
         "--min-allocation",
@@ -811,7 +828,7 @@ def parse_args() -> argparse.Namespace:
         help="List all active Musk tweet events with IDs and exit",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 async def main() -> None:
@@ -892,7 +909,8 @@ async def main() -> None:
         require_two_sided_liquidity=not args.no_require_two_sided,
     )
 
-    collateral_config = CollateralConfig(
+    collateral_config = build_collateral_config(
+        max_per_event=args.max_per_event,
         capital_multiplier=args.capital_multiplier,
     )
 
@@ -912,8 +930,9 @@ async def main() -> None:
         collateral=collateral_config,
     )
 
-    # max_per_event: CLI override or kelly_config default
-    max_per_event = args.max_per_event if args.max_per_event is not None else kelly_config.collateral.c_event_max
+    # Kelly collateral cap is the source of truth for both Kelly sizing and
+    # the manager's per-event allocation limit.
+    max_per_event = kelly_config.collateral.c_event_max
     logger.info(f"Max capital per event: ${max_per_event:.2f}")
 
     capital_pool_config = CapitalPoolConfig(
