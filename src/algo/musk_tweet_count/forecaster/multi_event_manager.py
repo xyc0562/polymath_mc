@@ -14,6 +14,7 @@ Key features:
 
 import asyncio
 import logging
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
@@ -458,6 +459,38 @@ class MultiEventManager:
         days_remaining = hours_remaining / 24.0
         return f"{days_remaining:.1f}d" if days_remaining >= 1 else f"{hours_remaining:.1f}h"
 
+    @staticmethod
+    def _extract_bin_bounds(bin_info: Dict[str, Any]) -> Optional[Tuple[int, float]]:
+        range_value = bin_info.get("range")
+        if isinstance(range_value, (list, tuple)) and len(range_value) == 2:
+            return range_value[0], range_value[1]
+
+        lower = bin_info.get("lower_bound")
+        upper = bin_info.get("upper_bound")
+        if lower is None or upper is None:
+            return None
+        return lower, upper
+
+    def _get_event_bin_bounds(self, active: ActiveEvent, bin_idx: int) -> Tuple[int, float]:
+        if bin_idx < len(active.bot._market_bins):
+            return active.bot._market_bins[bin_idx]
+
+        if bin_idx < len(active.info.bins):
+            parsed = self._extract_bin_bounds(active.info.bins[bin_idx])
+            if parsed is not None:
+                return parsed
+
+        return bin_idx, bin_idx
+
+    @staticmethod
+    def _format_exception_details(exc: Exception) -> List[str]:
+        lines = [f"{type(exc).__name__}: {exc}"]
+        tb = traceback.extract_tb(exc.__traceback__)
+        if tb:
+            last = tb[-1]
+            lines.append(f"at {last.filename}:{last.lineno} in {last.name}")
+        return lines
+
     def _format_event_holdings_lines(self, active: ActiveEvent) -> List[str]:
         if not active.bot.kelly_bot or not active.bot.kelly_bot.portfolio:
             return ["holdings=unavailable"]
@@ -467,9 +500,7 @@ class MultiEventManager:
         for bin_idx, pos in sorted(portfolio.positions.items()):
             if pos.yes_shares <= 0.01 and pos.no_shares <= 0.01:
                 continue
-            lower, upper = active.info.bins[bin_idx]["range"] if bin_idx < len(active.info.bins) else (
-                active.bot._market_bins[bin_idx] if bin_idx < len(active.bot._market_bins) else (bin_idx, bin_idx)
-            )
+            lower, upper = self._get_event_bin_bounds(active, bin_idx)
             range_label = self._format_bin_range_label(lower, upper)
             yes_part = (
                 f"YES {pos.yes_shares:6.1f} @ {self._fmt_price_cents(pos.yes_avg_cost):>5}"
@@ -2529,7 +2560,7 @@ class MultiEventManager:
                 self._notify_slack(
                     "error",
                     "Main loop error",
-                    [str(e)],
+                    self._format_exception_details(e),
                     dedupe_key="multi_event_manager_main_loop",
                     cooldown_seconds=300.0,
                     mention=True,

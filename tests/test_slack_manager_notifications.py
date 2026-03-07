@@ -121,7 +121,10 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
         short_name=short_name,
         settlement_date=date(2026, 3, 10),
         market_start_date=date(2026, 3, 3),
-        bins=[],
+        bins=[
+            {"lower_bound": 0, "upper_bound": 9},
+            {"lower_bound": 10, "upper_bound": 19},
+        ],
     )
     return ActiveEvent(
         info=info,
@@ -262,6 +265,18 @@ def test_notify_fill_dedupes_repeated_confirmed_fill():
     manager._notify_fill(event_info, 1, fill, bin_range="10-19")
 
     assert len(manager._pending_fill_notifications) == 1
+
+
+def test_format_exception_details_include_type_and_location():
+    manager = _make_manager()
+
+    try:
+        raise KeyError("range")
+    except KeyError as exc:
+        lines = manager._format_exception_details(exc)
+
+    assert lines[0] == "KeyError: 'range'"
+    assert any("in test_format_exception_details_include_type_and_location" in line for line in lines[1:])
 
 
 def test_balance_allowance_alert_uses_configured_cooldown():

@@ -208,7 +208,18 @@ def setup_logging(verbose: bool = False) -> None:
         def format(self, record):
             level_char = self.LEVEL_MAP.get(record.levelname, '?')
             timestamp = self.formatTime(record, "%y-%m-%d %H:%M:%S")
-            return f"{timestamp}[{level_char}]: {record.getMessage()}"
+            message = record.getMessage()
+
+            if record.exc_info:
+                if not record.exc_text:
+                    record.exc_text = self.formatException(record.exc_info)
+                if record.exc_text:
+                    message = f"{message}\n{record.exc_text}"
+
+            if record.stack_info:
+                message = f"{message}\n{self.formatStack(record.stack_info)}"
+
+            return f"{timestamp}[{level_char}]: {message}"
 
     handler = logging.StreamHandler()
     handler.setFormatter(CompactFormatter())
