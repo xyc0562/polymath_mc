@@ -178,6 +178,42 @@ def test_hard_deadline_drops_overlay_and_clears_freeze():
     assert integrity["last_forced_api_recovery_at"] is not None
 
 
+def test_enforce_integrity_deadline_syncs_and_clears_without_tick():
+    executor = _make_executor()
+    candidate = _make_candidate(size=6.0, price=0.25)
+    fill = _make_fill(size=6.0, price=0.25, match_id="match-deadline")
+    sync_calls = []
+    executor._last_api_snapshot = executor.api_base_portfolio._copy()
+
+    executor._record_confirmed_fill(
+        fill_key="match-deadline",
+        order_id=fill.order_id,
+        candidate=candidate,
+        token_id="yes-0",
+        fill_event=fill,
+        now=0.0,
+    )
+    executor._freeze_integrity("deadline test", now=10.0)
+
+    async def sync():
+        sync_calls.append(True)
+        updated = executor.api_base_portfolio._copy()
+        updated.execute_buy_yes(0, 6.0, 0.25, "yes-0")
+        executor.api_base_portfolio = updated
+        executor.portfolio = updated
+
+    executor.sync_portfolio = sync
+
+    recovered = asyncio.run(executor.enforce_integrity_deadline(now=400.0))
+
+    integrity = executor.get_integrity_summary()
+    assert recovered is True
+    assert len(sync_calls) == 1
+    assert integrity["frozen"] is False
+    assert integrity["overlay_entries"] == 0
+    assert integrity["last_forced_api_recovery_at"] is None
+
+
 def test_kelly_bot_status_exposes_integrity_fields():
     bot = KellyTradingBot(
         clob_client=object(),

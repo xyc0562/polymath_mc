@@ -697,6 +697,28 @@ class MultiEventManager:
 
         await asyncio.gather(*[_run_bot_tick(event_id, active) for event_id, active in active_snapshot])
 
+    async def _enforce_integrity_deadlines(self) -> None:
+        """
+        Enforce per-event integrity deadlines on wall-clock time.
+
+        This runs outside normal trading ticks so frozen events still recover
+        when no sync-driven tick is triggered for that event.
+        """
+        async with self._events_lock:
+            active_snapshot = list(self._active_events.items())
+
+        async def _enforce(event_id: str, active: ActiveEvent) -> None:
+            bot = active.bot
+            bot_name = getattr(bot.bot_config, "event_name", None) or active.info.short_name or event_id
+            try:
+                recovered = await bot.enforce_integrity_deadline()
+                if recovered:
+                    logger.info(f"[{bot_name}] Integrity deadline enforced outside trading tick")
+            except Exception as e:
+                logger.error(f"[{bot_name}] Error enforcing integrity deadline: {e}", exc_info=True)
+
+        await asyncio.gather(*[_enforce(event_id, active) for event_id, active in active_snapshot])
+
     def _handle_global_fill(self, fill_event: FillEvent) -> None:
         """
         Route fill event from global UserStreamClient to the correct bot.
@@ -1748,6 +1770,9 @@ class MultiEventManager:
                 if (now - self._last_health_log_time).total_seconds() >= self.config.health_log_interval:
                     self._log_health()
                     self._last_health_log_time = now
+
+                # Integrity deadlines (every poll cycle)
+                await self._enforce_integrity_deadlines()
 
                 # Capital values + status (every poll cycle)
                 await self._update_capital_values()

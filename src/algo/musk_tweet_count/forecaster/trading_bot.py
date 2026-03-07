@@ -1211,6 +1211,22 @@ class GASKellyTradingBot:
         except Exception as e:
             logger.error(f"Error recomputing Monte Carlo: {e}", exc_info=True)
 
+    async def enforce_integrity_deadline(self) -> bool:
+        """
+        Enforce a pending integrity deadline outside sync-driven trading ticks.
+
+        Returns True when the underlying Kelly executor cleared or force-recovered
+        a frozen event.
+        """
+        if not self._setup_complete or not self.kelly_bot:
+            return False
+
+        if self._tick_lock.locked():
+            return False
+
+        async with self._tick_lock:
+            return await self.kelly_bot.enforce_integrity_deadline()
+
     def stop(self) -> None:
         """Signal the trading loop to stop."""
         self._running = False

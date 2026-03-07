@@ -1024,6 +1024,43 @@ class KellyExecutor:
         if self._integrity_state.frozen and deadline is not None and now >= deadline:
             self._force_api_recovery(now)
 
+    async def enforce_integrity_deadline(self, now: Optional[float] = None) -> bool:
+        """
+        Enforce the hard wall-clock integrity deadline outside the trading loop.
+
+        This is used by higher-level runtime loops so frozen events can recover
+        even when no sync-driven trading tick is triggered.
+        """
+        now = now or time.time()
+        deadline = self._integrity_state.deadline_at
+        if not self._integrity_state.frozen or deadline is None or now < deadline:
+            return False
+
+        self._prune_recent_tracking(now)
+
+        # Refresh the authoritative API base once at deadline if possible.
+        if self.sync_portfolio:
+            try:
+                await self.sync_portfolio()
+            except Exception as e:
+                logger.warning(
+                    f"[{self.event_name}][INTEGRITY] Deadline recovery API sync failed: {e}"
+                )
+
+        current_snapshot = self.api_base_portfolio._copy()
+        current_snapshot.external_capital_limit = self.api_base_portfolio.external_capital_limit
+        self._reconcile_overlay_against_api(self._last_api_snapshot, current_snapshot)
+        self._last_api_snapshot = current_snapshot._copy()
+
+        now = now or time.time()
+        if not self._overlay_ledger:
+            self._clear_integrity_freeze("overlay_reconciled_at_deadline", now=now)
+            return True
+
+        self._force_api_recovery(now)
+        self._last_api_snapshot = self.api_base_portfolio._copy()
+        return True
+
     def _oldest_overlay_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
         """Get age in seconds of the oldest residual overlay fragment."""
         if not self._overlay_ledger:
