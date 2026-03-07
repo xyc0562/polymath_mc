@@ -71,6 +71,7 @@ class SlackConfig:
     fill_summary_interval_seconds: int = 3600
     fill_summary_max_examples: int = 5
     balance_allowance_cooldown_seconds: int = 3600
+    mention_user_id: str = ""
     min_level: str = "info"
     request_timeout_seconds: float = 10.0
     queue_size: int = 200
@@ -88,6 +89,7 @@ class SlackConfig:
             fill_summary_interval_seconds=max(0, _env_int("SLACK_FILL_SUMMARY_INTERVAL_SECONDS", 3600)),
             fill_summary_max_examples=max(1, _env_int("SLACK_FILL_SUMMARY_MAX_EXAMPLES", 5)),
             balance_allowance_cooldown_seconds=max(0, _env_int("SLACK_BALANCE_ALLOWANCE_COOLDOWN_SECONDS", 3600)),
+            mention_user_id=os.getenv("SLACK_MENTION_USER_ID", "").strip(),
             min_level=os.getenv("SLACK_MIN_LEVEL", "info").strip().lower() or "info",
             request_timeout_seconds=max(1.0, _env_float("SLACK_REQUEST_TIMEOUT_SECONDS", 10.0)),
             queue_size=max(1, _env_int("SLACK_QUEUE_SIZE", 200)),
@@ -190,6 +192,7 @@ class SlackNotifier:
         *,
         dedupe_key: Optional[str] = None,
         cooldown_seconds: float = 0.0,
+        mention: bool = False,
     ) -> None:
         if not self._accepting:
             return
@@ -197,6 +200,8 @@ class SlackNotifier:
             return
 
         text = self._format_message(level, title, lines)
+        if mention and self.config.mention_user_id:
+            text = f"<@{self.config.mention_user_id}>\n{text}"
         try:
             self._queue.put_nowait(
                 SlackMessage(
@@ -212,25 +217,31 @@ class SlackNotifier:
         self,
         title: str,
         lines: Optional[Iterable[object]] = None,
+        *,
+        mention: bool = False,
         **kwargs,
     ) -> None:
-        self.notify("info", title, lines, **kwargs)
+        self.notify("info", title, lines, mention=mention, **kwargs)
 
     def notify_warning(
         self,
         title: str,
         lines: Optional[Iterable[object]] = None,
+        *,
+        mention: bool = False,
         **kwargs,
     ) -> None:
-        self.notify("warning", title, lines, **kwargs)
+        self.notify("warning", title, lines, mention=mention, **kwargs)
 
     def notify_error(
         self,
         title: str,
         lines: Optional[Iterable[object]] = None,
+        *,
+        mention: bool = False,
         **kwargs,
     ) -> None:
-        self.notify("error", title, lines, **kwargs)
+        self.notify("error", title, lines, mention=mention, **kwargs)
 
     def _format_message(
         self,

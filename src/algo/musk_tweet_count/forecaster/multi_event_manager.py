@@ -407,6 +407,7 @@ class MultiEventManager:
         *,
         dedupe_key: Optional[str] = None,
         cooldown_seconds: float = 0.0,
+        mention: bool = False,
     ) -> None:
         if not self.slack_notifier:
             return
@@ -414,6 +415,7 @@ class MultiEventManager:
             self.slack_notifier.notify_error(
                 title,
                 lines,
+                mention=mention,
                 dedupe_key=dedupe_key,
                 cooldown_seconds=cooldown_seconds,
             )
@@ -421,6 +423,7 @@ class MultiEventManager:
             self.slack_notifier.notify_warning(
                 title,
                 lines,
+                mention=mention,
                 dedupe_key=dedupe_key,
                 cooldown_seconds=cooldown_seconds,
             )
@@ -428,6 +431,7 @@ class MultiEventManager:
             self.slack_notifier.notify_info(
                 title,
                 lines,
+                mention=mention,
                 dedupe_key=dedupe_key,
                 cooldown_seconds=cooldown_seconds,
             )
@@ -638,6 +642,7 @@ class MultiEventManager:
                 self.slack_notifier.balance_allowance_cooldown_seconds
                 if self.slack_notifier else 0.0
             ),
+            mention=True,
         )
 
     def _build_position_fingerprint(self, bot: GASKellyTradingBot) -> Optional[Tuple[Any, ...]]:
@@ -1192,6 +1197,7 @@ class MultiEventManager:
                 ],
                 dedupe_key=f"realtime_cookie_error_{cookie_label}",
                 cooldown_seconds=3600.0,
+                mention=True,
             )
 
         if result.gap_detected:
@@ -1202,6 +1208,7 @@ class MultiEventManager:
                 ["Forcing authoritative XTracker refresh."],
                 dedupe_key="realtime_gap_detected",
                 cooldown_seconds=300.0,
+                mention=True,
             )
             refresh_outcome = await self.refresh_shared_data()
             if refresh_outcome.effective_changed:
@@ -1290,6 +1297,7 @@ class MultiEventManager:
                 [f"bin={bin_index}", str(e)],
                 dedupe_key=f"fill_routing_error:{event_id}:{bin_index}",
                 cooldown_seconds=300.0,
+                mention=True,
             )
 
     async def _handle_global_stale_order(self, pending: PendingOrder) -> None:
@@ -1986,6 +1994,7 @@ class MultiEventManager:
                 [str(e)],
                 dedupe_key=f"event_runtime_error:{event_id}",
                 cooldown_seconds=300.0,
+                mention=True,
             )
         finally:
             await self._cleanup_event(event_id, bot)
@@ -2270,6 +2279,7 @@ class MultiEventManager:
                     [str(e)],
                     dedupe_key="multi_event_manager_main_loop",
                     cooldown_seconds=300.0,
+                    mention=True,
                 )
                 await asyncio.sleep(60)  # Back off on error
 
@@ -2288,6 +2298,7 @@ class MultiEventManager:
                 [str(e)],
                 dedupe_key="capital_resync_failed",
                 cooldown_seconds=1800.0,
+                mention=True,
             )
 
     async def _update_capital_values(self) -> None:
