@@ -28,6 +28,12 @@ from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
 
 from .config import KellyConfig
 from .orderbook import UnifiedOrderbook
+from .orderbook import (
+    compute_vwap_buy_no,
+    compute_vwap_buy_yes,
+    compute_vwap_sell_no,
+    compute_vwap_sell_yes,
+)
 from .portfolio import Portfolio
 from .candidates import (
     TradeCandidate,
@@ -895,7 +901,198 @@ class KellyExecutor:
             reservation_price=candidate.reservation_price,
             edge=candidate.edge,
             limit_price=candidate.limit_price,
+            threshold_price=candidate.threshold_price,
         )
+
+    def _fresh_start_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
+        """Return throttle age in seconds from the first trading tick, if known."""
+        raw = self._log_context.get("fresh_start_started_at")
+        if raw is None:
+            return None
+        try:
+            started_at = float(raw)
+        except (TypeError, ValueError):
+            return None
+
+        current_time = now if now is not None else time.time()
+        return max(0.0, current_time - started_at)
+
+    def _fresh_start_throttle_active(self, now: Optional[float] = None) -> bool:
+        """Return True when the fresh-start wall-clock throttle window is active."""
+        market_impact = getattr(self.config, "market_impact", None)
+        if market_impact is None or not market_impact.fresh_start_enabled:
+            return False
+
+        age_seconds = self._fresh_start_age_seconds(now)
+        if age_seconds is None:
+            return False
+
+        return age_seconds <= market_impact.fresh_start_minutes * 60.0
+
+    @staticmethod
+    def _best_execution_price(
+        orderbook: UnifiedOrderbook,
+        action: TradeAction,
+    ) -> Optional[float]:
+        """Return top-of-book price for the given trade action."""
+        if action == TradeAction.BUY_YES:
+            return orderbook.best_yes_ask
+        if action == TradeAction.SELL_YES:
+            return orderbook.best_yes_bid
+        if action == TradeAction.BUY_NO:
+            return orderbook.best_no_ask
+        if action == TradeAction.SELL_NO:
+            return orderbook.best_no_bid
+        return None
+
+    @staticmethod
+    def _compute_trade_path_metrics(
+        orderbook: UnifiedOrderbook,
+        action: TradeAction,
+        size: float,
+    ) -> tuple[float, float, float]:
+        """Return (vwap, filled_size, worst_price) for executing size shares."""
+        if action == TradeAction.BUY_YES:
+            return compute_vwap_buy_yes(orderbook, size)
+        if action == TradeAction.SELL_YES:
+            return compute_vwap_sell_yes(orderbook, size)
+        if action == TradeAction.BUY_NO:
+            return compute_vwap_buy_no(orderbook, size)
+        if action == TradeAction.SELL_NO:
+            return compute_vwap_sell_no(orderbook, size)
+        return 0.0, 0.0, 0.0
+
+    @staticmethod
+    def _within_market_impact_budget(
+        action: TradeAction,
+        worst_price: float,
+        allowed_worst_price: float,
+    ) -> bool:
+        """Check whether the deepest consumed level stays inside the price budget."""
+        eps = 1e-9
+        if action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+            return worst_price <= allowed_worst_price + eps
+        return worst_price + eps >= allowed_worst_price
+
+    def _apply_fresh_start_market_impact(
+        self,
+        trades: List[TradeCandidate],
+        orderbooks: Dict[int, UnifiedOrderbook],
+    ) -> List[TradeCandidate]:
+        """Clip executable size during the opening wall-clock window of an event."""
+        now = time.time()
+        if not self._fresh_start_throttle_active(now):
+            return trades
+
+        market_impact = self.config.market_impact
+        alpha = min(1.0, max(0.0, market_impact.fresh_start_edge_fraction))
+        age_seconds = self._fresh_start_age_seconds(now) or 0.0
+        throttled: List[TradeCandidate] = []
+
+        for trade in trades:
+            orderbook = orderbooks.get(trade.bin_index)
+            if orderbook is None:
+                throttled.append(trade)
+                continue
+
+            best_price = self._best_execution_price(orderbook, trade.action)
+            if best_price is None:
+                throttled.append(trade)
+                continue
+
+            threshold_price = trade.threshold_price
+            if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+                allowed_worst_price = best_price + alpha * (threshold_price - best_price)
+            else:
+                allowed_worst_price = best_price - alpha * (best_price - threshold_price)
+
+            requested_size = max(0, math.floor(trade.size))
+            if requested_size < 1:
+                logger.info(
+                    f"[{self.event_name}] Fresh-start throttle skipped {trade.action.value} "
+                    f"bin={trade.bin_index}: requested size {trade.size:.2f} < 1 share"
+                )
+                continue
+
+            def evaluate(size: int) -> Optional[tuple[float, float, float]]:
+                if size < 1:
+                    return None
+                vwap, filled, worst_price = self._compute_trade_path_metrics(
+                    orderbook, trade.action, float(size)
+                )
+                if filled + 1e-9 < size or worst_price <= 0:
+                    return None
+                return vwap, filled, worst_price
+
+            best_valid_size = 0
+            best_valid_metrics: Optional[tuple[float, float, float]] = None
+
+            full_metrics = evaluate(requested_size)
+            if full_metrics and self._within_market_impact_budget(
+                trade.action,
+                full_metrics[2],
+                allowed_worst_price,
+            ):
+                best_valid_size = requested_size
+                best_valid_metrics = full_metrics
+            else:
+                lo = 1
+                hi = requested_size
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    metrics = evaluate(mid)
+                    if metrics and self._within_market_impact_budget(
+                        trade.action,
+                        metrics[2],
+                        allowed_worst_price,
+                    ):
+                        best_valid_size = mid
+                        best_valid_metrics = metrics
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+
+            if best_valid_size < 1 or best_valid_metrics is None:
+                logger.info(
+                    f"[{self.event_name}] Fresh-start throttle skipped {trade.action.value} "
+                    f"bin={trade.bin_index}: top={best_price:.4f} threshold={threshold_price:.4f} "
+                    f"allowed={allowed_worst_price:.4f} age={age_seconds:.0f}s "
+                    f"reason=fresh_start_throttle"
+                )
+                continue
+
+            clipped_trade = self._clone_candidate(trade)
+            original_size = trade.size
+            clipped_trade.size = float(best_valid_size)
+            clipped_trade.price = best_valid_metrics[0]
+            clipped_trade.limit_price = best_valid_metrics[2]
+
+            if clipped_trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+                maker_amount = clipped_trade.size * clipped_trade.limit_price
+                if maker_amount + 1e-9 < MIN_ORDER_VALUE_USD:
+                    logger.info(
+                        f"[{self.event_name}] Fresh-start throttle skipped {trade.action.value} "
+                        f"bin={trade.bin_index}: clipped maker_amount=${maker_amount:.4f} "
+                        f"< ${MIN_ORDER_VALUE_USD:.2f} age={age_seconds:.0f}s "
+                        f"reason=fresh_start_throttle"
+                    )
+                    continue
+
+            if clipped_trade.size + 1e-9 < original_size:
+                if original_size > 0:
+                    clipped_trade.utility_gain *= clipped_trade.size / original_size
+                logger.info(
+                    f"[{self.event_name}] Fresh-start throttle clipped {trade.action.value} "
+                    f"bin={trade.bin_index}: size {original_size:.2f} -> {clipped_trade.size:.2f} | "
+                    f"top={best_price:.4f} threshold={threshold_price:.4f} "
+                    f"allowed={allowed_worst_price:.4f} vwap={clipped_trade.price:.4f} "
+                    f"worst={clipped_trade.limit_price:.4f} age={age_seconds:.0f}s "
+                    f"reason=fresh_start_throttle"
+                )
+
+            throttled.append(clipped_trade)
+
+        return throttled
 
     @staticmethod
     def _format_timestamp(ts: Optional[float]) -> Optional[str]:
@@ -1469,16 +1666,42 @@ class KellyExecutor:
                 logger.info(f"[{self.event_name}] iter={iteration}: no trades to execute")
                 break
 
+            # Collect results for this iteration's summary
+            iter_results: list[tuple[TradeCandidate, str]] = []  # (trade, status)
+            num_submitted_this_iter = 0
+
+            if not self.order_executor.dry_run:
+                # Live mode: drop BUY trades whose bin also has a SELL
+                # (SELL failing + BUY succeeding = dual-position deadlock)
+                sell_bins = {
+                    t.bin_index for t in planned_trades
+                    if t.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                }
+                if sell_bins:
+                    before = len(planned_trades)
+                    planned_trades = [
+                        t for t in planned_trades
+                        if t.action not in (TradeAction.BUY_YES, TradeAction.BUY_NO)
+                        or t.bin_index not in sell_bins
+                    ]
+                    dropped = before - len(planned_trades)
+                    if dropped:
+                        logger.info(
+                            "Dropped %d BUY trade(s) on bins with pending SELLs: %s",
+                            dropped, sell_bins,
+                        )
+
+            planned_trades = self._apply_fresh_start_market_impact(planned_trades, orderbooks)
+            if not planned_trades:
+                logger.info(f"[{self.event_name}] iter={iteration}: no executable trades after throttling")
+                break
+
             # Cap by remaining order budget for this tick
             orders_remaining = max_orders - tick_result.num_executed
             if len(planned_trades) > orders_remaining:
                 planned_trades = planned_trades[:orders_remaining]
 
             tick_result.num_candidates += len(planned_trades)
-
-            # Collect results for this iteration's summary
-            iter_results: list[tuple[TradeCandidate, str]] = []  # (trade, status)
-            num_submitted_this_iter = 0
 
             if self.order_executor.dry_run:
                 # Dry run: simulate all fills optimistically on LIVE portfolio
@@ -1518,26 +1741,6 @@ class KellyExecutor:
                     if self.on_trade:
                         self.on_trade(result)
             else:
-                # Live mode: drop BUY trades whose bin also has a SELL
-                # (SELL failing + BUY succeeding = dual-position deadlock)
-                sell_bins = {
-                    t.bin_index for t in planned_trades
-                    if t.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-                }
-                if sell_bins:
-                    before = len(planned_trades)
-                    planned_trades = [
-                        t for t in planned_trades
-                        if t.action not in (TradeAction.BUY_YES, TradeAction.BUY_NO)
-                        or t.bin_index not in sell_bins
-                    ]
-                    dropped = before - len(planned_trades)
-                    if dropped:
-                        logger.info(
-                            "Dropped %d BUY trade(s) on bins with pending SELLs: %s",
-                            dropped, sell_bins,
-                        )
-
                 # Build and submit batch
                 order_specs = []
                 trade_token_pairs = []
@@ -2341,8 +2544,13 @@ class KellyExecutor:
                 # Keep the worst limit_price (highest for buys, lowest for sells)
                 if t.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
                     existing.limit_price = max(existing.limit_price, t.limit_price)
+                    if existing.threshold_price > 0 and t.threshold_price > 0:
+                        existing.threshold_price = min(existing.threshold_price, t.threshold_price)
+                    else:
+                        existing.threshold_price = max(existing.threshold_price, t.threshold_price)
                 else:
                     existing.limit_price = min(existing.limit_price, t.limit_price) if existing.limit_price > 0 else t.limit_price
+                    existing.threshold_price = max(existing.threshold_price, t.threshold_price)
             else:
                 # Clone to avoid mutating the original
                 merged[key] = TradeCandidate(
@@ -2354,6 +2562,7 @@ class KellyExecutor:
                     reservation_price=t.reservation_price,
                     edge=t.edge,
                     limit_price=t.limit_price,
+                    threshold_price=t.threshold_price,
                 )
 
         return list(merged.values())
@@ -2581,11 +2790,14 @@ class KellyExecutor:
         hours_to_settlement: float = 0,
         forecast_mean: float = 0,
         forecast_std: float = 0,
+        fresh_start_started_at: Optional[float] = None,
     ) -> None:
         """
         Set context for trade logging.
 
         Call this before run_tick() to provide context for detailed trade logs.
+        `fresh_start_started_at` is the UNIX timestamp of the event's first
+        trading tick and is used for fresh-start market impact throttling.
         """
         self._log_context = {
             "probabilities": probabilities or [],
@@ -2595,6 +2807,7 @@ class KellyExecutor:
             "hours_to_settlement": hours_to_settlement,
             "forecast_mean": forecast_mean,
             "forecast_std": forecast_std,
+            "fresh_start_started_at": fresh_start_started_at,
         }
         # Propagate bin_ranges to order executor for log context
         if hasattr(self.order_executor, 'bin_ranges'):

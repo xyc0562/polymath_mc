@@ -100,6 +100,7 @@ class TradeCandidate:
     reservation_price: float  # Kelly fair price
     edge: float  # Edge = |market - reservation| / reservation
     limit_price: float = 0.0  # Worst orderbook level consumed (actual tick price for FAK)
+    threshold_price: float = 0.0  # Worst economically acceptable execution price this tick
 
     @property
     def cost(self) -> float:
@@ -632,6 +633,7 @@ def _generate_buy_yes_candidate(
         reservation_price=reservation_price,
         edge=actual_edge,
         limit_price=worst_price,
+        threshold_price=compute_buy_threshold(reservation_price, config.edge_buffer),
     )
 
 
@@ -727,6 +729,9 @@ def _generate_sell_yes_candidate(
     # 1. Market >= model fair value (edge disappeared)
     # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
     exit_threshold = min(model_probability, reservation_price)
+    threshold_price = reservation_price + sell_friction
+    if not kelly_only_exit:
+        threshold_price = max(threshold_price, exit_threshold)
 
     # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
     if not kelly_only_exit:
@@ -766,6 +771,7 @@ def _generate_sell_yes_candidate(
         reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
         limit_price=worst_price,
+        threshold_price=threshold_price,
     )
 
 
@@ -847,8 +853,7 @@ def _generate_buy_no_candidate(
         vwap, reservation_price, TradeAction.BUY_NO, config.edge_buffer
     )
     if not trade_ok:
-        req_edge = compute_required_edge(reservation_price, config.edge_buffer)
-        threshold = reservation_price * (1 - req_edge)
+        threshold = 1.0 - compute_buy_no_threshold(1.0 - reservation_price, config.edge_buffer)
         reject(f"edge failed (ask={vwap:.1%} > thresh={threshold:.1%}, fair={reservation_price:.1%})")
         return None
 
@@ -869,6 +874,7 @@ def _generate_buy_no_candidate(
         reservation_price=reservation_price,
         edge=actual_edge,
         limit_price=worst_price,
+        threshold_price=1.0 - compute_buy_no_threshold(1.0 - reservation_price, config.edge_buffer),
     )
 
 
@@ -966,6 +972,9 @@ def _generate_sell_no_candidate(
     # 1. Market >= model fair value (edge disappeared)
     # 2. Market >= Kelly reservation (utility-based exit for concentrated positions)
     exit_threshold = min(model_probability, reservation_price)
+    threshold_price = reservation_price + sell_friction
+    if not kelly_only_exit:
+        threshold_price = max(threshold_price, exit_threshold)
 
     # Only exit if we can get threshold or better (skip in kelly_only_exit mode)
     if not kelly_only_exit:
@@ -1005,6 +1014,7 @@ def _generate_sell_no_candidate(
         reservation_price=exit_threshold,  # Threshold used (min of model prob and Kelly)
         edge=actual_edge,
         limit_price=worst_price,
+        threshold_price=threshold_price,
     )
 
 

@@ -40,7 +40,13 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventConfig,
     EventInfo,
 )
-from src.algo.musk_tweet_count.kelly.config import KellyConfig, EdgeBufferConfig, CollateralConfig, EventTradingRulesConfig
+from src.algo.musk_tweet_count.kelly.config import (
+    KellyConfig,
+    EdgeBufferConfig,
+    CollateralConfig,
+    EventTradingRulesConfig,
+    MarketImpactConfig,
+)
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
@@ -103,6 +109,13 @@ def log_config_summary(
     w(f"    Min market price:        {eb.min_market_price:.2%}")
     w(f"    Require 2-sided liq:     {eb.require_two_sided_liquidity}")
     w(f"    Max spread ratio:        {eb.max_spread_ratio}")
+    w("")
+
+    mi = kelly_config.market_impact
+    w("  MARKET IMPACT")
+    w(f"    Fresh-start throttle:    {mi.fresh_start_enabled}")
+    w(f"    Fresh-start window:      {mi.fresh_start_minutes:.1f}m")
+    w(f"    Edge fraction cap:       {mi.fresh_start_edge_fraction:.2f}")
     w("")
 
     # Rate limit
@@ -734,6 +747,23 @@ def parse_args() -> argparse.Namespace:
         default=KellyConfig.min_sell_utility,
         help=f"Minimum utility gain for sells (default: {KellyConfig.min_sell_utility})",
     )
+    parser.add_argument(
+        "--fresh-start-minutes",
+        type=float,
+        default=MarketImpactConfig.fresh_start_minutes,
+        help=f"Minutes to throttle after an event's first trading tick (default: {MarketImpactConfig.fresh_start_minutes})",
+    )
+    parser.add_argument(
+        "--fresh-start-edge-fraction",
+        type=float,
+        default=MarketImpactConfig.fresh_start_edge_fraction,
+        help=f"Fraction of available edge the executor may consume per fresh-start tick (default: {MarketImpactConfig.fresh_start_edge_fraction})",
+    )
+    parser.add_argument(
+        "--no-fresh-start-throttle",
+        action="store_true",
+        help="Disable fresh-start market impact throttling.",
+    )
 
     # Projection model
     parser.add_argument(
@@ -866,12 +896,19 @@ async def main() -> None:
         capital_multiplier=args.capital_multiplier,
     )
 
+    market_impact_config = MarketImpactConfig(
+        fresh_start_enabled=not args.no_fresh_start_throttle,
+        fresh_start_minutes=args.fresh_start_minutes,
+        fresh_start_edge_fraction=args.fresh_start_edge_fraction,
+    )
+
     kelly_config = KellyConfig(
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_buy_utility=args.min_buy_utility,
         min_sell_utility=args.min_sell_utility,
         edge_buffer=edge_buffer_config,
+        market_impact=market_impact_config,
         collateral=collateral_config,
     )
 

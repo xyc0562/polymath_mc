@@ -13,6 +13,7 @@ Key design decisions:
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Tuple
 
@@ -112,6 +113,7 @@ class KellyTradingBot:
         self._setup_complete = False
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
         self._ema_probabilities: Optional[List[float]] = None
+        self._fresh_start_started_at: Optional[float] = None
 
         # Lock for thread-safe tick execution
         self._tick_lock = asyncio.Lock()
@@ -389,6 +391,13 @@ class KellyTradingBot:
             )
 
         async with self._tick_lock:
+            if (
+                self._fresh_start_started_at is None and
+                getattr(self.config, "market_impact", None) is not None and
+                self.config.market_impact.fresh_start_enabled
+            ):
+                self._fresh_start_started_at = time.time()
+
             # NOTE: Portfolio sync is now handled by the executor BEFORE EACH order decision
             # The executor calls sync_portfolio callback before each generate_candidates() call
             # This ensures we always use official API data, not calculated estimates
@@ -428,6 +437,7 @@ class KellyTradingBot:
                 hours_to_settlement=hours_to_settlement,
                 forecast_mean=forecast_mean,
                 forecast_std=forecast_std,
+                fresh_start_started_at=self._fresh_start_started_at,
             )
 
             # Run Kelly optimization tick

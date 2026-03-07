@@ -72,6 +72,21 @@ class EdgeBufferConfig:
 
 
 @dataclass
+class MarketImpactConfig:
+    """Execution-only controls for limiting market impact during fresh starts."""
+
+    # Enable fresh-start throttling when an event first starts trading.
+    fresh_start_enabled: bool = True
+
+    # Wall-clock throttle window in minutes from the event's first trading tick.
+    fresh_start_minutes: float = 20.0
+
+    # Fraction of available edge the executor may consume in one tick.
+    # 0.25 means only walk 25% of the gap from top-of-book to threshold price.
+    fresh_start_edge_fraction: float = 0.25
+
+
+@dataclass
 class RateLimitConfig:
     """
     Configuration for order rate limiting.
@@ -207,6 +222,9 @@ class KellyConfig:
     # Set to 1.0 to disable smoothing (use raw probabilities).
     prob_ema_alpha: float = 0.3
 
+    # Execution-only market impact controls.
+    market_impact: MarketImpactConfig = field(default_factory=MarketImpactConfig)
+
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
@@ -215,6 +233,8 @@ class KellyConfig:
         """Create config from dictionary (e.g., from YAML)."""
         # Extract nested configs
         edge_buffer_data = data.pop("edge_buffer", {})
+        market_impact_data = data.pop("market_impact", {})
+        market_impact_data.pop("fresh_start_ticks", None)  # Legacy field, replaced by wall-clock window
         data.pop("adaptive_delta", None)  # Legacy field, ignored
         collateral_data = data.pop("collateral", {})
         rate_limit_data = data.pop("rate_limit", {})
@@ -237,6 +257,7 @@ class KellyConfig:
 
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),
+            market_impact=MarketImpactConfig(**market_impact_data),
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
             **data,

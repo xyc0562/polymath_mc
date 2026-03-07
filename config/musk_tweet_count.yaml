@@ -60,6 +60,11 @@ kelly:
     friction_tail: 0.04           # 4% friction for p <= 10% or p >= 90%
     tail_threshold: 0.10          # Threshold for tail zone
 
+  market_impact:
+    fresh_start_enabled: true
+    fresh_start_minutes: 20.0
+    fresh_start_edge_fraction: 0.25
+
   # Adaptive chunk sizing
   adaptive_delta:
     base_delta: 10.0
