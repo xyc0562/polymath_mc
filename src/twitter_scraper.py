@@ -147,11 +147,25 @@ def window_to_key(window_start: datetime, window_end: datetime) -> str:
     return f"{window_start.strftime('%Y-%m-%d')}_{window_end.strftime('%Y-%m-%d')}"
 
 
+def _load_first_cookie(cookies_path: Path) -> dict:
+    """Load the first cookie from a cookies file (supports both single dict and array formats)."""
+    with open(cookies_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        if not data:
+            raise ValueError("Empty cookie list")
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    raise ValueError(f"Invalid cookies format: expected dict or list")
+
+
 async def login_client(client: Client, cookies_path: Path) -> bool:
     """Handle client login, using saved cookies if available."""
     if cookies_path.exists():
         try:
-            client.load_cookies(str(cookies_path))
+            cookie = _load_first_cookie(cookies_path)
+            client.set_cookies(cookie)
             print("Loaded saved cookies successfully.")
             return True
         except Exception as e:

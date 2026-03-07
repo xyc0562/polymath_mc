@@ -145,7 +145,7 @@ class MultiEventConfig:
 
     # Realtime twikit polling for provisional edge detection
     realtime_tracker_enabled: bool = True
-    realtime_poll_interval_seconds: float = 20.0
+    realtime_poll_interval_seconds: float = 10.0
     realtime_fetch_count: int = 40
     realtime_late_tweet_grace_seconds: float = 120.0
     realtime_cookies_path: Optional[str] = None
@@ -1178,6 +1178,22 @@ class MultiEventManager:
             return RealtimePollResult(events=[])
 
         result = await self.realtime_tracker.poll_once()
+
+        cookie_err = self.realtime_tracker.last_cookie_error
+        if cookie_err:
+            cookie_label = self.realtime_tracker._last_cookie_error_label or "unknown"
+            self._notify_slack(
+                "error",
+                f"Twitter cookie error: {cookie_err}",
+                [
+                    f"Cookie '{cookie_label}' failed with: {cookie_err}.",
+                    f"Consecutive errors: {self.realtime_tracker.consecutive_errors}.",
+                    "Check/refresh cookies in config/twitter_cookies.json.",
+                ],
+                dedupe_key=f"realtime_cookie_error_{cookie_label}",
+                cooldown_seconds=3600.0,
+            )
+
         if result.gap_detected:
             logger.warning("Realtime gap detected; forcing authoritative XTracker refresh")
             self._notify_slack(

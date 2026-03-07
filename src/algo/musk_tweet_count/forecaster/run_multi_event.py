@@ -721,20 +721,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--realtime-poll-interval",
         type=float,
-        default=20.0,
-        help="Seconds between twikit polls for provisional tweet detection (default: 20).",
+        default=None,
+        help="Seconds between twikit polls for provisional tweet detection (default: from config, 10).",
     )
     parser.add_argument(
         "--realtime-fetch-count",
         type=int,
-        default=40,
-        help="Number of tweets to fetch per twikit poll (default: 40).",
+        default=None,
+        help="Number of tweets to fetch per twikit poll (default: from config, 40).",
     )
     parser.add_argument(
         "--realtime-late-tweet-grace",
         type=float,
-        default=120.0,
-        help="Seconds of grace for slightly late/out-of-order tweets from twikit (default: 120).",
+        default=None,
+        help="Seconds of grace for slightly late/out-of-order tweets from twikit (default: from config, 120).",
     )
     parser.add_argument(
         "--realtime-cookies-path",
@@ -1205,9 +1205,9 @@ async def main() -> None:
         min_event_duration_days=args.min_event_days,
         max_event_duration_days=args.max_event_days,
         realtime_tracker_enabled=not args.disable_realtime_tracker,
-        realtime_poll_interval_seconds=args.realtime_poll_interval,
-        realtime_fetch_count=args.realtime_fetch_count,
-        realtime_late_tweet_grace_seconds=args.realtime_late_tweet_grace,
+        **({"realtime_poll_interval_seconds": args.realtime_poll_interval} if args.realtime_poll_interval is not None else {}),
+        **({"realtime_fetch_count": args.realtime_fetch_count} if args.realtime_fetch_count is not None else {}),
+        **({"realtime_late_tweet_grace_seconds": args.realtime_late_tweet_grace} if args.realtime_late_tweet_grace is not None else {}),
         realtime_cookies_path=args.realtime_cookies_path,
     )
     logger.info(f"Event duration filter: {args.min_event_days}-{args.max_event_days} days (inclusive)")
