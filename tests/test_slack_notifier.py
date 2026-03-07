@@ -11,6 +11,7 @@ def test_slack_config_from_env(monkeypatch):
     monkeypatch.setenv("SLACK_HEALTH_INTERVAL_SECONDS", "900")
     monkeypatch.setenv("SLACK_HEALTH_ON_CHANGE_ONLY", "false")
     monkeypatch.setenv("SLACK_FILL_SUMMARY_INTERVAL_SECONDS", "1800")
+    monkeypatch.setenv("SLACK_FILL_SUMMARY_QUIET_SECONDS", "600")
     monkeypatch.setenv("SLACK_FILL_SUMMARY_MAX_EXAMPLES", "3")
     monkeypatch.setenv("SLACK_BALANCE_ALLOWANCE_COOLDOWN_SECONDS", "7200")
     monkeypatch.setenv("SLACK_MIN_LEVEL", "warning")
@@ -24,6 +25,7 @@ def test_slack_config_from_env(monkeypatch):
     assert config.health_interval_seconds == 900
     assert config.health_on_change_only is False
     assert config.fill_summary_interval_seconds == 1800
+    assert config.fill_summary_quiet_seconds == 600
     assert config.fill_summary_max_examples == 3
     assert config.balance_allowance_cooldown_seconds == 7200
     assert config.min_level == "warning"

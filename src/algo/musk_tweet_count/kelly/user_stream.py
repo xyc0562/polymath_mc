@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
@@ -377,7 +377,7 @@ class UserStreamClient:
             self._ws = ws
             self._subscribed_market_ids = set()
             self._reconnect_delay = 1.0  # Reset on successful connect
-            self._connected_at = datetime.now()
+            self._connected_at = datetime.now(timezone.utc)
             self._last_message_at = None
             self._message_count = 0
             self._fill_count = 0
@@ -408,7 +408,7 @@ class UserStreamClient:
     async def _handle_message(self, message: str) -> None:
         """Handle incoming WebSocket message."""
         try:
-            self._last_message_at = datetime.now()
+            self._last_message_at = datetime.now(timezone.utc)
             self._message_count += 1
 
             raw = message.strip() if isinstance(message, str) else message
@@ -473,7 +473,7 @@ class UserStreamClient:
                 price=float(data.get("price", 0)),
                 size=float(data.get("size", 0)),
                 status=OrderStatus(status_str) if status_str else OrderStatus.MATCHED,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 match_id=match_id,
             )
 
@@ -636,12 +636,12 @@ class UserStreamClient:
                     continue
 
                 # Calculate uptime
-                uptime = datetime.now() - self._connected_at
+                uptime = datetime.now(timezone.utc) - self._connected_at
                 uptime_mins = uptime.total_seconds() / 60
 
                 # Last message age
                 if self._last_message_at:
-                    last_msg_age = (datetime.now() - self._last_message_at).total_seconds()
+                    last_msg_age = (datetime.now(timezone.utc) - self._last_message_at).total_seconds()
                     last_msg_str = f"{last_msg_age:.0f}s ago"
                 else:
                     last_msg_str = "none"
@@ -729,7 +729,7 @@ class UserStreamClient:
         - pending_orders: int, number of pending orders
         - on_fill_callback_set: bool, whether callback is configured
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         connected = self._is_ws_open()
 
         uptime_seconds = 0.0

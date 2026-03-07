@@ -69,6 +69,7 @@ class SlackConfig:
     health_interval_seconds: int = 21600
     health_on_change_only: bool = True
     fill_summary_interval_seconds: int = 3600
+    fill_summary_quiet_seconds: int = 900
     fill_summary_max_examples: int = 5
     balance_allowance_cooldown_seconds: int = 3600
     mention_user_id: str = ""
@@ -87,6 +88,7 @@ class SlackConfig:
             health_interval_seconds=max(0, _env_int("SLACK_HEALTH_INTERVAL_SECONDS", 21600)),
             health_on_change_only=_env_bool("SLACK_HEALTH_ON_CHANGE_ONLY", True),
             fill_summary_interval_seconds=max(0, _env_int("SLACK_FILL_SUMMARY_INTERVAL_SECONDS", 3600)),
+            fill_summary_quiet_seconds=max(0, _env_int("SLACK_FILL_SUMMARY_QUIET_SECONDS", 900)),
             fill_summary_max_examples=max(1, _env_int("SLACK_FILL_SUMMARY_MAX_EXAMPLES", 5)),
             balance_allowance_cooldown_seconds=max(0, _env_int("SLACK_BALANCE_ALLOWANCE_COOLDOWN_SECONDS", 3600)),
             mention_user_id=os.getenv("SLACK_MENTION_USER_ID", "").strip(),
@@ -108,6 +110,7 @@ class SlackNotifier:
         self.health_interval_seconds = config.health_interval_seconds
         self.health_on_change_only = config.health_on_change_only
         self.fill_summary_interval_seconds = config.fill_summary_interval_seconds
+        self.fill_summary_quiet_seconds = config.fill_summary_quiet_seconds
         self.fill_summary_max_examples = config.fill_summary_max_examples
         self.balance_allowance_cooldown_seconds = config.balance_allowance_cooldown_seconds
         self._level_threshold = _LEVELS.get(config.min_level, _LEVELS["info"])

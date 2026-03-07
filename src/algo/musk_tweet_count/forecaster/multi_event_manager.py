@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 # Count validation threshold - warn if computed vs API count differs by more than this
 COUNT_MISMATCH_THRESHOLD = 5
+SLACK_TIMEZONE = ZoneInfo("Asia/Singapore")
+SLACK_FILL_DEDUPE_TTL = timedelta(hours=24)
 
 TICK_SOURCE_PRIORITY = {
     "startup": 0,
@@ -98,7 +100,10 @@ class RefreshOutcome:
 class FillNotification:
     """Buffered fill notification for Slack summaries."""
 
+    event_id: str
     event_short_name: str
+    order_id: str
+    match_id: str
     bin_index: int
     bin_range: str
     side: str
@@ -285,6 +290,7 @@ class MultiEventManager:
 
         # Timezone for scheduling
         self._tz = ZoneInfo(forecaster_config.timezone)
+        self._slack_tz = SLACK_TIMEZONE
 
         # Shared XTracker client for /posts endpoint (single session)
         self.posts_xtracker_client = PostsXTrackerClient()
@@ -376,6 +382,8 @@ class MultiEventManager:
         self._last_slack_health_signature: Optional[Tuple[Any, ...]] = None
         self._pending_fill_notifications: List[FillNotification] = []
         self._first_pending_fill_at: Optional[datetime] = None
+        self._last_pending_fill_at: Optional[datetime] = None
+        self._seen_fill_notification_keys: Dict[str, datetime] = {}
         self._total_events_started: int = 0
         self._total_events_completed: int = 0
         self._total_trades_executed: int = 0
@@ -399,6 +407,209 @@ class MultiEventManager:
     @staticmethod
     def _fmt_usd(value: float) -> str:
         return f"${value:.2f}"
+
+    @staticmethod
+    def _fmt_price_cents(value: float) -> str:
+        return f"{value * 100:.1f}c"
+
+    @staticmethod
+    def _format_bin_range_label(lower: int, upper: float) -> str:
+        return f"{lower}+" if upper == float("inf") else f"{lower}-{upper}"
+
+    def _coerce_datetime(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _fmt_slack_timestamp(self, value: Any, *, fallback: str = "n/a") -> str:
+        dt = self._coerce_datetime(value)
+        if dt is None:
+            return fallback if value is None else str(value)
+        return dt.astimezone(self._slack_tz).strftime("%Y-%m-%d %H:%M:%S SGT")
+
+    def _prune_seen_fill_notification_keys(self, now: datetime) -> None:
+        cutoff = now - SLACK_FILL_DEDUPE_TTL
+        stale_keys = [
+            key for key, seen_at in self._seen_fill_notification_keys.items()
+            if seen_at < cutoff
+        ]
+        for key in stale_keys:
+            self._seen_fill_notification_keys.pop(key, None)
+
+    @staticmethod
+    def _format_time_remaining(hours_remaining: float) -> str:
+        days_remaining = hours_remaining / 24.0
+        return f"{days_remaining:.1f}d" if days_remaining >= 1 else f"{hours_remaining:.1f}h"
+
+    def _format_event_holdings_lines(self, active: ActiveEvent) -> List[str]:
+        if not active.bot.kelly_bot or not active.bot.kelly_bot.portfolio:
+            return ["holdings=unavailable"]
+
+        portfolio = active.bot.kelly_bot.portfolio
+        nonzero_positions = []
+        for bin_idx, pos in sorted(portfolio.positions.items()):
+            if pos.yes_shares <= 0.01 and pos.no_shares <= 0.01:
+                continue
+            lower, upper = active.info.bins[bin_idx]["range"] if bin_idx < len(active.info.bins) else (
+                active.bot._market_bins[bin_idx] if bin_idx < len(active.bot._market_bins) else (bin_idx, bin_idx)
+            )
+            range_label = self._format_bin_range_label(lower, upper)
+            yes_part = (
+                f"YES {pos.yes_shares:6.1f} @ {self._fmt_price_cents(pos.yes_avg_cost):>5}"
+                if pos.yes_shares > 0.01 else "YES      -"
+            )
+            no_part = (
+                f"NO {pos.no_shares:6.1f} @ {self._fmt_price_cents(pos.no_avg_cost):>5}"
+                if pos.no_shares > 0.01 else "NO       -"
+            )
+            nonzero_positions.append(f"{range_label:<9} {yes_part} | {no_part}")
+
+        summary = (
+            f"holdings: capital={self._fmt_usd(portfolio.capital)} "
+            f"available={self._fmt_usd(portfolio.available_capital)} "
+            f"invested={self._fmt_usd(portfolio.total_collateral_used)} "
+            f"positions={len(nonzero_positions)}"
+        )
+        if not nonzero_positions:
+            return [summary, "holdings: flat"]
+
+        lines = [summary, "```", f"{'Range':<9} Holdings"]
+        lines.extend(nonzero_positions[:10])
+        if len(nonzero_positions) > 10:
+            lines.append(f"... {len(nonzero_positions) - 10} more position(s)")
+        lines.append("```")
+        return lines
+
+    def _format_event_probability_table_lines(self, active: ActiveEvent) -> List[str]:
+        bot = active.bot
+        if not bot.kelly_bot or not bot.kelly_bot.portfolio:
+            return ["probability table unavailable"]
+
+        try:
+            current_count = bot._get_market_cumulative_count()
+        except Exception:
+            current_count = bot._last_known_count or 0
+        effective_count = bot.get_effective_count_for_dead_bins(current_count)
+        hours_elapsed, hours_remaining = bot._get_timing()
+
+        probabilities = list(bot._cached_probabilities or [])
+        if not probabilities:
+            probabilities = list(bot.kelly_bot.portfolio.probabilities or [])
+        if not probabilities:
+            return ["probability table unavailable (no cached probabilities)"]
+
+        forecast_line = (
+            f"state: count={effective_count} time_left={self._format_time_remaining(hours_remaining)} "
+            f"forecast_as_of={self._fmt_slack_timestamp(bot._cached_forecast_time)}"
+        )
+        if bot._cached_forecast_mean is None:
+            forecast_summary = "forecast: unavailable"
+        elif bot._cached_forecast_breakdown:
+            past_count = bot._cached_forecast_breakdown["past_count"]
+            past_days = bot._cached_forecast_breakdown["past_days"]
+            remaining_days = bot._cached_forecast_breakdown["remaining_days"]
+            forecast_remaining = bot._cached_forecast_mean - past_count
+            std_part = (
+                f" (std {bot._cached_forecast_std:.0f})"
+                if bot._cached_forecast_std is not None else ""
+            )
+            forecast_summary = (
+                f"forecast: {past_count} ({past_days}d actual) + "
+                f"{forecast_remaining:.0f} ({remaining_days}d forecast) = "
+                f"{bot._cached_forecast_mean:.0f}{std_part}"
+            )
+        else:
+            std_part = (
+                f" +/- {bot._cached_forecast_std:.0f}"
+                if bot._cached_forecast_std is not None else ""
+            )
+            forecast_summary = f"forecast: {bot._cached_forecast_mean:.0f}{std_part}"
+
+        try:
+            yes_prices, no_prices = bot.kelly_bot.portfolio.get_reservation_prices(
+                self.kelly_config.w_floor,
+                self.kelly_config.kelly_fraction,
+            )
+        except Exception:
+            yes_prices = []
+            no_prices = []
+
+        from ..kelly.candidates import compute_buy_yes_threshold
+
+        lines = [
+            forecast_line,
+            forecast_summary,
+            "```",
+            f"{'Bin':<4} {'Range':<9} {'Model':>6} {'c*_Y':>6} {'Y.Ask':>6} {'Y.Thr':>6} {'c*_N':>6} {'N.Ask':>6} {'N.Thr':>6} {'Y.Pos':>7} {'N.Pos':>7} {'Signal':>8}",
+        ]
+
+        for bin_idx, (lower, upper) in enumerate(bot._market_bins):
+            if upper < effective_count:
+                continue
+
+            range_label = self._format_bin_range_label(lower, upper)
+            model_prob = probabilities[bin_idx] if bin_idx < len(probabilities) else 0.0
+            kelly_yes = yes_prices[bin_idx] if bin_idx < len(yes_prices) else model_prob
+            kelly_no = no_prices[bin_idx] if bin_idx < len(no_prices) else 1.0 - model_prob
+            yes_threshold = compute_buy_yes_threshold(kelly_yes, self.kelly_config.edge_buffer)
+            no_threshold = compute_buy_yes_threshold(kelly_no, self.kelly_config.edge_buffer)
+
+            token_id = bot.kelly_bot.bin_token_ids.get(bin_idx)
+            orderbook = bot.kelly_bot.orderbook_manager.get_orderbook(token_id) if token_id else None
+            yes_ask = orderbook.best_yes_ask if orderbook else None
+            no_ask = orderbook.best_no_ask if orderbook else None
+
+            position = bot.kelly_bot.portfolio.get_position(bin_idx)
+            yes_pos = position.yes_shares if position else 0.0
+            no_pos = position.no_shares if position else 0.0
+
+            signal = ""
+            if no_ask is not None and no_ask <= no_threshold:
+                signal = "BUY_NO"
+            elif yes_ask is not None and yes_ask <= yes_threshold:
+                signal = "BUY_YES"
+
+            yes_pos_str = f"{yes_pos:6.0f}" if yes_pos > 0 else "     -"
+            no_pos_str = f"{no_pos:6.0f}" if no_pos > 0 else "     -"
+            yes_ask_str = f"{yes_ask * 100:5.1f}%" if yes_ask is not None else "  N/A "
+            no_ask_str = f"{no_ask * 100:5.1f}%" if no_ask is not None else "  N/A "
+
+            lines.append(
+                f"{bin_idx:<4} {range_label:<9} {model_prob:>5.1%} "
+                f"{kelly_yes * 100:>5.1f}% {yes_ask_str:>6} {yes_threshold * 100:>5.1f}% "
+                f"{kelly_no * 100:>5.1f}% {no_ask_str:>6} {no_threshold * 100:>5.1f}% "
+                f"{yes_pos_str:>7} {no_pos_str:>7} {signal:>8}"
+            )
+
+        lines.append("```")
+        return lines
+
+    def _build_fill_summary_event_lines(self, event_id: str) -> List[str]:
+        active = self._active_events.get(event_id)
+        if not active:
+            return [f"event={event_id} current_state=unavailable (inactive)"]
+
+        lines = [f"event={active.info.short_name} ({event_id})"]
+        lines.extend(self._format_event_holdings_lines(active))
+        lines.extend(self._format_event_probability_table_lines(active))
+        return lines
 
     def _notify_slack(
         self,
@@ -442,7 +653,7 @@ class MultiEventManager:
         lines = [
             f"mode={'DRY RUN' if self.config.dry_run else 'LIVE'} active={health['active_events']} pending={health['pending_events']}",
             f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
-            f"data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')} refreshed_at={health.get('last_data_refresh_time') or 'n/a'}",
+            f"data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')} refreshed_at={self._fmt_slack_timestamp(health.get('last_data_refresh_time'))}",
         ]
         if health["active_event_names"]:
             lines.append("events=" + ", ".join(health["active_event_names"][:5]))
@@ -457,11 +668,12 @@ class MultiEventManager:
         realtime = health.get("realtime_tracker", {})
         return (
             health.get("status"),
-            health.get("errors_count"),
             user_stream.get("connected", False),
+            bool(health.get("errors_count")),
+            bool(health.get("frozen_events")),
             realtime.get("enabled", False),
             bool(realtime.get("backoff_until")),
-            min(int(realtime.get("consecutive_errors", 0) or 0), 3),
+            bool((realtime.get("consecutive_errors", 0) or 0) >= 3),
         )
 
     def _maybe_notify_health(self, *, force: bool = False) -> None:
@@ -489,7 +701,7 @@ class MultiEventManager:
                 return
 
         lines = [
-            f"status={health['status']} uptime={health['uptime_hours']:.1f}h active={health['active_events']} pending={health['pending_events']}",
+            f"status={health['status']} uptime={health['uptime_hours']:.1f}h active={health['active_events']} pending={health['pending_events']} as_of={self._fmt_slack_timestamp(health.get('timestamp'))}",
             f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
             f"errors={health['errors_count']} data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')}",
         ]
@@ -500,7 +712,7 @@ class MultiEventManager:
         realtime = health.get("realtime_tracker", {})
         if realtime.get("enabled", False):
             lines.append(
-                f"realtime errors={realtime.get('consecutive_errors', 0)} last_poll={realtime.get('last_poll_time') or 'n/a'}"
+                f"realtime errors={realtime.get('consecutive_errors', 0)} last_poll={self._fmt_slack_timestamp(realtime.get('last_poll_time'))}"
             )
         if health["active_event_names"]:
             lines.append("events=" + ", ".join(health["active_event_names"][:5]))
@@ -552,9 +764,21 @@ class MultiEventManager:
     ) -> None:
         if fill_event.status != OrderStatus.CONFIRMED:
             return
+        seen_at = datetime.now(self._tz)
+        self._prune_seen_fill_notification_keys(seen_at)
+        dedupe_key = (
+            f"{event_info.event_id}:{fill_event.order_id}:{fill_event.match_id or 'nomatch'}:"
+            f"{bin_index}:{fill_event.side}:{fill_event.size:.8f}:{fill_event.price:.8f}"
+        )
+        if dedupe_key in self._seen_fill_notification_keys:
+            return
+        self._seen_fill_notification_keys[dedupe_key] = seen_at
         self._pending_fill_notifications.append(
             FillNotification(
+                event_id=event_info.event_id,
                 event_short_name=event_info.short_name,
+                order_id=fill_event.order_id,
+                match_id=fill_event.match_id,
                 bin_index=bin_index,
                 bin_range=bin_range,
                 side=fill_event.side,
@@ -566,7 +790,8 @@ class MultiEventManager:
             )
         )
         if self._first_pending_fill_at is None:
-            self._first_pending_fill_at = datetime.now(self._tz)
+            self._first_pending_fill_at = seen_at
+        self._last_pending_fill_at = seen_at
 
     def _maybe_flush_fill_summaries(self, *, force: bool = False) -> None:
         if not self.slack_notifier or not self._pending_fill_notifications:
@@ -574,26 +799,33 @@ class MultiEventManager:
 
         now = datetime.now(self._tz)
         interval = self.slack_notifier.fill_summary_interval_seconds
+        quiet_interval = getattr(self.slack_notifier, "fill_summary_quiet_seconds", 0)
         started_at = self._first_pending_fill_at or now
-        if not force and interval > 0 and (now - started_at).total_seconds() < interval:
+        last_fill_at = self._last_pending_fill_at or started_at
+        interval_elapsed = interval <= 0 or (now - started_at).total_seconds() >= interval
+        quiet_elapsed = quiet_interval > 0 and (now - last_fill_at).total_seconds() >= quiet_interval
+        if not force and not interval_elapsed and not quiet_elapsed:
             return
 
         fills = self._pending_fill_notifications
         self._pending_fill_notifications = []
         self._first_pending_fill_at = None
+        self._last_pending_fill_at = None
 
-        event_totals: Dict[str, Tuple[int, float]] = {}
+        event_totals: Dict[str, Tuple[str, int, float]] = {}
         for fill in fills:
-            count, total_notional = event_totals.get(fill.event_short_name, (0, 0.0))
-            event_totals[fill.event_short_name] = (count + 1, total_notional + fill.notional)
+            _, count, total_notional = event_totals.get(fill.event_id, (fill.event_short_name, 0, 0.0))
+            event_totals[fill.event_id] = (fill.event_short_name, count + 1, total_notional + fill.notional)
 
         lines = [
-            f"window={started_at.isoformat()} -> {now.isoformat()} fills={len(fills)} total_notional={self._fmt_usd(sum(fill.notional for fill in fills))} events={len(event_totals)}",
+            f"window={self._fmt_slack_timestamp(started_at)} -> {self._fmt_slack_timestamp(now)} fills={len(fills)} total_notional={self._fmt_usd(sum(fill.notional for fill in fills))} events={len(event_totals)}",
         ]
-        for event_name, (count, total_notional) in sorted(
-            event_totals.items(),
-            key=lambda item: (-item[1][0], item[0]),
-        )[: self.slack_notifier.fill_summary_max_examples]:
+        for event_name, count, total_notional in (
+            item[1] for item in sorted(
+                event_totals.items(),
+                key=lambda item: (-item[1][1], item[1][0]),
+            )[: self.slack_notifier.fill_summary_max_examples]
+        ):
             lines.append(
                 f"{event_name}: fills={count} notional={self._fmt_usd(total_notional)}"
             )
@@ -605,8 +837,18 @@ class MultiEventManager:
                 if fill.bin_range else str(fill.bin_index)
             )
             lines.append(
-                f"{fill.event_short_name}: {fill.side} bin={bin_label} size={fill.size:.2f} price={fill.price:.4f} notional={self._fmt_usd(fill.notional)}"
+                f"{fill.event_short_name}: {fill.side} bin={bin_label} size={fill.size:.2f} price={fill.price:.4f} notional={self._fmt_usd(fill.notional)} at={self._fmt_slack_timestamp(fill.timestamp)}"
             )
+
+        detailed_event_ids = [
+            event_id for event_id, _ in sorted(
+                event_totals.items(),
+                key=lambda item: (-item[1][1], item[1][0]),
+            )[: self.slack_notifier.fill_summary_max_examples]
+        ]
+        for event_id in detailed_event_ids:
+            lines.append("")
+            lines.extend(self._build_fill_summary_event_lines(event_id))
 
         self._notify_slack("info", "Fill summary", lines)
 

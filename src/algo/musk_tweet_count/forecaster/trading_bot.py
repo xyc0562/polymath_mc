@@ -1039,7 +1039,7 @@ class GASKellyTradingBot:
         if forecast_time:
             time_stamp = forecast_time.strftime("%H:%M:%S")
         else:
-            time_stamp = datetime.now().strftime("%H:%M:%S")
+            time_stamp = datetime.now(self.forecaster.contract_utils.tz).strftime("%H:%M:%S")
 
         # Get Kelly reservation prices (c*) from portfolio
         kelly_yes_prices = {}
@@ -1352,7 +1352,7 @@ class GASKellyTradingBot:
             self._cached_forecast_mean = forecast.mean
             self._cached_forecast_std = forecast.std
             self._cached_forecast_breakdown = forecast_breakdown
-            self._cached_forecast_time = datetime.now()
+            self._cached_forecast_time = datetime.now(self.forecaster.contract_utils.tz)
 
             # Recompute bin probabilities
             self._cached_probabilities = self._compute_probabilities(current_count)
