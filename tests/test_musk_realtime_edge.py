@@ -1,11 +1,17 @@
 import asyncio
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 from src.algo.musk_tweet_count.forecaster.config import ForecasterConfig
 from src.algo.musk_tweet_count.forecaster.data import ContractDayUtils, EventStore, TweetEvent
+from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
+    ActiveEvent,
+    EventInfo,
+    MultiEventManager,
+)
 from src.algo.musk_tweet_count.forecaster.trading_bot import (
     GASKellyTradingBot,
+    TickRequest,
     TradingBotConfig,
 )
 from src.algo.musk_tweet_count.kelly.config import KellyConfig
@@ -146,6 +152,108 @@ def test_sync_tick_requests_coalesce_to_latest_version_and_highest_priority(monk
     ]
     assert bot._last_processed_data_version == 11
     assert bot._last_processed_tick_source == "xtracker"
+
+
+def test_xtracker_noop_cycles_reuse_data_version_but_still_run_once_per_sequence(monkeypatch):
+    bot = _make_bot()
+    calls = []
+
+    async def fake_execute_tick(*, log_header, recompute, allow_authoritative_rebase=False):
+        calls.append((log_header, recompute, allow_authoritative_rebase))
+        return TickResult(
+            num_candidates=0,
+            num_executed=0,
+            total_utility_gain=0.0,
+            executions=[],
+            elapsed_seconds=0.0,
+        )
+
+    monkeypatch.setattr(bot, "_execute_tick", fake_execute_tick)
+
+    asyncio.run(bot._execute_sync_tick_request(TickRequest("xtracker", 31, 100)))
+    asyncio.run(bot._execute_sync_tick_request(TickRequest("xtracker", 31, 100)))
+    asyncio.run(bot._execute_sync_tick_request(TickRequest("xtracker", 31, 101)))
+
+    assert calls == [
+        (True, True, False),
+        (True, True, False),
+    ]
+    assert bot._last_processed_data_version == 31
+    assert bot._last_processed_sync_tick_request_sequence == 101
+    assert bot._last_processed_tick_source == "xtracker"
+
+
+def test_manager_can_queue_xtracker_ticks_for_all_active_events_on_noop_refresh():
+    manager = object.__new__(MultiEventManager)
+    manager.shared_data_version = 31
+    manager._sync_tick_request_sequence = 40
+    manager._events_lock = asyncio.Lock()
+
+    async def fake_wait_for_stabilization(event_id, active):
+        return True
+
+    manager._maybe_wait_for_event_stabilization = fake_wait_for_stabilization
+
+    class FakeBot:
+        def __init__(self):
+            self.requests = []
+
+        def request_sync_tick(self, **kwargs):
+            self.requests.append(kwargs)
+
+    start_day = date(2026, 3, 1)
+    settlement_day = date(2026, 3, 8)
+    info_a = EventInfo(
+        event_id="event-a",
+        title="Event A",
+        short_name="Mar 01 - Mar 08",
+        settlement_date=settlement_day,
+        market_start_date=start_day,
+        bins=[],
+    )
+    info_b = EventInfo(
+        event_id="event-b",
+        title="Event B",
+        short_name="Mar 02 - Mar 09",
+        settlement_date=date(2026, 3, 9),
+        market_start_date=date(2026, 3, 2),
+        bins=[],
+    )
+    bot_a = FakeBot()
+    bot_b = FakeBot()
+    manager._active_events = {
+        "event-a": ActiveEvent(
+            info=info_a,
+            bot=bot_a,
+            task=SimpleNamespace(),
+            started_at=datetime.now(UTC),
+            allocated_capital=100.0,
+        ),
+        "event-b": ActiveEvent(
+            info=info_b,
+            bot=bot_b,
+            task=SimpleNamespace(),
+            started_at=datetime.now(UTC),
+            allocated_capital=100.0,
+        ),
+    }
+
+    asyncio.run(
+        manager._queue_sync_tick_requests(
+            "xtracker",
+            set(),
+            queue_all_active=True,
+        )
+    )
+
+    expected = {
+        "source": "xtracker",
+        "data_version": 31,
+        "request_sequence": 41,
+        "allow_authoritative_rebase": False,
+    }
+    assert bot_a.requests == [expected]
+    assert bot_b.requests == [expected]
 
 
 def test_authoritative_rebase_resets_regression_baseline():

@@ -110,6 +110,7 @@ class TickRequest:
 
     source: str
     data_version: int
+    request_sequence: int
     allow_authoritative_rebase: bool = False
 
 
@@ -194,7 +195,9 @@ class GASKellyTradingBot:
         self._tick_in_progress = False
         self._sync_tick_event = asyncio.Event()
         self._pending_sync_tick: Optional[TickRequest] = None
+        self._next_sync_tick_request_sequence: int = 0
         self._last_processed_data_version: int = 0
+        self._last_processed_sync_tick_request_sequence: int = 0
         self._last_processed_tick_source: Optional[str] = None
 
         # WebSocket-triggered trading
@@ -300,18 +303,30 @@ class GASKellyTradingBot:
         source: str,
         data_version: int,
         *,
+        request_sequence: Optional[int] = None,
         allow_authoritative_rebase: bool = False,
     ) -> None:
         """
         Queue a sync-driven tick request.
 
         Requests are coalesced so the bot will process at most one follow-up tick
-        after any in-flight execution, using the newest data version and the
-        highest-priority source that arrived in the meantime.
+        after any in-flight execution, using the newest request sequence, the
+        newest data version, and the highest-priority source that arrived in
+        the meantime.
         """
+        if request_sequence is None:
+            self._next_sync_tick_request_sequence += 1
+            request_sequence = self._next_sync_tick_request_sequence
+        else:
+            self._next_sync_tick_request_sequence = max(
+                self._next_sync_tick_request_sequence,
+                request_sequence,
+            )
+
         request = TickRequest(
             source=source,
             data_version=data_version,
+            request_sequence=request_sequence,
             allow_authoritative_rebase=allow_authoritative_rebase,
         )
         self._fresh_data_available = True
@@ -325,6 +340,10 @@ class GASKellyTradingBot:
             merged = TickRequest(
                 source=pending.source,
                 data_version=max(pending.data_version, request.data_version),
+                request_sequence=max(
+                    pending.request_sequence,
+                    request.request_sequence,
+                ),
                 allow_authoritative_rebase=(
                     pending.allow_authoritative_rebase or
                     request.allow_authoritative_rebase
@@ -525,32 +544,36 @@ class GASKellyTradingBot:
         """Process one coalesced sync-driven tick request."""
         if request.data_version < self._last_processed_data_version:
             logger.debug(
-                "Skipping stale sync tick request: source=%s version=%s last_processed=%s",
+                "Skipping stale sync tick request: source=%s version=%s request_sequence=%s last_processed=%s",
                 request.source,
                 request.data_version,
+                request.request_sequence,
                 self._last_processed_data_version,
             )
             return None
 
         if (
             request.data_version == self._last_processed_data_version and
+            request.request_sequence <= self._last_processed_sync_tick_request_sequence and
             not request.allow_authoritative_rebase and
             self._sync_tick_priority(request.source) <=
             self._sync_tick_priority(self._last_processed_tick_source)
         ):
             logger.debug(
-                "Skipping duplicate sync tick request: source=%s version=%s",
+                "Skipping duplicate sync tick request: source=%s version=%s request_sequence=%s",
                 request.source,
                 request.data_version,
+                request.request_sequence,
             )
             return None
 
         self._tick_count += 1
         logger.info(
-            "=== Sync-Driven Tick %s (%s, data_version=%s) ===",
+            "=== Sync-Driven Tick %s (%s, data_version=%s, request_sequence=%s) ===",
             self._tick_count,
             request.source,
             request.data_version,
+            request.request_sequence,
         )
 
         result = await self._execute_tick(
@@ -561,6 +584,10 @@ class GASKellyTradingBot:
         self._last_processed_data_version = max(
             self._last_processed_data_version,
             request.data_version,
+        )
+        self._last_processed_sync_tick_request_sequence = max(
+            self._last_processed_sync_tick_request_sequence,
+            request.request_sequence,
         )
         self._last_processed_tick_source = request.source
         self._fresh_data_available = False
@@ -1125,8 +1152,13 @@ class GASKellyTradingBot:
         request = TickRequest(
             source="xtracker",
             data_version=self._last_processed_data_version + 1,
+            request_sequence=max(
+                self._next_sync_tick_request_sequence,
+                self._last_processed_sync_tick_request_sequence,
+            ) + 1,
             allow_authoritative_rebase=False,
         )
+        self._next_sync_tick_request_sequence = request.request_sequence
         return await self._execute_sync_tick_request(request)
 
     async def run(self) -> None:

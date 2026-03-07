@@ -300,6 +300,7 @@ class MultiEventManager:
         )
         self._data_update_lock = asyncio.Lock()
         self.shared_data_version: int = 0
+        self._sync_tick_request_sequence: int = 0
 
         # Sync-driven polling: last known XTracker sync timestamp
         self._last_known_sync: Optional[datetime] = None
@@ -771,6 +772,7 @@ class MultiEventManager:
                 bot.request_sync_tick(
                     source="startup",
                     data_version=self.shared_data_version,
+                    request_sequence=self._next_sync_tick_request_sequence(),
                     allow_authoritative_rebase=False,
                 )
             except Exception as e:
@@ -932,6 +934,10 @@ class MultiEventManager:
     def _next_shared_data_version(self) -> int:
         self.shared_data_version += 1
         return self.shared_data_version
+
+    def _next_sync_tick_request_sequence(self) -> int:
+        self._sync_tick_request_sequence += 1
+        return self._sync_tick_request_sequence
 
     def _event_overlaps_days(self, event_info: EventInfo, days: Set[date]) -> bool:
         if not days:
@@ -1101,18 +1107,20 @@ class MultiEventManager:
         source: str,
         affected_days: Set[date],
         *,
+        queue_all_active: bool = False,
         allow_authoritative_rebase: bool = False,
     ) -> None:
-        if not affected_days:
+        if not queue_all_active and not affected_days:
             return
 
         queue_source = "authoritative_rebase" if allow_authoritative_rebase else source
+        request_sequence = self._next_sync_tick_request_sequence()
 
         async with self._events_lock:
             active_snapshot = list(self._active_events.items())
 
         async def _queue_for_event(event_id: str, active: ActiveEvent) -> None:
-            if not self._event_overlaps_days(active.info, affected_days):
+            if not queue_all_active and not self._event_overlaps_days(active.info, affected_days):
                 return
             if not await self._maybe_wait_for_event_stabilization(event_id, active):
                 return
@@ -1120,6 +1128,7 @@ class MultiEventManager:
             active.bot.request_sync_tick(
                 source=queue_source,
                 data_version=self.shared_data_version,
+                request_sequence=request_sequence,
                 allow_authoritative_rebase=allow_authoritative_rebase,
             )
 
@@ -2202,14 +2211,16 @@ class MultiEventManager:
                         )
 
                         refresh_outcome = await self.refresh_shared_data()
-                        if refresh_outcome.effective_changed:
-                            await self._queue_sync_tick_requests(
-                                "xtracker",
-                                refresh_outcome.affected_days,
-                                allow_authoritative_rebase=refresh_outcome.authoritative_rebase,
-                            )
-                        else:
+                        if not refresh_outcome.effective_changed:
                             logger.info("Authoritative refresh made no effective event-store changes")
+                        # A settled authoritative cycle still needs one sync-driven
+                        # tick per active event even when the shared store is unchanged.
+                        await self._queue_sync_tick_requests(
+                            "xtracker",
+                            refresh_outcome.affected_days,
+                            queue_all_active=True,
+                            allow_authoritative_rebase=refresh_outcome.authoritative_rebase,
+                        )
 
                         # 2. Log cycle timing (soft deadline — always completes)
                         elapsed = (datetime.now(self._tz) - sync_detected_at).total_seconds()
