@@ -145,7 +145,7 @@ class MultiEventConfig:
 
     # Realtime twikit polling for provisional edge detection
     realtime_tracker_enabled: bool = True
-    realtime_poll_interval_seconds: float = 10.0
+    realtime_poll_interval_seconds: float = 20.0
     realtime_fetch_count: int = 40
     realtime_late_tweet_grace_seconds: float = 120.0
     realtime_cookies_path: Optional[str] = None
