@@ -124,6 +124,7 @@ class UserStreamClient:
         self._max_reconnect_delay = 60.0
         self._send_lock = asyncio.Lock()
         self._market_ids: Set[str] = set()
+        self._subscribed_market_ids: Set[str] = set()
 
         # Callbacks
         self.on_fill: Optional[Callable[[FillEvent], None]] = None
@@ -171,6 +172,17 @@ class UserStreamClient:
             "markets": sorted(self._market_ids),
         })
 
+    @staticmethod
+    def _build_market_update_message(
+        market_ids: Iterable[str],
+        operation: str,
+    ) -> str:
+        """Build a dynamic subscription update for an open user-channel socket."""
+        return json.dumps({
+            "markets": sorted({market_id for market_id in market_ids if market_id}),
+            "operation": operation,
+        })
+
     def _is_ws_open(self) -> bool:
         """Return True when the websocket connection is fully open."""
         if self._ws is None:
@@ -210,23 +222,51 @@ class UserStreamClient:
             len(self._market_ids),
         )
         await self._send_message(self._build_subscription_message())
+        self._subscribed_market_ids = set(self._market_ids)
+
+    async def _send_market_update(
+        self,
+        market_ids: Iterable[str],
+        operation: str,
+    ) -> None:
+        """Send a documented subscribe/unsubscribe delta for an open socket."""
+        normalized = sorted({market_id for market_id in market_ids if market_id})
+        if not normalized:
+            return
+
+        logger.info(
+            "[UserWS] Sending %s update for %d market(s)...",
+            operation,
+            len(normalized),
+        )
+        await self._send_message(
+            self._build_market_update_message(normalized, operation)
+        )
 
     async def set_markets(self, market_ids: Iterable[str]) -> None:
         """
         Update the user-channel market filter.
 
-        Polymarket expects market ids in the subscribe payload for user events.
-        Re-send the subscription immediately if the socket is already open.
+        Polymarket supports dynamic subscribe/unsubscribe updates on open sockets.
         """
         normalized = {market_id for market_id in market_ids if market_id}
         if normalized == self._market_ids:
             return
 
+        previous_markets = set(self._market_ids)
         self._market_ids = normalized
         logger.info("[UserWS] Tracking %d market(s) for user events", len(self._market_ids))
 
         if self._is_ws_open():
-            await self._send_subscription()
+            added_markets = self._market_ids - self._subscribed_market_ids
+            removed_markets = self._subscribed_market_ids - self._market_ids
+
+            # Subscribe first so newly tracked markets start streaming immediately.
+            await self._send_market_update(added_markets, "subscribe")
+            await self._send_market_update(removed_markets, "unsubscribe")
+            self._subscribed_market_ids = set(self._market_ids)
+        else:
+            self._subscribed_market_ids = set(previous_markets)
 
     async def start(self) -> None:
         """Start the user stream client."""
@@ -335,6 +375,7 @@ class UserStreamClient:
             ping_timeout=None,
         ) as ws:
             self._ws = ws
+            self._subscribed_market_ids = set()
             self._reconnect_delay = 1.0  # Reset on successful connect
             self._connected_at = datetime.now()
             self._last_message_at = None
@@ -360,6 +401,7 @@ class UserStreamClient:
                 )
 
         self._ws = None
+        self._subscribed_market_ids = set()
         if self.on_disconnected:
             self.on_disconnected()
 

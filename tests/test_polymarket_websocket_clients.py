@@ -26,14 +26,41 @@ def test_user_stream_connection_status_uses_websocket_state():
     assert client.get_connection_status()["connected"] is False
 
 
-def test_user_stream_set_markets_resends_sorted_subscription():
+def test_user_stream_set_markets_sends_subscribe_delta():
     client = UserStreamClient("key", "secret", "pass")
     client._ws = DummyConnection(State.OPEN)
+    client._market_ids = {"market-a"}
+    client._subscribed_market_ids = {"market-a"}
 
-    asyncio.run(client.set_markets(["market-b", "market-a", "market-a"]))
+    asyncio.run(client.set_markets(["market-b", "market-a", "market-c"]))
 
     assert len(client._ws.sent) == 1
     assert json.loads(client._ws.sent[0]) == {
+        "markets": ["market-b", "market-c"],
+        "operation": "subscribe",
+    }
+
+
+def test_user_stream_set_markets_sends_unsubscribe_delta():
+    client = UserStreamClient("key", "secret", "pass")
+    client._ws = DummyConnection(State.OPEN)
+    client._market_ids = {"market-a", "market-b", "market-c"}
+    client._subscribed_market_ids = {"market-a", "market-b", "market-c"}
+
+    asyncio.run(client.set_markets(["market-b"]))
+
+    assert len(client._ws.sent) == 1
+    assert json.loads(client._ws.sent[0]) == {
+        "markets": ["market-a", "market-c"],
+        "operation": "unsubscribe",
+    }
+
+
+def test_user_stream_initial_subscription_includes_auth_and_markets():
+    client = UserStreamClient("key", "secret", "pass")
+    client._market_ids = {"market-b", "market-a"}
+
+    assert json.loads(client._build_subscription_message()) == {
         "type": "user",
         "auth": {
             "apiKey": "key",
