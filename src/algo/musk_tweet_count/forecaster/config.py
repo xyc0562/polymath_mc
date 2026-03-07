@@ -95,7 +95,7 @@ class BucketNowcastConfig:
     impulse_decay_halflife_minutes: float = 30.0       # Excitation decay half-life
     impulse_floor: float = 0.4                         # Minimum rate_mult (extended silence)
     impulse_silence_halflife_minutes: float = 90.0     # Forward decay halflife when in silence (rate_mult < 1)
-    impulse_neutral_fraction: float = 0.3              # Fraction of expected excitation that's "neutral" (rate_mult=1.0)
+    impulse_neutral_fraction: float = 0.8              # Fraction of expected excitation that's "neutral" (rate_mult=1.0)
     impulse_gain: float = 0.6                          # Linear sensitivity of rate_mult to shifted excitation
     impulse_ceiling: float = 3.0                       # Max rate_mult
     impulse_lookback_minutes: int = 360                # How far back for expected excitation calc
