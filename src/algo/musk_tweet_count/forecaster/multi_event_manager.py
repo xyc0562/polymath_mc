@@ -801,6 +801,46 @@ class MultiEventManager:
 
         logger.debug(f"Unregistered tokens for event {event_info.event_id}")
 
+    @staticmethod
+    def _extract_user_stream_market_ids(event_info: EventInfo) -> List[str]:
+        """
+        Extract market ids for Polymarket user-channel subscriptions.
+
+        Multi-bin events expose per-bin condition ids. Those are the most
+        specific market ids we have for routing fill and order events, so prefer
+        them and fall back to the event-level condition id when necessary.
+        """
+        market_ids: List[str] = []
+        seen = set()
+
+        for bin_def in event_info.bins:
+            condition_id = bin_def.get("condition_id")
+            if condition_id and condition_id not in seen:
+                seen.add(condition_id)
+                market_ids.append(condition_id)
+
+        if not market_ids and event_info.condition_id:
+            market_ids.append(event_info.condition_id)
+
+        return market_ids
+
+    async def _sync_user_stream_markets(self) -> None:
+        """Keep the shared user stream aligned with known pending/active markets."""
+        if not self.user_stream:
+            return
+
+        async with self._events_lock:
+            event_infos = [
+                *(active.info for active in self._active_events.values()),
+                *self._pending_events.values(),
+            ]
+
+        market_ids: List[str] = []
+        for event_info in event_infos:
+            market_ids.extend(self._extract_user_stream_market_ids(event_info))
+
+        await self.user_stream.set_markets(market_ids)
+
     def _get_event_trading_rules(self) -> EventTradingRulesConfig:
         """Get event trading rules config, using default if not configured."""
         if self.config.event_trading_rules is not None:
@@ -1195,6 +1235,8 @@ class MultiEventManager:
             self._pending_events[event_id] = event_info
             logger.info(f"Added event {event_id} ({event_info.short_name}) to pending queue")
 
+        await self._sync_user_stream_markets()
+
         # Try to start immediately if running (outside lock to avoid deadlock)
         if self._running:
             await self._try_start_pending_events()
@@ -1278,6 +1320,7 @@ class MultiEventManager:
                 logger.info(f"Event {event_id} expired (t_stop={t_stop}h), removing from pending")
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
+                await self._sync_user_stream_markets()
                 # Return any restored capital allocation (e.g., from reconstruct_state_from_api)
                 # Without this, concluded events with positions leave orphaned allocations
                 allocation = await self.capital_pool.get_allocation(event_id)
@@ -1316,6 +1359,7 @@ class MultiEventManager:
                 await self._start_event(event_info, allocated)
                 async with self._events_lock:
                     self._pending_events.pop(event_id, None)
+                await self._sync_user_stream_markets()
             except Exception as e:
                 logger.error(f"Failed to start event {event_id}: {e}")
                 # Return capital on failure
@@ -1535,6 +1579,8 @@ class MultiEventManager:
                 num_active = len(self._active_events)
                 self._total_events_completed += 1
 
+            await self._sync_user_stream_markets()
+
             logger.info(
                 f"Event {event_id} completed. "
                 f"Active events: {num_active}, "
@@ -1571,6 +1617,7 @@ class MultiEventManager:
 
         # Start global user stream for fill confirmations
         if self.user_stream:
+            await self._sync_user_stream_markets()
             await self.user_stream.start()
             logger.info("Global UserStreamClient started")
 
@@ -2227,6 +2274,8 @@ class MultiEventManager:
             async with self._events_lock:
                 self._pending_events[event_id] = event_info
             logger.info(f"[PRIORITY] Restored event {event_info.short_name} with ${event_values[event_id]:.2f} position value")
+
+        await self._sync_user_stream_markets()
 
         # Second: Add events WITHOUT positions (they need new allocations)
         # Apply duration filter — only auto-start events within configured range

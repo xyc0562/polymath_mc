@@ -18,15 +18,20 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 logger = logging.getLogger(__name__)
 
 # Polymarket User WebSocket endpoint
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+APP_PING_MESSAGE = "PING"
+APP_PONG_MESSAGE = "PONG"
+DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
 
 
 class OrderStatus(Enum):
@@ -113,10 +118,12 @@ class UserStreamClient:
         self.api_passphrase = api_passphrase
 
         # WebSocket state
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws: Optional[ClientConnection] = None
         self._running = False
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
+        self._send_lock = asyncio.Lock()
+        self._market_ids: Set[str] = set()
 
         # Callbacks
         self.on_fill: Optional[Callable[[FillEvent], None]] = None
@@ -143,6 +150,10 @@ class UserStreamClient:
         self._message_count: int = 0
         self._fill_count: int = 0
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+
+        # App-level heartbeat required by Polymarket's WS docs.
+        self.keepalive_interval_seconds: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS
 
     def _generate_auth_object(self) -> Dict[str, str]:
         """Generate authentication object for WebSocket subscription message."""
@@ -151,6 +162,71 @@ class UserStreamClient:
             "secret": self.api_secret,
             "passphrase": self.api_passphrase,
         }
+
+    def _build_subscription_message(self) -> str:
+        """Build the authenticated user-channel subscription payload."""
+        return json.dumps({
+            "type": "user",
+            "auth": self._generate_auth_object(),
+            "markets": sorted(self._market_ids),
+        })
+
+    def _is_ws_open(self) -> bool:
+        """Return True when the websocket connection is fully open."""
+        if self._ws is None:
+            return False
+
+        state = getattr(self._ws, "state", None)
+        if state is not None:
+            return state == State.OPEN
+
+        closed = getattr(self._ws, "closed", None)
+        if closed is not None:
+            return not closed
+
+        return False
+
+    @staticmethod
+    def _format_close_details(exc: ConnectionClosed) -> str:
+        details = f"code={getattr(exc, 'code', 'unknown')}"
+        reason = getattr(exc, "reason", "") or ""
+        if reason:
+            details += f", reason={reason}"
+        return details
+
+    async def _send_message(self, message: str) -> None:
+        """Serialize websocket writes to avoid concurrent send races."""
+        if not self._is_ws_open():
+            return
+
+        async with self._send_lock:
+            if self._ws is not None:
+                await self._ws.send(message)
+
+    async def _send_subscription(self) -> None:
+        """Send the current user-channel subscription payload."""
+        logger.info(
+            "[UserWS] Sending subscription message for %d market(s)...",
+            len(self._market_ids),
+        )
+        await self._send_message(self._build_subscription_message())
+
+    async def set_markets(self, market_ids: Iterable[str]) -> None:
+        """
+        Update the user-channel market filter.
+
+        Polymarket expects market ids in the subscribe payload for user events.
+        Re-send the subscription immediately if the socket is already open.
+        """
+        normalized = {market_id for market_id in market_ids if market_id}
+        if normalized == self._market_ids:
+            return
+
+        self._market_ids = normalized
+        logger.info("[UserWS] Tracking %d market(s) for user events", len(self._market_ids))
+
+        if self._is_ws_open():
+            await self._send_subscription()
 
     async def start(self) -> None:
         """Start the user stream client."""
@@ -175,6 +251,11 @@ class UserStreamClient:
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(),
             name="user_stream_heartbeat"
+        )
+
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(),
+            name="user_stream_keepalive"
         )
 
         logger.info("User stream client started")
@@ -204,6 +285,13 @@ class UserStreamClient:
             except asyncio.CancelledError:
                 pass
 
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -219,13 +307,16 @@ class UserStreamClient:
             try:
                 await self._connect_and_listen()
             except ConnectionClosed as e:
-                logger.warning(f"WebSocket connection closed: {e}")
+                logger.warning(
+                    "[UserWS] WebSocket connection closed: %s",
+                    self._format_close_details(e),
+                )
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
+                logger.error(f"[UserWS] WebSocket error: {e}")
 
             if self._running:
                 # Reconnect with exponential backoff
-                logger.info(f"Reconnecting in {self._reconnect_delay}s...")
+                logger.info(f"[UserWS] Reconnecting in {self._reconnect_delay}s...")
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(
                     self._reconnect_delay * 2,
@@ -239,12 +330,14 @@ class UserStreamClient:
         async with websockets.connect(
             USER_WS_URL,
             open_timeout=20,  # Allow more time for initial handshake
-            ping_interval=30,
-            ping_timeout=10,
+            close_timeout=10,
+            ping_interval=None,
+            ping_timeout=None,
         ) as ws:
             self._ws = ws
             self._reconnect_delay = 1.0  # Reset on successful connect
             self._connected_at = datetime.now()
+            self._last_message_at = None
             self._message_count = 0
             self._fill_count = 0
 
@@ -253,19 +346,20 @@ class UserStreamClient:
             if self.on_connected:
                 self.on_connected()
 
-            # Subscribe to user channel with authentication in the message
-            # Polymarket expects auth in the subscription message, not HTTP headers
-            subscribe_msg = json.dumps({
-                "type": "user",
-                "auth": self._generate_auth_object(),
-            })
-            logger.info("[UserWS] Sending subscription message...")
-            await ws.send(subscribe_msg)
+            await self._send_subscription()
 
             # Listen for messages
             async for message in ws:
                 await self._handle_message(message)
 
+            if self._running:
+                logger.warning(
+                    "[UserWS] WebSocket closed by server (code=%s, reason=%s)",
+                    getattr(ws, "close_code", None),
+                    getattr(ws, "close_reason", None) or "none",
+                )
+
+        self._ws = None
         if self.on_disconnected:
             self.on_disconnected()
 
@@ -275,13 +369,20 @@ class UserStreamClient:
             self._last_message_at = datetime.now()
             self._message_count += 1
 
+            raw = message.strip() if isinstance(message, str) else message
+            if raw == APP_PONG_MESSAGE:
+                return
+            if raw == APP_PING_MESSAGE:
+                logger.debug("[UserWS] Received unexpected PING from server")
+                return
+
             data = json.loads(message)
             await self._process_data(data)
 
         except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON message: {message}")
+            logger.warning(f"[UserWS] Invalid JSON message: {message}")
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"[UserWS] Error handling message: {e}")
 
     async def _process_data(self, data: Any) -> None:
         """Recursively process data, handling nested lists."""
@@ -302,9 +403,14 @@ class UserStreamClient:
         elif event_type == "order":
             await self._handle_order_event(data)
         elif data.get("type") == "subscribed":
-            logger.info("[UserWS] Subscription CONFIRMED - ready to receive fill events")
+            logger.info(
+                "[UserWS] Subscription confirmed for %d market(s)",
+                len(self._market_ids),
+            )
         elif data.get("type") == "pong":
             pass  # Heartbeat response
+        elif data.get("type") == "error":
+            logger.warning("[UserWS] Server error: %s", data)
         else:
             logger.debug(f"[UserWS] Unknown event: {data}")
 
@@ -498,8 +604,7 @@ class UserStreamClient:
                 else:
                     last_msg_str = "none"
 
-                # Connection status (use getattr for compatibility with different websocket libs)
-                connected = self._ws is not None and not getattr(self._ws, 'closed', True)
+                connected = self._is_ws_open()
 
                 # Pending orders
                 pending_count = len(self._pending_orders)
@@ -515,6 +620,27 @@ class UserStreamClient:
                 break
             except Exception as e:
                 logger.error(f"Error in heartbeat loop: {e}")
+
+    async def _keepalive_loop(self) -> None:
+        """Send Polymarket-required app-level PING frames on the user socket."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.keepalive_interval_seconds)
+
+                if not self._is_ws_open():
+                    continue
+
+                await self._send_message(APP_PING_MESSAGE)
+
+            except asyncio.CancelledError:
+                break
+            except ConnectionClosed as e:
+                logger.warning(
+                    "[UserWS] Keepalive ping failed: %s",
+                    self._format_close_details(e),
+                )
+            except Exception as e:
+                logger.warning(f"[UserWS] Keepalive ping failed: {e}")
 
     async def add_pending_order(self, order: PendingOrder) -> None:
         """Add an order to pending tracking."""
@@ -562,7 +688,7 @@ class UserStreamClient:
         - on_fill_callback_set: bool, whether callback is configured
         """
         now = datetime.now()
-        connected = self._ws is not None and not getattr(self._ws, 'closed', True)
+        connected = self._is_ws_open()
 
         uptime_seconds = 0.0
         if self._connected_at:

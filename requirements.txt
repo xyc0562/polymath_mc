@@ -76,6 +76,6 @@ typing_extensions==4.15.0
 tzlocal==5.3.1
 urllib3==2.6.3
 web3==7.14.0
-websockets==15.0.1
+websockets==16.0
 webvtt-py==0.5.1
 yarl==1.22.0

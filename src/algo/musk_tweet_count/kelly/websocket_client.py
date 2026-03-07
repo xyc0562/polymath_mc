@@ -15,11 +15,15 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 from .orderbook import UnifiedOrderbook, OrderbookLevel
 
 logger = logging.getLogger(__name__)
+APP_PING_MESSAGE = "PING"
+APP_PONG_MESSAGE = "PONG"
 
 
 @dataclass
@@ -32,8 +36,8 @@ class WebSocketConfig:
     # Delay between reconnection attempts
     reconnect_delay_seconds: float = 5.0
 
-    # Heartbeat interval to keep connection alive
-    heartbeat_interval_seconds: float = 30.0
+    # Polymarket expects app-level PING messages roughly every 10 seconds.
+    heartbeat_interval_seconds: float = 10.0
 
     # WebSocket endpoint
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -69,7 +73,7 @@ class OrderbookWebSocket:
         self.on_orderbook_update = on_orderbook_update
 
         # Connection state
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws: Optional[ClientConnection] = None
         self._running = False
         self._connected = False
 
@@ -88,11 +92,48 @@ class OrderbookWebSocket:
         # Tasks
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._send_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self._connected and self._ws is not None
+        return self._connected and self._is_ws_open()
+
+    def _is_ws_open(self) -> bool:
+        """Return True when the websocket is fully open."""
+        if self._ws is None:
+            return False
+
+        state = getattr(self._ws, "state", None)
+        if state is not None:
+            return state == State.OPEN
+
+        closed = getattr(self._ws, "closed", None)
+        if closed is not None:
+            return not closed
+
+        return False
+
+    @staticmethod
+    def _format_close_details(exc: ConnectionClosed) -> str:
+        details = f"code={getattr(exc, 'code', 'unknown')}"
+        reason = getattr(exc, "reason", "") or ""
+        if reason:
+            details += f", reason={reason}"
+        return details
+
+    async def _send_message(self, payload: str) -> None:
+        """Serialize websocket writes to avoid concurrent send races."""
+        if not self._is_ws_open():
+            return
+
+        async with self._send_lock:
+            if self._ws is not None:
+                await self._ws.send(payload)
+
+    async def _send_json(self, payload: dict) -> None:
+        """Send a JSON payload over the websocket."""
+        await self._send_message(json.dumps(payload))
 
     async def connect(self) -> None:
         """Establish WebSocket connection."""
@@ -106,8 +147,9 @@ class OrderbookWebSocket:
             self._ws = await websockets.connect(
                 self.config.ws_url,
                 open_timeout=20,
-                ping_interval=self.config.heartbeat_interval_seconds,
-                ping_timeout=10,
+                close_timeout=10,
+                ping_interval=None,
+                ping_timeout=None,
             )
             self._connected = True
             self._reconnect_delay = 1.0  # Reset on successful connect
@@ -191,7 +233,7 @@ class OrderbookWebSocket:
         }
 
         try:
-            await self._ws.send(json.dumps(msg))
+            await self._send_json(msg)
             self._subscribed_tokens.update(token_ids)
             logger.info(f"Subscribed to {len(token_ids)} tokens")
         except Exception as e:
@@ -208,7 +250,7 @@ class OrderbookWebSocket:
         }
 
         try:
-            await self._ws.send(json.dumps(msg))
+            await self._send_json(msg)
             self._subscribed_tokens -= set(token_ids)
             logger.info(f"Unsubscribed from {len(token_ids)} tokens")
         except Exception as e:
@@ -223,11 +265,18 @@ class OrderbookWebSocket:
                     continue
 
                 message = await self._ws.recv()
+                if isinstance(message, str):
+                    raw = message.strip()
+                    if raw in {APP_PING_MESSAGE, APP_PONG_MESSAGE}:
+                        continue
                 data = json.loads(message)
                 self._process_data(data)
 
-            except ConnectionClosed:
-                logger.warning("WebSocket connection closed")
+            except ConnectionClosed as e:
+                logger.warning(
+                    "WebSocket connection closed: %s",
+                    self._format_close_details(e),
+                )
                 self._connected = False
                 if self._running:
                     await self._reconnect()
@@ -245,13 +294,14 @@ class OrderbookWebSocket:
             try:
                 await asyncio.sleep(self.config.heartbeat_interval_seconds)
 
-                if self._ws and self._connected:
-                    # websockets library handles ping/pong automatically,
-                    # but we can send a custom heartbeat if needed
-                    pass
+                if self.is_connected:
+                    await self._send_message(APP_PING_MESSAGE)
 
             except asyncio.CancelledError:
                 break
+
+            except ConnectionClosed as e:
+                logger.warning(f"Heartbeat error: {self._format_close_details(e)}")
 
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
@@ -273,8 +323,9 @@ class OrderbookWebSocket:
                 self._ws = await websockets.connect(
                     self.config.ws_url,
                     open_timeout=20,
-                    ping_interval=self.config.heartbeat_interval_seconds,
-                    ping_timeout=10,
+                    close_timeout=10,
+                    ping_interval=None,
+                    ping_timeout=None,
                 )
                 self._connected = True
                 self._reconnect_delay = 1.0  # Reset on successful connect
