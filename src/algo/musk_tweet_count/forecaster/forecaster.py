@@ -580,8 +580,8 @@ class TweetCountForecaster:
         settlement_dt, _ = self.contract_utils.get_contract_day_bounds(settlement_date)
 
         # Calculate elapsed and remaining
-        hours_elapsed = (now - start_dt).total_seconds() / 3600
-        hours_remaining = (settlement_dt - now).total_seconds() / 3600
+        hours_elapsed = self.contract_utils.hours_between(start_dt, now)
+        hours_remaining = self.contract_utils.hours_between(now, settlement_dt)
 
         return max(0, hours_elapsed), max(0, hours_remaining)
 

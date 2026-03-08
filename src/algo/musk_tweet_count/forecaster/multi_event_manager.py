@@ -893,9 +893,8 @@ class MultiEventManager:
         event_duration_days = (event_info.settlement_date - event_info.market_start_date).days
 
         # Calculate counting start time (noon ET on market_start_date)
-        counting_start_dt = datetime.combine(
-            event_info.market_start_date,
-            datetime.min.time().replace(hour=17)  # 12:00 ET = 17:00 UTC
+        counting_start_dt, _ = self.contract_utils.get_contract_day_bounds_utc(
+            event_info.market_start_date
         )
         hours_until_counting = (counting_start_dt - now).total_seconds() / 3600
         counting_started = hours_until_counting <= 0
@@ -1227,10 +1226,9 @@ class MultiEventManager:
                 return False
 
             # Check if event is still tradeable
-            now = datetime.utcnow()
-            settlement_dt = datetime.combine(
-                event_info.settlement_date,
-                datetime.min.time().replace(hour=17)  # Noon ET = 17:00 UTC
+            now = datetime.now(timezone.utc)
+            settlement_dt, _ = self.contract_utils.get_contract_day_bounds_utc(
+                event_info.settlement_date
             )
 
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
@@ -1323,10 +1321,9 @@ class MultiEventManager:
 
         for event_id, event_info in pending_snapshot:
             # Check timing again
-            now = datetime.utcnow()
-            settlement_dt = datetime.combine(
-                event_info.settlement_date,
-                datetime.min.time().replace(hour=17)
+            now = datetime.now(timezone.utc)
+            settlement_dt, _ = self.contract_utils.get_contract_day_bounds_utc(
+                event_info.settlement_date
             )
             hours_to_settlement = (settlement_dt - now).total_seconds() / 3600
 

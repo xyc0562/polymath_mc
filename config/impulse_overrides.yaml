@@ -8,4 +8,4 @@ overrides:
     start: 1200   # 8:00 AM ET (3h before settlement)
     end: 1440     # 12:00 PM ET (settlement)
     floor: 1.0    # No silence penalty in final 4 hours
-    # ceiling: not set → uses global default (3.0)
+    # ceiling: not set -> uses global default (3.8)

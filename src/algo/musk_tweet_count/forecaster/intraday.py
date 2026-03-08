@@ -239,7 +239,7 @@ class BurstFeatureExtractor:
         count_180m = self._count_in_window(timestamps, now, self.config.window_180m)
 
         # Last gap feature (with edge case handling)
-        last_gap_min = self._compute_last_gap(timestamps, tau, num_tweets)
+        last_gap_min = self._compute_last_gap(timestamps, now, tau, num_tweets)
 
         # In session flag
         in_session = self._compute_in_session(last_gap_min, num_tweets)
@@ -274,6 +274,7 @@ class BurstFeatureExtractor:
     def _compute_last_gap(
         self,
         timestamps: List[datetime],
+        now: datetime,
         tau: int,
         num_tweets: int,
     ) -> float:
@@ -287,17 +288,16 @@ class BurstFeatureExtractor:
         """
         if num_tweets == 0:
             # No tweets today: gap = time since noon
-            return float(tau)
+            contract_date = self.contract_utils.get_contract_date(now)
+            start_dt, _ = self.contract_utils.get_contract_day_bounds(contract_date)
+            return self.contract_utils.minutes_between(start_dt, now)
         elif num_tweets == 1:
             # One tweet: gap = time since that tweet
-            # But we need the current tau vs that tweet's tau
-            # For simplicity, use time since that tweet to 'now'
-            return float(tau)  # Approximate
+            return self.contract_utils.minutes_between(timestamps[0], now)
         else:
             # Normal case: gap between last two tweets
             sorted_ts = sorted(timestamps)
-            gap = sorted_ts[-1] - sorted_ts[-2]
-            return gap.total_seconds() / 60.0
+            return self.contract_utils.minutes_between(sorted_ts[-2], sorted_ts[-1])
 
     def _compute_in_session(self, last_gap_min: float, num_tweets: int) -> bool:
         """Determine if currently in an active session."""
@@ -1037,18 +1037,17 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             f"σ={sigma:.0f}min (from {total_tweets} tweets, {len(day_counts)} days)"
         )
 
-    def _get_last_tweet_tau(
+    def _get_last_tweet_timestamp(
         self,
         events: List[TweetEvent],
-        contract_date: date,
         now: datetime,
-    ) -> Optional[int]:
-        """Get τ of the most recent tweet, or None if no tweets today."""
+    ) -> Optional[datetime]:
+        """Get timestamp of the most recent tweet before now, or None."""
         past_events = [e for e in events if e.timestamp < now]
         if not past_events:
             return None
         last = max(past_events, key=lambda e: e.timestamp)
-        return self.contract_utils.get_tau(last.timestamp, contract_date)
+        return last.timestamp
 
     def predict(
         self,
@@ -1206,15 +1205,17 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             # Actual excitation: each tweet adds a decaying boost
             excitation = 0.0
             for e in events:
-                e_tau = self.contract_utils.get_tau(e.timestamp, contract_date)
-                if e_tau < tau_now:
-                    excitation += math.exp(-decay * (tau_now - e_tau))
+                if e.timestamp < now:
+                    age_min = self.contract_utils.minutes_between(e.timestamp, now)
+                    if age_min > 0:
+                        excitation += math.exp(-decay * age_min)
 
             # Expected excitation from rate curve lookback
             lookback = self.config.impulse_lookback_minutes
             expected_excitation = 0.0
             for t in range(1, lookback + 1):
-                past_tau = tau_now - t
+                past_time = now - timedelta(minutes=t)
+                past_tau = self.contract_utils.get_tau(past_time, contract_date)
                 if 0 <= past_tau < 1440:
                     expected_excitation += self._rate_curve[past_tau] * math.exp(-decay * t)
 
@@ -1251,8 +1252,12 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
 
             # Logging
-            last_tweet_tau = self._get_last_tweet_tau(events, contract_date, now)
-            silence_min = (tau_now - last_tweet_tau) if last_tweet_tau is not None else tau_now
+            last_tweet_ts = self._get_last_tweet_timestamp(events, now)
+            if last_tweet_ts is not None:
+                silence_min = self.contract_utils.minutes_between(last_tweet_ts, now)
+            else:
+                start_dt, _ = self.contract_utils.get_contract_day_bounds(contract_date)
+                silence_min = self.contract_utils.minutes_between(start_dt, now)
 
             self._last_impulse = {
                 "silence_min": silence_min,

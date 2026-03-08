@@ -11,7 +11,7 @@ Handles:
 import csv
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -107,6 +107,33 @@ class ContractDayUtils:
             tzinfo=self.tz
         )
         return start, end
+
+    def get_contract_day_bounds_utc(self, contract_date: date) -> Tuple[datetime, datetime]:
+        """
+        Get start and end datetimes for a contract-day in UTC.
+
+        Args:
+            contract_date: The contract date
+
+        Returns:
+            Tuple of (start_dt_utc, end_dt_utc) where end is exclusive
+        """
+        start, end = self.get_contract_day_bounds(contract_date)
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+    def minutes_between(self, start: datetime, end: datetime) -> float:
+        """
+        Get real elapsed minutes between two timezone-aware datetimes.
+
+        This normalizes both endpoints to UTC first, so DST transitions do not
+        create phantom jumps or backwards time.
+        """
+        delta = end.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+        return delta.total_seconds() / 60.0
+
+    def hours_between(self, start: datetime, end: datetime) -> float:
+        """Get real elapsed hours between two timezone-aware datetimes."""
+        return self.minutes_between(start, end) / 60.0
 
     def get_current_contract_date(self) -> date:
         """Get the current contract-day."""

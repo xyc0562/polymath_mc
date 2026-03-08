@@ -35,6 +35,7 @@ from py_clob_client.clob_types import ApiCreds
 
 from src.utils.crypto_utils import load_private_key
 from src.algo.musk_tweet_count.forecaster.config import ForecasterConfig
+from src.algo.musk_tweet_count.forecaster.data import ContractDayUtils
 from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventManager,
     MultiEventConfig,
@@ -50,6 +51,7 @@ from src.algo.musk_tweet_count.kelly.config import (
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 
 logger = logging.getLogger(__name__)
+CONTRACT_UTILS = ContractDayUtils()
 
 
 def log_config_summary(
@@ -457,11 +459,7 @@ async def discover_musk_tweet_events(clob_client: ClobClient) -> List[EventInfo]
 
         # Check if event hasn't settled yet
         now = datetime.now(timezone.utc)
-        settlement_dt = datetime.combine(
-            settlement,
-            datetime.min.time().replace(hour=17),  # Noon ET = 17:00 UTC
-            tzinfo=timezone.utc,
-        )
+        settlement_dt, _ = CONTRACT_UTILS.get_contract_day_bounds_utc(settlement)
 
         if now >= settlement_dt:
             logger.debug(f"Skipping settled event: {event_title}")
@@ -857,10 +855,8 @@ async def main() -> None:
 
         for event in sorted(events, key=lambda e: e.settlement_date):
             now = datetime.now(timezone.utc)
-            settlement_dt = datetime.combine(
-                event.settlement_date,
-                datetime.min.time().replace(hour=17),
-                tzinfo=timezone.utc,
+            settlement_dt, _ = CONTRACT_UTILS.get_contract_day_bounds_utc(
+                event.settlement_date
             )
             hours_remaining = (settlement_dt - now).total_seconds() / 3600
 
