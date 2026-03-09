@@ -545,7 +545,7 @@ def test_run_tick_does_not_rebuy_when_api_is_stale_after_confirmed_fill():
                 max_orders_per_tick=3,
                 tick_timeout_seconds=5.0,
                 overlay_reconciliation_grace_seconds=90.0,
-                integrity_freeze_max_seconds=300.0,
+                integrity_freeze_max_seconds=180.0,
             )
         )
         executor.order_executor = order_executor

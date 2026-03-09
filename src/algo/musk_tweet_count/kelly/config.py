@@ -134,7 +134,7 @@ class RateLimitConfig:
     # Hard deadline for an event integrity freeze. Once exceeded, the executor
     # drops any residual overlay, trusts the latest API snapshot, logs a
     # critical recovery event, and resumes trading from API state.
-    integrity_freeze_max_seconds: float = 300.0
+    integrity_freeze_max_seconds: float = 180.0
 
 
 
