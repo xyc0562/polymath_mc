@@ -498,28 +498,6 @@ def generate_candidates(
             if candidate:
                 candidates.append(candidate)
 
-    # Log rejection reasons if verbose
-    if verbose and rejection_reasons:
-        logger.info("Candidate rejection reasons:")
-        for bin_idx in sorted(rejection_reasons.keys()):
-            reasons = rejection_reasons[bin_idx]
-            logger.info(f"  Bin {bin_idx}: {'; '.join(reasons)}")
-
-    # Log ALL buy candidates with utility gains (for debugging multi-bin Kelly)
-    if verbose:
-        buy_candidates = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
-        if buy_candidates:
-            logger.info("All BUY candidates (sorted by utility gain):")
-            # Sort by utility for display
-            buy_sorted = sorted(buy_candidates, key=lambda c: c.utility_gain, reverse=True)
-            for c in buy_sorted[:10]:  # Top 10
-                logger.info(
-                    f"  Bin {c.bin_index} {c.action.value}: "
-                    f"util={c.utility_gain:.6f} edge={c.edge:+.2%} "
-                    f"fair={c.reservation_price:.3f} vwap={c.price:.3f} "
-                    f"size={c.size:.1f}"
-                )
-
     # Separate sells from buys
     # Sells are processed first (exit at fair value or better, not utility-based)
     # Then buys are sorted by utility gain
@@ -529,6 +507,33 @@ def generate_candidates(
     # Sort buys by utility gain per dollar spent (descending).
     # With a small screening chunk ($2), this approximates marginal utility per dollar.
     buys.sort(key=lambda c: c.utility_gain / c.cost if c.cost > 0 else 0, reverse=True)
+
+    # Log rejection reasons and candidate ordering if verbose
+    if verbose and rejection_reasons:
+        logger.info("Candidate rejection reasons:")
+        for bin_idx in sorted(rejection_reasons.keys()):
+            reasons = rejection_reasons[bin_idx]
+            logger.info(f"  Bin {bin_idx}: {'; '.join(reasons)}")
+
+    if verbose and sells:
+        logger.info("All SELL candidates (priority order):")
+        for c in sells[:10]:
+            logger.info(
+                f"  Bin {c.bin_index} {c.action.value}: "
+                f"util={c.utility_gain:.6f} edge={c.edge:+.2%} "
+                f"fair={c.reservation_price:.3f} thresh={c.threshold_price:.3f} "
+                f"vwap={c.price:.3f} size={c.size:.1f}"
+            )
+
+    if verbose and buys:
+        logger.info("All BUY candidates (priority order):")
+        for c in buys[:10]:
+            logger.info(
+                f"  Bin {c.bin_index} {c.action.value}: "
+                f"util={c.utility_gain:.6f} edge={c.edge:+.2%} "
+                f"fair={c.reservation_price:.3f} thresh={c.threshold_price:.3f} "
+                f"vwap={c.price:.3f} size={c.size:.1f}"
+            )
 
     # Sells come first, then buys
     return sells + buys

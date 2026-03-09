@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, TYPE_CHECKING
 
@@ -860,6 +860,21 @@ class KellyExecutor:
         # Cooldown expired, remove from tracking
         del self._fak_failure_times[bin_index]
         return False
+
+    def _get_fak_cooldown_remaining(self, bin_index: int) -> Optional[float]:
+        """Get remaining FAK cooldown seconds for a bin, or None if inactive."""
+        if bin_index not in self._fak_failure_times:
+            return None
+
+        cooldown = self.config.rate_limit.fak_failure_cooldown_seconds
+        elapsed = time.time() - self._fak_failure_times[bin_index]
+        remaining = cooldown - elapsed
+
+        if remaining > 0:
+            return remaining
+
+        del self._fak_failure_times[bin_index]
+        return None
 
     def _record_fak_failure(self, bin_index: int) -> None:
         """Record a FAK order failure for cooldown tracking."""
@@ -2438,69 +2453,106 @@ class KellyExecutor:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
                 break
 
-            # Pick best candidate (sells come first, then buys by utility/$)
-            # Screening uses $2 chunk so utility_gain is tiny — just require positive.
-            # The real min_utility check happens after optimal sizing below.
-            best = candidates[0]
+            selected: Optional[TradeCandidate] = None
+            selected_after: Optional[Portfolio] = None
+            rejected: List[str] = []
 
-            if best.utility_gain <= 0:
-                logger.debug(
-                    f"[{self.event_name}][SIM iter={sim_iter}] Best candidate utility "
-                    f"{best.utility_gain:.6f} <= 0, stopping"
+            # Scan candidates in returned priority order. Invalid earlier candidates
+            # should not block later candidates from the same simulation iteration.
+            for candidate in candidates:
+                if candidate.utility_gain <= 0:
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            candidate,
+                            "screen_utility<=0",
+                            (
+                                f"screen_util={candidate.utility_gain:.6f} "
+                                f"price={candidate.price:.4f} size={candidate.size:.1f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+
+                cooldown_remaining = self._get_fak_cooldown_remaining(candidate.bin_index)
+                if cooldown_remaining is not None:
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            candidate,
+                            "fak_cooldown",
+                            (
+                                f"remaining={cooldown_remaining:.1f}s "
+                                f"screen_util={candidate.utility_gain:.6f} "
+                                f"price={candidate.price:.4f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+
+                optimal_size = self._find_optimal_size_on(
+                    hyp, candidate, orderbooks, hours_to_settlement
                 )
+
+                if optimal_size < 1.0:
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            candidate,
+                            "optimal_size<1",
+                            (
+                                f"optimal_size={optimal_size:.2f} "
+                                f"screen_util={candidate.utility_gain:.6f} "
+                                f"price={candidate.price:.4f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+
+                sized_candidate = replace(candidate, size=optimal_size)
+                hyp_after = self._simulate_trade(hyp, sized_candidate)
+                from .candidates import _compute_portfolio_utility_gain
+
+                actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, self.config)
+
+                is_sell = sized_candidate.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
+                min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
+                if actual_utility < min_util:
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            sized_candidate,
+                            "sized_utility_below_min",
+                            (
+                                f"screen_util={candidate.utility_gain:.6f} "
+                                f"sized_util={actual_utility:.6f} "
+                                f"min_util={min_util:.6f} "
+                                f"size={optimal_size:.0f} price={candidate.price:.4f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+
+                sized_candidate.utility_gain = actual_utility
+                selected = sized_candidate
+                selected_after = hyp_after
                 break
 
-            # Skip bins in FAK cooldown
-            if self._is_bin_in_fak_cooldown(best.bin_index):
-                candidates = [c for c in candidates if c.bin_index != best.bin_index]
-                if not candidates:
-                    break
-                best = candidates[0]
-                if best.utility_gain <= 0:
-                    break
-                if self._is_bin_in_fak_cooldown(best.bin_index):
-                    break
-
-            # Binary search for optimal size on the HYPOTHETICAL portfolio
-            optimal_size = self._find_optimal_size_on(
-                hyp, best, orderbooks, hours_to_settlement
-            )
-
-            if optimal_size < 1.0:
-                logger.debug(
-                    f"[{self.event_name}][SIM iter={sim_iter}] Optimal size < 1 for "
-                    f"{best.action.value} bin={best.bin_index}, stopping"
-                )
+            if selected is None or selected_after is None:
+                if rejected:
+                    self._log_optimizer_exhausted(sim_iter, rejected, verbose=verbose)
                 break
 
-            best.size = optimal_size
+            hyp = selected_after
+            planned_trades.append(selected)
 
-            # Compute actual utility gain for the optimally-sized trade
-            hyp_after = self._simulate_trade(hyp, best)
-            from .candidates import _compute_portfolio_utility_gain
-            actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, self.config)
-
-            is_sell = best.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
-            min_util = self.config.min_sell_utility if is_sell else self.config.min_buy_utility
-            if actual_utility < min_util:
-                logger.debug(
-                    f"[{self.event_name}][SIM iter={sim_iter}] Optimal-size utility "
-                    f"{actual_utility:.6f} < {min_util} for {best.action.value} "
-                    f"bin={best.bin_index}, stopping"
-                )
-                break
-
-            best.utility_gain = actual_utility
-            hyp = hyp_after
-
-            planned_trades.append(best)
-
-            # Log
-            br = self._bin_range(best.bin_index)
-            bin_info = f"bin={best.bin_index} ({br})" if br else f"bin={best.bin_index}"
             logger.info(
-                f"[{self.event_name}][SIM iter={sim_iter}] {best.action.value} {bin_info} "
-                f"size={optimal_size:.0f} @ {best.price:.4f} util={best.utility_gain:.6f}"
+                f"[{self.event_name}][SIM iter={sim_iter}] {self._candidate_label(selected)} "
+                f"size={selected.size:.0f} @ {selected.price:.4f} util={selected.utility_gain:.6f}"
             )
 
         if planned_trades:
@@ -2816,6 +2868,49 @@ class KellyExecutor:
     def _bin_range(self, bin_index: int) -> str:
         """Get bin range string for logging (e.g., '340-359')."""
         return self._log_context.get("bin_ranges", {}).get(bin_index, "")
+
+    def _candidate_label(self, candidate: TradeCandidate) -> str:
+        """Format a candidate label with action and bin range for logs."""
+        br = self._bin_range(candidate.bin_index)
+        bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
+        return f"{candidate.action.value} {bin_info}"
+
+    def _log_optimizer_rejection(
+        self,
+        sim_iter: int,
+        candidate: TradeCandidate,
+        reason: str,
+        details: str,
+        *,
+        verbose: bool,
+    ) -> str:
+        """Log and return a normalized optimizer rejection summary."""
+        message = (
+            f"[{self.event_name}][SIM iter={sim_iter}] Reject {self._candidate_label(candidate)}: "
+            f"{reason} {details}".rstrip()
+        )
+        if verbose:
+            logger.info(message)
+        else:
+            logger.debug(message)
+        return f"{self._candidate_label(candidate)} -> {reason}"
+
+    def _log_optimizer_exhausted(
+        self,
+        sim_iter: int,
+        rejected: List[str],
+        *,
+        verbose: bool,
+    ) -> None:
+        """Log that all candidates were exhausted for a simulation iteration."""
+        message = (
+            f"[{self.event_name}][SIM iter={sim_iter}] All candidates exhausted: "
+            + "; ".join(rejected)
+        )
+        if verbose:
+            logger.info(message)
+        else:
+            logger.debug(message)
 
     def _log_iter_summary(
         self,

@@ -1,10 +1,14 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 
-from src.algo.musk_tweet_count.kelly.candidates import TradeAction, TradeCandidate
+from src.algo.musk_tweet_count.kelly import candidates as candidates_module
+from src.algo.musk_tweet_count.kelly import executor as executor_module
+from src.algo.musk_tweet_count.kelly.candidates import TradeAction, TradeCandidate, generate_candidates
 from src.algo.musk_tweet_count.kelly.config import KellyConfig, RateLimitConfig
 from src.algo.musk_tweet_count.kelly.executor import KellyExecutor
 from src.algo.musk_tweet_count.kelly.integration import KellyTradingBot
+from src.algo.musk_tweet_count.kelly.orderbook import OrderbookLevel, UnifiedOrderbook
 from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
 from src.algo.musk_tweet_count.kelly.user_stream import FillEvent, OrderStatus
 
@@ -15,16 +19,20 @@ def _make_candidate(
     size: float = 10.0,
     price: float = 0.2,
     bin_index: int = 0,
+    utility_gain: float = 0.01,
+    reservation_price: float = 0.25,
+    threshold_price: float = 0.0,
 ) -> TradeCandidate:
     return TradeCandidate(
         bin_index=bin_index,
         action=action,
         size=size,
         price=price,
-        utility_gain=0.01,
-        reservation_price=0.25,
+        utility_gain=utility_gain,
+        reservation_price=reservation_price,
         edge=0.05,
         limit_price=price,
+        threshold_price=threshold_price or reservation_price,
     )
 
 
@@ -54,22 +62,38 @@ def _make_executor(
     *,
     capital: float = 100.0,
     rate_limit: RateLimitConfig | None = None,
+    probabilities: list[float] | None = None,
 ) -> KellyExecutor:
+    probabilities = probabilities or [1.0]
     config = KellyConfig(rate_limit=rate_limit or RateLimitConfig())
     portfolio = Portfolio(
         initial_capital=capital,
         capital=capital,
-        num_bins=1,
-        probabilities=[1.0],
+        num_bins=len(probabilities),
+        probabilities=probabilities,
     )
     executor = KellyExecutor(
         config=config,
         portfolio=portfolio,
-        token_ids={0: "yes-0"},
-        no_token_ids={0: "no-0"},
+        token_ids={i: f"yes-{i}" for i in range(len(probabilities))},
+        no_token_ids={i: f"no-{i}" for i in range(len(probabilities))},
         event_name="test-event",
     )
     return executor
+
+
+def _make_orderbook(
+    *,
+    bin_index: int = 0,
+    yes_bids: list[tuple[float, float]] | None = None,
+    yes_asks: list[tuple[float, float]] | None = None,
+) -> UnifiedOrderbook:
+    return UnifiedOrderbook(
+        bin_index=bin_index,
+        yes_token_id=f"yes-{bin_index}",
+        yes_bids=[OrderbookLevel(price=price, size=size) for price, size in (yes_bids or [])],
+        yes_asks=[OrderbookLevel(price=price, size=size) for price, size in (yes_asks or [])],
+    )
 
 
 def test_confirmed_buy_overlay_applied_once_and_reconciled():
@@ -249,6 +273,230 @@ def test_kelly_bot_status_exposes_integrity_fields():
     assert status["integrity"]["overlay_entries"] == 3
     assert status["pending_orders"]["count"] == 2
     assert status["pending_orders"]["collateral"] == 12.5
+
+
+def test_generate_candidates_logs_sell_candidates_in_priority_order(monkeypatch, caplog):
+    portfolio = Portfolio(
+        initial_capital=100.0,
+        capital=90.0,
+        num_bins=1,
+        probabilities=[0.5],
+    )
+    portfolio.execute_buy_yes(0, 20.0, 0.5, "yes-0")
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.45, 100.0)],
+            yes_asks=[(0.46, 100.0)],
+        )
+    }
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_YES,
+        size=20.0,
+        price=0.45,
+        bin_index=0,
+        utility_gain=0.012,
+        reservation_price=0.40,
+        threshold_price=0.42,
+    )
+
+    monkeypatch.setattr(candidates_module, "_generate_buy_yes_candidate", lambda **_kwargs: None)
+    monkeypatch.setattr(candidates_module, "_generate_sell_yes_candidate", lambda **_kwargs: sell_candidate)
+    monkeypatch.setattr(candidates_module, "_generate_buy_no_candidate", lambda **_kwargs: None)
+    monkeypatch.setattr(candidates_module, "_generate_sell_no_candidate", lambda **_kwargs: None)
+
+    with caplog.at_level(logging.INFO):
+        candidates = generate_candidates(
+            portfolio=portfolio,
+            orderbooks=orderbooks,
+            config=KellyConfig(),
+            hours_to_settlement=12.0,
+            verbose=True,
+        )
+
+    assert len(candidates) == 1
+    assert candidates[0].action == TradeAction.SELL_YES
+    assert "All SELL candidates (priority order):" in caplog.text
+    assert "Bin 0 SELL_YES" in caplog.text
+
+
+def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monkeypatch, caplog):
+    executor = _make_executor(probabilities=[0.2, 0.3, 0.5])
+    candidates = [
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=0,
+            size=50.0,
+            price=0.72,
+            utility_gain=0.010,
+            reservation_price=0.60,
+            threshold_price=0.60,
+        ),
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=1,
+            size=75.0,
+            price=0.68,
+            utility_gain=0.011,
+            reservation_price=0.55,
+            threshold_price=0.55,
+        ),
+        _make_candidate(
+            action=TradeAction.BUY_YES,
+            bin_index=2,
+            size=80.0,
+            price=0.10,
+            utility_gain=0.040,
+            reservation_price=0.20,
+            threshold_price=0.18,
+        ),
+    ]
+    call_count = {"n": 0}
+
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, verbose
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return list(candidates)
+        return []
+
+    monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
+    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: candidate.size
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_candidate_bin = candidate.bin_index
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: {0: 0.005, 1: 0.020, 2: 0.030}[after._mock_candidate_bin],
+    )
+
+    with caplog.at_level(logging.INFO):
+        planned = executor._compute_optimal_trades(
+            executor.portfolio,
+            {},
+            hours_to_settlement=12.0,
+            verbose=True,
+        )
+
+    assert len(planned) == 1
+    assert planned[0].action == TradeAction.SELL_YES
+    assert planned[0].bin_index == 1
+    assert "Reject SELL_YES bin=0: sized_utility_below_min" in caplog.text
+    assert "[test-event][SIM iter=0] SELL_YES bin=1" in caplog.text
+
+
+def test_compute_optimal_trades_skips_sell_with_size_below_one(monkeypatch):
+    executor = _make_executor(probabilities=[0.4, 0.6])
+    candidates = [
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=0,
+            size=10.0,
+            price=0.50,
+            utility_gain=0.010,
+        ),
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=1,
+            size=25.0,
+            price=0.55,
+            utility_gain=0.011,
+        ),
+    ]
+    call_count = {"n": 0}
+
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, verbose
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return list(candidates)
+        return []
+
+    monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
+    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: 0.0 if candidate.bin_index == 0 else candidate.size
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_candidate_bin = candidate.bin_index
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
+    )
+
+    planned = executor._compute_optimal_trades(
+        executor.portfolio,
+        {},
+        hours_to_settlement=12.0,
+        verbose=False,
+    )
+
+    assert len(planned) == 1
+    assert planned[0].action == TradeAction.SELL_YES
+    assert planned[0].bin_index == 1
+
+
+def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monkeypatch):
+    executor = _make_executor(probabilities=[0.4, 0.6])
+    executor._record_fak_failure(0)
+    candidates = [
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=0,
+            size=30.0,
+            price=0.40,
+            utility_gain=0.010,
+        ),
+        _make_candidate(
+            action=TradeAction.SELL_YES,
+            bin_index=1,
+            size=35.0,
+            price=0.41,
+            utility_gain=0.011,
+        ),
+    ]
+    call_count = {"n": 0}
+
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, verbose
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return list(candidates)
+        return []
+
+    monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
+    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: candidate.size
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_candidate_bin = candidate.bin_index
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
+    )
+
+    planned = executor._compute_optimal_trades(
+        executor.portfolio,
+        {},
+        hours_to_settlement=12.0,
+        verbose=False,
+    )
+
+    assert len(planned) == 1
+    assert planned[0].action == TradeAction.SELL_YES
+    assert planned[0].bin_index == 1
 
 
 def test_run_tick_does_not_rebuy_when_api_is_stale_after_confirmed_fill():
