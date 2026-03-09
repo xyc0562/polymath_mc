@@ -879,7 +879,7 @@ class KellyExecutor:
 
         self._recent_tracking_ttl_seconds = 30.0 * 60.0
         self._recent_tracking_cap = 10_000
-        self._overlay_size_epsilon = 1e-6
+        self._overlay_size_epsilon = 0.01
 
     def _check_rate_limit(self) -> bool:
         """
