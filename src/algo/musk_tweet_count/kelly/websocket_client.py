@@ -332,8 +332,10 @@ class OrderbookWebSocket:
                         continue
                     if raw == APP_PING_MESSAGE:
                         continue
-                data = json.loads(message)
-                self._process_data(data)
+                    if not raw:
+                        continue
+                    data = json.loads(raw)
+                    self._process_data(data)
 
             except ConnectionClosed as e:
                 logger.warning(
