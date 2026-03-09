@@ -612,7 +612,13 @@ class MultiEventManager:
         self,
         active: ActiveEvent,
     ) -> SlackEventCapitalSnapshot:
-        alloc_budget = float(active.allocated_capital)
+        kelly_bot = getattr(active.bot, "kelly_bot", None)
+        event_budget = getattr(
+            getattr(getattr(kelly_bot, "config", None), "collateral", None),
+            "c_event_max",
+            0.0,
+        )
+        alloc_budget = float(event_budget) if event_budget and event_budget > 0 else float(active.allocated_capital)
         idle_cash = alloc_budget
         open_cost = 0.0
         open_liq = 0.0
@@ -620,13 +626,11 @@ class MultiEventManager:
         stale_px_fallback_cost = 0.0
 
         integrity = self._get_event_integrity_summary(active)
-        kelly_bot = getattr(active.bot, "kelly_bot", None)
         portfolio = getattr(kelly_bot, "portfolio", None)
         orderbook_manager = getattr(kelly_bot, "orderbook_manager", None)
         bin_token_ids = getattr(kelly_bot, "bin_token_ids", {}) or {}
 
         if portfolio is not None:
-            idle_cash = float(portfolio.capital)
             for bin_idx, pos in sorted(portfolio.positions.items()):
                 token_id = bin_token_ids.get(bin_idx)
                 orderbook = (
@@ -657,6 +661,7 @@ class MultiEventManager:
                     else:
                         open_liq += pos.no_shares * no_bid
 
+        idle_cash = alloc_budget - open_cost
         open_pnl = open_liq - open_cost
         asset_now = idle_cash + open_liq
         return SlackEventCapitalSnapshot(
@@ -695,7 +700,7 @@ class MultiEventManager:
         open_liq_total = sum(event.open_liq for event in events)
         unallocated_idle = baseline_total - alloc_budget_total
         open_pnl_total = open_liq_total - open_cost_total
-        asset_now_total = unallocated_idle + event_idle_cash_total + open_liq_total
+        asset_now_total = baseline_total + open_pnl_total
         return SlackCapitalSnapshot(
             baseline_total=baseline_total,
             unallocated_idle=unallocated_idle,
@@ -716,7 +721,9 @@ class MultiEventManager:
     def _format_capital_total_line(self, snapshot: SlackCapitalSnapshot) -> str:
         return (
             f"capital: baseline={self._fmt_usd(snapshot.baseline_total)} "
+            f"alloc={self._fmt_usd(snapshot.alloc_budget_total)} "
             f"unallocated_idle={self._fmt_usd(snapshot.unallocated_idle)} "
+            f"event_idle={self._fmt_usd(snapshot.event_idle_cash_total)} "
             f"open_cost={self._fmt_usd(snapshot.open_cost_total)} "
             f"open_liq={self._fmt_usd(snapshot.open_liq_total)} "
             f"open_pnl={self._fmt_usd(snapshot.open_pnl_total)} "

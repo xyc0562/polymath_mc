@@ -80,6 +80,8 @@ def _make_active_event(
     event_id: str,
     short_name: str,
     *,
+    allocated_capital: float = 100.0,
+    event_budget: float = 100.0,
     frozen: bool = False,
     missing_bid: bool = False,
 ) -> ActiveEvent:
@@ -123,6 +125,9 @@ def _make_active_event(
         "unmatched_api_delta_count": 0,
     }
     kelly_bot = SimpleNamespace(
+        config=SimpleNamespace(
+            collateral=SimpleNamespace(c_event_max=event_budget),
+        ),
         portfolio=portfolio,
         orderbook_manager=orderbook_manager,
         bin_token_ids={0: "token-0", 1: "token-1"},
@@ -147,7 +152,7 @@ def _make_active_event(
         bot=bot,
         task=None,
         started_at=datetime(2026, 3, 7, 0, 0, tzinfo=timezone.utc),
-        allocated_capital=100.0,
+        allocated_capital=allocated_capital,
     )
 
 
@@ -227,6 +232,27 @@ def test_capital_snapshot_uses_best_bid_liquidation():
     assert snapshot.events[0].short_name == "Event A"
 
 
+def test_capital_snapshot_uses_effective_event_budget_not_restored_basis():
+    manager = _make_manager()
+    manager._active_events = {
+        "event-a": _make_active_event(
+            "event-a",
+            "Event A",
+            allocated_capital=32.0,
+            event_budget=100.0,
+        )
+    }
+
+    snapshot = manager._build_capital_snapshot()
+
+    assert snapshot.alloc_budget_total == 100.0
+    assert snapshot.unallocated_idle == 150.0
+    assert round(snapshot.event_idle_cash_total, 2) == 95.08
+    assert round(snapshot.asset_now_total, 2) == 250.12
+    assert snapshot.events[0].alloc_budget == 100.0
+    assert round(snapshot.events[0].idle_cash, 2) == 95.08
+
+
 def test_startup_digest_uses_capital_rollup():
     manager = _make_manager()
     manager._active_events = {"event-a": _make_active_event("event-a", "Event A")}
@@ -243,8 +269,28 @@ def test_startup_digest_uses_capital_rollup():
     assert level == "info"
     assert title == "Startup digest"
     assert any("subsystems:" in line for line in lines)
-    assert any("capital: baseline=$250.00" in line for line in lines)
+    assert any("capital: baseline=$250.00 alloc=$100.00" in line for line in lines)
     assert any("asset_now=$250.12" in line for line in lines)
+
+
+def test_event_capital_line_stays_self_consistent_when_restored_basis_is_smaller():
+    manager = _make_manager()
+    manager._active_events = {
+        "event-a": _make_active_event(
+            "event-a",
+            "Event A",
+            allocated_capital=32.0,
+            event_budget=100.0,
+        )
+    }
+
+    lines = manager._format_event_capital_lines(manager._build_capital_snapshot().events)
+
+    assert any(
+        "Event A | alloc=$100.00 idle=$95.08 cost=$4.92 liq=$5.04 pnl=$0.12 asset=$100.12"
+        in line
+        for line in lines
+    )
 
 
 def test_health_digest_is_clamped_when_healthy():
@@ -269,7 +315,7 @@ def test_health_digest_is_clamped_when_healthy():
 
     assert len(sent) == 1
     assert sent[0][1] == "Health digest"
-    assert any("capital: baseline=$250.00" in line for line in sent[0][2])
+    assert any("capital: baseline=$250.00 alloc=$100.00" in line for line in sent[0][2])
 
 
 def test_health_digest_sends_immediately_on_degraded_change():

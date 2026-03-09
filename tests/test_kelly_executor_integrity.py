@@ -361,7 +361,9 @@ def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monk
         return []
 
     monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
-    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: candidate.size
+    executor._find_optimal_size_on = (
+        lambda portfolio, candidate, orderbooks, hours, tick_config=None: candidate.size
+    )
 
     def fake_simulate_trade(portfolio, candidate):
         after = portfolio._copy()
@@ -418,7 +420,10 @@ def test_compute_optimal_trades_skips_sell_with_size_below_one(monkeypatch):
         return []
 
     monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
-    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: 0.0 if candidate.bin_index == 0 else candidate.size
+    executor._find_optimal_size_on = (
+        lambda portfolio, candidate, orderbooks, hours, tick_config=None:
+        0.0 if candidate.bin_index == 0 else candidate.size
+    )
 
     def fake_simulate_trade(portfolio, candidate):
         after = portfolio._copy()
@@ -473,7 +478,9 @@ def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monke
         return []
 
     monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
-    executor._find_optimal_size_on = lambda portfolio, candidate, orderbooks, hours: candidate.size
+    executor._find_optimal_size_on = (
+        lambda portfolio, candidate, orderbooks, hours, tick_config=None: candidate.size
+    )
 
     def fake_simulate_trade(portfolio, candidate):
         after = portfolio._copy()
