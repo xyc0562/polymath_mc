@@ -315,6 +315,11 @@ class OrderbookWebSocket:
         self._subscribed_tokens.clear()
         self._pending_subscriptions.update(tokens_to_resubscribe)
 
+        # Clear stale orderbook cache — incremental price_change events may have
+        # been lost during the disconnect, so the cached data could be wrong.
+        # The next full 'book' snapshot on resubscribe will repopulate correctly.
+        self._orderbooks.clear()
+
         while self._running:
             try:
                 logger.info(f"Reconnecting in {self._reconnect_delay:.1f}s...")
@@ -594,7 +599,11 @@ class OrderbookManager:
                 timestamp=time.time(),
             )
 
+            # Update both manager cache and WS cache so get_orderbook()
+            # returns the fresh data (it prefers the WS cache).
             self._orderbooks[token_id] = orderbook
+            if self._ws_client:
+                self._ws_client._orderbooks[token_id] = orderbook
             return orderbook
 
         except Exception as e:

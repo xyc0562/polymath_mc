@@ -421,15 +421,16 @@ class KellyTradingBot:
             # The executor calls sync_portfolio callback before each generate_candidates() call
             # This ensures we always use official API data, not calculated estimates
 
-            # Fetch fresh orderbooks only for LIVE bins (skip dead bins)
+            # Fetch fresh orderbooks from REST API for all LIVE bins (skip dead bins).
+            # Always fetch from API rather than relying solely on WebSocket cache,
+            # which can become stale and cause trades to be systematically blocked
+            # until restart (when fresh API data is fetched).
             dead_bins = set(identify_dead_bins(self.bin_upper_bounds, current_count))
             orderbooks = {}
             for bin_idx, token_id in self.bin_token_ids.items():
                 if bin_idx in dead_bins:
                     continue  # Skip dead bins - no need to fetch orderbooks
-                if not self.orderbook_manager.get_orderbook(token_id):
-                    await self.orderbook_manager.fetch_orderbook(token_id, bin_idx)
-                ob = self.orderbook_manager.get_orderbook(token_id)
+                ob = await self.orderbook_manager.fetch_orderbook(token_id, bin_idx)
                 if ob:
                     orderbooks[bin_idx] = ob
 
