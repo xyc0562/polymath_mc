@@ -2798,8 +2798,12 @@ class MultiEventManager:
             # Return capital to pool (CapitalPool has its own lock)
             await self.capital_pool.return_capital(event_id, final_value)
 
-            # Shutdown bot
+            # Shutdown bot (unsubscribes its tokens from shared WS locally)
             await bot.shutdown()
+
+            # Reconnect shared orderbook WS so server stops sending data
+            # for the expired event's tokens.
+            await self.orderbook_ws.force_resubscribe()
 
         except Exception as e:
             logger.error(f"Error cleaning up event {event_id}: {e}")

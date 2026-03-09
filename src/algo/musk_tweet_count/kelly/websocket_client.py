@@ -86,12 +86,14 @@ class OrderbookWebSocket:
         self._reconnect_delay = config.reconnect_delay_seconds
         self._max_reconnect_delay = 60.0
 
-        # PONG tracking for dead connection detection
+        # Liveness tracking for dead connection detection
         self._last_pong_time: float = time.time()
+        self._last_message_time: float = time.time()
 
         # Subscriptions
         self._subscribed_tokens: Set[str] = set()
         self._pending_subscriptions: Set[str] = set()
+        self._subscribe_sent: bool = False  # True after first subscribe on this connection
 
         # Orderbook cache
         self._orderbooks: Dict[str, UnifiedOrderbook] = {}
@@ -121,7 +123,7 @@ class OrderbookWebSocket:
             "connected": self.is_connected,
             "subscribed_tokens": len(self._subscribed_tokens),
             "cached_orderbooks": len(self._orderbooks),
-            "last_pong_age_seconds": round(time.time() - self._last_pong_time, 1),
+            "last_message_age_seconds": round(time.time() - self._last_message_time, 1),
         }
 
     @property
@@ -186,13 +188,14 @@ class OrderbookWebSocket:
                 ping_timeout=None,
             )
             self._connected = True
+            self._subscribe_sent = False
             self._reconnect_delay = self.config.reconnect_delay_seconds
             self._last_pong_time = time.time()
             logger.info("WebSocket connected successfully")
 
-            # Resubscribe to any pending tokens (batched to avoid hammering server)
+            # Resubscribe to any pending tokens
             if self._pending_subscriptions:
-                await self._subscribe_batched(list(self._pending_subscriptions))
+                await self._subscribe(list(self._pending_subscriptions))
                 self._pending_subscriptions.clear()
 
             # Start listener and heartbeat tasks
@@ -257,64 +260,84 @@ class OrderbookWebSocket:
             self._pending_subscriptions.update(new_tokens)
 
     async def _subscribe(self, token_ids: List[str]) -> None:
-        """Send subscription message to WebSocket."""
+        """Send subscription message to WebSocket.
+
+        The Polymarket orderbook WS only accepts a single subscribe message
+        per connection.  If a subscribe has already been sent, the new tokens
+        are queued and a reconnect is triggered so they are included in the
+        fresh subscribe on the new connection.
+        """
         if not self._ws:
             return
 
+        self._subscribed_tokens.update(token_ids)
+
+        if self._subscribe_sent:
+            # Can't send another subscribe — queue and reconnect
+            logger.info(
+                f"Subscribe already sent on this connection, "
+                f"queuing {len(token_ids)} new tokens and reconnecting"
+            )
+            await self.force_resubscribe()
+            return
+
+        all_tokens = list(self._subscribed_tokens)
         msg = {
             "type": "MARKET",
-            "assets_ids": token_ids,
+            "assets_ids": all_tokens,
             "auth": {},
         }
 
         try:
             await self._send_json(msg)
-            self._subscribed_tokens.update(token_ids)
-            logger.info(f"Subscribed to {len(token_ids)} tokens")
+            self._subscribe_sent = True
+            logger.info(f"Subscribed to {len(all_tokens)} tokens (added {len(token_ids)} new)")
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
 
-    async def _subscribe_batched(self, token_ids: List[str], batch_size: int = 20, delay: float = 0.5) -> None:
-        """Subscribe in batches to avoid hammering server after reconnect."""
-        for i in range(0, len(token_ids), batch_size):
-            batch = token_ids[i:i + batch_size]
-            await self._subscribe(batch)
-            if i + batch_size < len(token_ids):
-                await asyncio.sleep(delay)
-
     async def unsubscribe(self, token_ids: List[str]) -> None:
-        """Unsubscribe from token updates."""
+        """Unsubscribe from token updates (local state only).
+
+        The Polymarket WS does not support per-token unsubscribe messages,
+        so we only clean up local state here.  Call ``force_resubscribe()``
+        afterwards to reconnect with the pruned token set (e.g. after an
+        event expires).
+        """
         if not token_ids:
             return
 
         token_set = set(token_ids)
 
-        # Always drop local subscription state, even if the socket is already
-        # disconnected. Otherwise dead tokens can linger in the shared client
-        # and get resubscribed on the next reconnect.
+        # Drop local subscription state so dead tokens are not resubscribed
+        # on the next reconnect.
         self._pending_subscriptions -= token_set
         self._subscribed_tokens -= token_set
         for token_id in token_ids:
             self._token_to_bin.pop(token_id, None)
             self._orderbooks.pop(token_id, None)
 
-        if not self._ws or not self.is_connected:
-            logger.info(
-                "Unsubscribed locally from %d tokens (socket disconnected)",
-                len(token_ids),
-            )
+        logger.info(f"Unsubscribed locally from {len(token_ids)} tokens, "
+                     f"{len(self._subscribed_tokens)} remaining")
+
+    async def force_resubscribe(self) -> None:
+        """Force a reconnect so the server only sends updates for current tokens.
+
+        Should be called after removing tokens via ``unsubscribe()`` when you
+        want the server-side subscription to reflect the change (e.g. after
+        event expiry).  Skipped if there are no remaining subscriptions.
+        """
+        if not self._subscribed_tokens:
+            logger.info("No tokens left after unsubscribe, skipping resubscribe")
+            return
+        if not self._ws:
             return
 
-        msg = {
-            "assets_ids": token_ids,
-            "operation": "unsubscribe",
-        }
-
+        logger.info(f"Force-resubscribing with {len(self._subscribed_tokens)} tokens")
         try:
-            await self._send_json(msg)
-            logger.info(f"Unsubscribed from {len(token_ids)} tokens")
-        except Exception as e:
-            logger.error(f"Unsubscribe failed: {e}")
+            await self._ws.close()
+        except Exception:
+            pass
+        # _reconnect is triggered by the listen loop when the WS closes
 
     async def _listen_loop(self) -> None:
         """Main loop to receive and process messages."""
@@ -325,6 +348,7 @@ class OrderbookWebSocket:
                     continue
 
                 message = await self._ws.recv()
+                self._last_message_time = time.time()
                 if isinstance(message, str):
                     raw = message.strip()
                     if raw == APP_PONG_MESSAGE:
@@ -334,7 +358,11 @@ class OrderbookWebSocket:
                         continue
                     if not raw:
                         continue
-                    data = json.loads(raw)
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("Non-JSON message from server: %s", raw[:120])
+                        continue
                     self._process_data(data)
 
             except ConnectionClosed as e:
@@ -354,19 +382,23 @@ class OrderbookWebSocket:
                 await asyncio.sleep(1)
 
     async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats and detect dead connections via PONG timeout."""
+        """Monitor connection liveness by checking for prolonged silence.
+
+        The Polymarket orderbook WS does not support application-level PING;
+        sending one causes an immediate server-side disconnect.  Instead we
+        track the time of the last received message and force-close if the
+        connection has been silent for too long.
+        """
+        silence_limit = 60.0  # seconds of silence before we consider the connection dead
         while self._running:
             try:
                 await asyncio.sleep(self.config.heartbeat_interval_seconds)
 
                 if self.is_connected:
-                    await self._send_message(APP_PING_MESSAGE)
-
-                    # Check for PONG timeout (dead connection detection)
-                    pong_age = time.time() - self._last_pong_time
-                    if pong_age > 30.0:
+                    silence = time.time() - self._last_message_time
+                    if silence > silence_limit:
                         logger.warning(
-                            f"No PONG received for {pong_age:.0f}s, forcing reconnect"
+                            f"No messages received for {silence:.0f}s, forcing reconnect"
                         )
                         if self._ws:
                             await self._ws.close()
@@ -407,13 +439,14 @@ class OrderbookWebSocket:
                     ping_timeout=None,
                 )
                 self._connected = True
+                self._subscribe_sent = False
                 self._reconnect_delay = self.config.reconnect_delay_seconds
                 self._last_pong_time = time.time()
                 logger.info("WebSocket reconnected")
 
-                # Resubscribe (batched to avoid hammering server)
+                # Resubscribe with all pending tokens
                 if self._pending_subscriptions:
-                    await self._subscribe_batched(list(self._pending_subscriptions))
+                    await self._subscribe(list(self._pending_subscriptions))
                     self._pending_subscriptions.clear()
 
                 break

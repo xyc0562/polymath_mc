@@ -109,29 +109,29 @@ class TestRegisterUnregisterCallback:
         assert results == ["tok_abc"]
 
 
-class TestPongTracking:
-    def test_stale_pong_reported_in_health(self):
+class TestSilenceBasedLiveness:
+    def test_stale_message_reported_in_health(self):
         ws = _make_ws()
-        ws._last_pong_time = time.time() - 60.0
+        ws._last_message_time = time.time() - 60.0
         status = ws.get_connection_status()
-        assert status["last_pong_age_seconds"] >= 59.0
+        assert status["last_message_age_seconds"] >= 59.0
 
-    def test_pong_updates_timestamp(self):
+    def test_message_updates_timestamp(self):
         ws = _make_ws()
-        ws._last_pong_time = time.time() - 60.0
-        ws._last_pong_time = time.time()
+        ws._last_message_time = time.time() - 60.0
+        ws._last_message_time = time.time()
         status = ws.get_connection_status()
-        assert status["last_pong_age_seconds"] < 2.0
+        assert status["last_message_age_seconds"] < 2.0
 
-    def test_pong_timeout_triggers_ws_close(self):
-        """Heartbeat loop should close WS when PONG is stale."""
+    def test_silence_timeout_triggers_ws_close(self):
+        """Heartbeat loop should close WS when no messages received for too long."""
         config = WebSocketConfig(heartbeat_interval_seconds=0.01)
         ws = OrderbookWebSocket(config=config)
         dummy = DummyWS(State.OPEN)
         ws._ws = dummy
         ws._connected = True
         ws._running = True
-        ws._last_pong_time = time.time() - 60.0
+        ws._last_message_time = time.time() - 120.0
 
         async def _run():
             task = asyncio.create_task(ws._heartbeat_loop())
@@ -198,24 +198,86 @@ class TestSubscribeUnsubscribeState:
         assert "tok_a" not in ws._subscribed_tokens
 
 
-class TestBatchedResubscription:
-    def test_batched_subscribe_sends_multiple_batches(self):
+class TestSingleSubscribeAll:
+    def test_subscribe_sends_all_tokens_in_one_message(self):
+        """_subscribe sends ALL subscribed tokens (existing + new) in a single message."""
         ws = _make_ws()
         dummy = DummyWS()
         ws._ws = dummy
         ws._connected = True
 
-        tokens = [f"tok_{i}" for i in range(50)]
-        asyncio.run(ws._subscribe_batched(tokens, batch_size=20, delay=0.0))
+        # Pre-existing subscriptions
+        ws._subscribed_tokens = {"tok_existing_1", "tok_existing_2"}
 
-        # Should have sent 3 batches: 20 + 20 + 10
-        assert len(dummy.sent) == 3
-        batch_0 = json.loads(dummy.sent[0])
-        batch_1 = json.loads(dummy.sent[1])
-        batch_2 = json.loads(dummy.sent[2])
-        assert len(batch_0["assets_ids"]) == 20
-        assert len(batch_1["assets_ids"]) == 20
-        assert len(batch_2["assets_ids"]) == 10
+        new_tokens = ["tok_new_1", "tok_new_2", "tok_new_3"]
+        asyncio.run(ws._subscribe(new_tokens))
+
+        # Should send exactly 1 message containing all 5 tokens
+        assert len(dummy.sent) == 1
+        msg = json.loads(dummy.sent[0])
+        assert msg["type"] == "MARKET"
+        assert set(msg["assets_ids"]) == {
+            "tok_existing_1", "tok_existing_2",
+            "tok_new_1", "tok_new_2", "tok_new_3",
+        }
+
+
+    def test_second_subscribe_triggers_reconnect(self):
+        """Second _subscribe call should queue tokens and close WS for reconnect."""
+        ws = _make_ws()
+        dummy = DummyWS()
+        ws._ws = dummy
+        ws._connected = True
+
+        # First subscribe — goes through normally
+        asyncio.run(ws._subscribe(["tok_a", "tok_b"]))
+        assert ws._subscribe_sent is True
+        assert len(dummy.sent) == 1
+
+        # Second subscribe — should close WS instead of sending
+        asyncio.run(ws._subscribe(["tok_c"]))
+        assert dummy._closed is True
+        # New tokens are added to _subscribed_tokens for reconnect
+        assert "tok_c" in ws._subscribed_tokens
+
+
+class TestForceResubscribe:
+    def test_force_resubscribe_closes_ws(self):
+        """force_resubscribe() should close the WS so the listen loop reconnects."""
+        ws = _make_ws()
+        dummy = DummyWS()
+        ws._ws = dummy
+        ws._connected = True
+        ws._subscribed_tokens = {"tok_a", "tok_b"}
+
+        asyncio.run(ws.force_resubscribe())
+        assert dummy._closed is True
+
+    def test_force_resubscribe_skipped_when_no_tokens(self):
+        """force_resubscribe() is a no-op if no tokens remain."""
+        ws = _make_ws()
+        dummy = DummyWS()
+        ws._ws = dummy
+        ws._connected = True
+        ws._subscribed_tokens = set()
+
+        asyncio.run(ws.force_resubscribe())
+        assert dummy._closed is False
+
+    def test_unsubscribe_then_force_resubscribe(self):
+        """Unsubscribe removes tokens locally, force_resubscribe closes WS."""
+        ws = _make_ws()
+        dummy = DummyWS()
+        ws._ws = dummy
+        ws._connected = True
+        ws._subscribed_tokens = {"tok_a", "tok_b", "tok_c"}
+        ws._token_to_bin = {"tok_a": 0, "tok_b": 1, "tok_c": 2}
+
+        asyncio.run(ws.unsubscribe(["tok_a", "tok_b"]))
+        assert ws._subscribed_tokens == {"tok_c"}
+
+        asyncio.run(ws.force_resubscribe())
+        assert dummy._closed is True
 
 
 class TestReconnectDelay:
@@ -512,8 +574,11 @@ class TestSharedWSMultipleManagersLifecycle:
             await manager_a.start()
             await manager_b.start()
 
-            await manager_a.subscribe_bins([{"token_id": "tok_a", "bin_index": 0}])
-            await manager_b.subscribe_bins([{"token_id": "tok_b", "bin_index": 1}])
+            # Set up subscription state directly to avoid triggering the
+            # single-subscribe-per-connection reconnect logic (tested elsewhere).
+            manager_a._token_to_bin = {"tok_a": 0}
+            manager_b._token_to_bin = {"tok_b": 1}
+            shared_ws._subscribed_tokens = {"tok_a", "tok_b"}
 
             # Both receive their updates
             shared_ws._handle_book_update(_make_book_data("tok_a"))
