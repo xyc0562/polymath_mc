@@ -755,6 +755,7 @@ class ImpulseOverrideWindow:
     end: int     # tau end
     floor: Optional[float] = None
     ceiling: Optional[float] = None
+    impulse_decay_halflife: Optional[float] = None  # Override excitation decay halflife (minutes)
 
 
 @dataclass
@@ -785,6 +786,7 @@ def _load_impulse_overrides(path: str) -> List[ImpulseOverrideWindow]:
                 end=int(window["end"]),
                 floor=window.get("floor"),
                 ceiling=window.get("ceiling"),
+                impulse_decay_halflife=window.get("impulse_decay_halflife"),
             ))
         logger.info(f"Loaded {len(overrides)} impulse override windows from {path}")
         return overrides
@@ -1403,6 +1405,18 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         if use_impulse:
             tau_now = int(tau)
             halflife = self.config.impulse_decay_halflife_minutes
+
+            # Check if a time-of-day override changes the decay halflife
+            active_override_name = None
+            active_override = None
+            for ov in self._impulse_overrides:
+                if ov.start <= tau_now < ov.end:
+                    active_override = ov
+                    active_override_name = ov.name
+                    if ov.impulse_decay_halflife is not None:
+                        halflife = ov.impulse_decay_halflife
+                    break
+
             decay = math.log(2) / halflife
 
             # Actual excitation: each tweet adds a decaying boost
@@ -1438,19 +1452,15 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             rate_mult = 1.0 + self.config.impulse_gain * shifted
             rate_mult = max(self.config.impulse_floor, min(self.config.impulse_ceiling, rate_mult))
 
-            # Apply time-of-day overrides
-            active_override_name = None
-            for ov in self._impulse_overrides:
-                if ov.start <= tau_now < ov.end:
-                    ov_floor = ov.floor if ov.floor is not None else self.config.impulse_floor
-                    ov_ceiling = ov.ceiling if ov.ceiling is not None else self.config.impulse_ceiling
-                    rate_mult = max(ov_floor, min(ov_ceiling, rate_mult))
-                    active_override_name = ov.name
-                    break
+            # Apply time-of-day floor/ceiling overrides
+            if active_override is not None:
+                ov_floor = active_override.floor if active_override.floor is not None else self.config.impulse_floor
+                ov_ceiling = active_override.ceiling if active_override.ceiling is not None else self.config.impulse_ceiling
+                rate_mult = max(ov_floor, min(ov_ceiling, rate_mult))
 
             # Asymmetric forward decay
             if rate_mult >= 1.0:
-                forward_decay = decay  # boost: halflife = 30 min
+                forward_decay = decay  # boost: halflife matches current decay
             else:
                 forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
 
