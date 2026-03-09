@@ -2656,7 +2656,7 @@ class KellyExecutor:
                     continue
 
                 optimal_size = self._find_optimal_size_on(
-                    hyp, candidate, orderbooks, hours_to_settlement
+                    hyp, candidate, orderbooks, hours_to_settlement, self.config
                 )
 
                 if optimal_size < 1.0:
