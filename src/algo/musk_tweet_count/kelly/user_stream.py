@@ -417,8 +417,10 @@ class UserStreamClient:
             if raw == APP_PING_MESSAGE:
                 logger.debug("[UserWS] Received unexpected PING from server")
                 return
+            if not raw:
+                return
 
-            data = json.loads(message)
+            data = json.loads(raw)
             await self._process_data(data)
 
         except json.JSONDecodeError:
