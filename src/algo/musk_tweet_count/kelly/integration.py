@@ -28,7 +28,7 @@ from .orderbook import UnifiedOrderbook
 from .portfolio import Portfolio
 from .candidates import TradeCandidate
 from .executor import KellyExecutor, OrderExecutor, ExecutionResult, TickResult
-from .websocket_client import OrderbookManager, WebSocketConfig
+from .websocket_client import OrderbookManager, OrderbookWebSocket, WebSocketConfig
 from .kelly_math import identify_dead_bins, renormalize_probabilities
 from .market_aware import compute_market_aware_blend
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
@@ -60,6 +60,7 @@ class KellyTradingBot:
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
         external_user_stream: Optional[UserStreamClient] = None,
+        external_orderbook_ws: Optional[OrderbookWebSocket] = None,
         disable_websocket: bool = False,
         event_name: Optional[str] = None,
     ):
@@ -83,6 +84,7 @@ class KellyTradingBot:
             event_name: Optional event name for logging (e.g., "Feb 03 - Feb 10")
         """
         self._external_user_stream = external_user_stream
+        self._external_orderbook_ws = external_orderbook_ws
         self.event_name = event_name or "unknown"
         self._owns_user_stream = False  # Will be set in setup()
         self._disable_websocket = disable_websocket
@@ -162,6 +164,7 @@ class KellyTradingBot:
         self.orderbook_manager = OrderbookManager(
             config=ws_config,
             clob_client=self.clob_client,
+            ws_client=self._external_orderbook_ws,
         )
 
         # Start orderbook streaming

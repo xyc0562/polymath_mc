@@ -21,6 +21,7 @@ from ..kelly.config import KellyConfig
 from ..kelly.integration import KellyTradingBot
 from ..kelly.executor import TickResult
 from ..kelly.user_stream import UserStreamClient
+from ..kelly.websocket_client import OrderbookWebSocket
 
 if TYPE_CHECKING:
     from .data import EventStore
@@ -135,6 +136,7 @@ class GASKellyTradingBot:
         bot_config: TradingBotConfig,
         event_store: "EventStore",
         user_stream: Optional[UserStreamClient] = None,
+        orderbook_ws: Optional[OrderbookWebSocket] = None,
     ):
         """
         Initialize the trading bot.
@@ -149,6 +151,7 @@ class GASKellyTradingBot:
                         (if None, bot will create its own if API credentials available)
         """
         self._external_user_stream = user_stream
+        self._external_orderbook_ws = orderbook_ws
         self.clob_client = clob_client
         self.kelly_config = kelly_config
         self.forecaster_config = forecaster_config
@@ -650,6 +653,7 @@ class GASKellyTradingBot:
             api_secret=os.getenv("CLOB_API_SECRET"),
             api_passphrase=os.getenv("CLOB_API_PASSPHRASE"),
             external_user_stream=self._external_user_stream,
+            external_orderbook_ws=self._external_orderbook_ws,
             disable_websocket=self.bot_config.disable_websocket,
             event_name=self.bot_config.event_name,
         )

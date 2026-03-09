@@ -37,6 +37,7 @@ from ..musk_tweet_count import XTrackerClient as TrackingsXTrackerClient
 from ..kelly.config import KellyConfig, EventTradingRulesConfig
 from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
+from ..kelly.websocket_client import OrderbookWebSocket, WebSocketConfig
 from ..kelly.executor import BalanceAllowanceErrorContext
 
 try:
@@ -222,6 +223,7 @@ class MultiEventConfig:
     # Trading bot configuration (shared across events)
     tick_interval_seconds: int = 300
     dry_run: bool = True
+    disable_websocket: bool = False
 
     # Forecaster configuration
     training_days: int = 45
@@ -449,6 +451,15 @@ class MultiEventManager:
             logger.info("Global UserStreamClient created for fill confirmations")
         else:
             logger.warning("No API credentials for user stream - fill confirmations disabled")
+
+        # Global shared OrderbookWebSocket (single connection for all events)
+        # Same pattern as UserStreamClient above — one connection, shared by all bots
+        ws_config = WebSocketConfig(enabled=not self.config.disable_websocket)
+        self.orderbook_ws = OrderbookWebSocket(config=ws_config)
+        if self.config.disable_websocket:
+            logger.info("Global OrderbookWebSocket disabled")
+        else:
+            logger.info("Global OrderbookWebSocket created")
 
         # Mapping from token_id to (event_id, bin_index) for fill routing
         self._token_to_event: Dict[str, Tuple[str, int]] = {}
@@ -2594,6 +2605,7 @@ class MultiEventManager:
             initial_capital=allocated_capital,
             training_days=self.config.training_days,
             use_gas=self.config.use_gas,
+            disable_websocket=self.config.disable_websocket,
             event_name=event_info.short_name,
             projection_model=self.config.projection_model,
             sync_driven=True,
@@ -2620,6 +2632,7 @@ class MultiEventManager:
             bot_config=bot_config,
             event_store=self.shared_event_store,
             user_stream=self.user_stream,  # Pass global user stream
+            orderbook_ws=None if self.config.disable_websocket else self.orderbook_ws,
         )
 
         # Setup bot (expensive, do outside lock)
@@ -2839,6 +2852,11 @@ class MultiEventManager:
             await self._sync_user_stream_markets()
             await self.user_stream.start()
             logger.info("Global UserStreamClient started")
+
+        # Start global orderbook WebSocket (single shared connection)
+        if self.orderbook_ws.config.enabled:
+            await self.orderbook_ws.connect()
+            logger.info("Global OrderbookWebSocket connected")
 
         # Pre-fetch shared tweet data (once for all events)
         await self.prefetch_shared_data()
@@ -3076,6 +3094,11 @@ class MultiEventManager:
         if tasks_to_wait:
             await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
+        # Stop global orderbook WebSocket
+        if self.orderbook_ws.config.enabled:
+            await self.orderbook_ws.disconnect()
+            logger.info("Global OrderbookWebSocket disconnected")
+
         # Stop global user stream
         if self.user_stream:
             await self.user_stream.stop()
@@ -3266,6 +3289,9 @@ class MultiEventManager:
                 if self._last_xtracker_refresh_time else None
             ),
 
+            # Orderbook WebSocket status
+            "orderbook_ws": self.orderbook_ws.get_connection_status(),
+
             # Active event details
             "active_event_names": [
                 active.info.short_name for active in self._active_events.values()
@@ -3388,6 +3414,14 @@ class MultiEventManager:
         last_msg = user_stream.get('last_message_age_seconds')
         if last_msg is not None:
             logger.info(f"    Last message: {last_msg:.0f}s ago")
+        logger.info("")
+        logger.info("  ORDERBOOK WS:")
+        ob_ws = health.get('orderbook_ws', {})
+        logger.info(f"    Enabled: {ob_ws.get('enabled', False)}")
+        logger.info(f"    Connected: {ob_ws.get('connected', False)}")
+        logger.info(f"    Subscribed tokens: {ob_ws.get('subscribed_tokens', 0)}")
+        logger.info(f"    Cached orderbooks: {ob_ws.get('cached_orderbooks', 0)}")
+        logger.info(f"    Last PONG age: {ob_ws.get('last_pong_age_seconds')}s")
         logger.info("")
         logger.info("  REALTIME TRACKER:")
         realtime = health.get('realtime_tracker', {})

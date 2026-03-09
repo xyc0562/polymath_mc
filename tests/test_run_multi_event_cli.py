@@ -36,3 +36,9 @@ def test_parse_args_accepts_max_per_event_flag():
     args = parse_args(["--max-per-event", "325"])
 
     assert args.max_per_event == 325.0
+
+
+def test_parse_args_accepts_no_ws_flag():
+    args = parse_args(["--no-ws"])
+
+    assert args.no_ws is True

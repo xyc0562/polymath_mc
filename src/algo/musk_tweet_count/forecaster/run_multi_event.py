@@ -143,6 +143,7 @@ def log_config_summary(
     # Multi-event
     w("  MULTI-EVENT")
     w(f"    Tick interval:           {multi_event_config.tick_interval_seconds}s")
+    w(f"    Orderbook websocket:     {not multi_event_config.disable_websocket}")
     w(f"    Event duration filter:   {multi_event_config.min_event_duration_days}-{multi_event_config.max_event_duration_days} days")
     w(f"    Projection model:        {multi_event_config.projection_model}")
     w(f"    Event scan interval:     {multi_event_config.event_scan_interval}s")
@@ -692,6 +693,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Run in dry-run mode (no real orders)",
     )
     parser.add_argument(
+        "--no-ws",
+        action="store_true",
+        help="Disable market-data websocket streaming and use REST orderbook fetches only.",
+    )
+    parser.add_argument(
         "--live",
         action="store_true",
         help="Run in live mode (real orders)",
@@ -1211,6 +1217,7 @@ async def main() -> None:
         max_per_event=max_per_event,
         tick_interval_seconds=args.tick_interval,
         dry_run=dry_run,
+        disable_websocket=args.no_ws,
         event_trading_rules=event_trading_rules,
         projection_model=args.projection,
         min_event_duration_days=args.min_event_days,

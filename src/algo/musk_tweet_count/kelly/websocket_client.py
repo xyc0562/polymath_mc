@@ -68,9 +68,14 @@ class OrderbookWebSocket:
             config: WebSocket configuration
             on_orderbook_update: Optional callback for orderbook updates.
                                  Called with (token_id, orderbook).
+                                 For backward compat; auto-registered as a callback.
         """
         self.config = config
-        self.on_orderbook_update = on_orderbook_update
+
+        # Multi-callback support: each OrderbookManager registers its own callback
+        self._update_callbacks: List[Callable[[str, UnifiedOrderbook], None]] = []
+        if on_orderbook_update:
+            self._update_callbacks.append(on_orderbook_update)
 
         # Connection state
         self._ws: Optional[ClientConnection] = None
@@ -78,8 +83,11 @@ class OrderbookWebSocket:
         self._connected = False
 
         # Reconnect state with exponential backoff
-        self._reconnect_delay = 1.0
+        self._reconnect_delay = config.reconnect_delay_seconds
         self._max_reconnect_delay = 60.0
+
+        # PONG tracking for dead connection detection
+        self._last_pong_time: float = time.time()
 
         # Subscriptions
         self._subscribed_tokens: Set[str] = set()
@@ -93,6 +101,28 @@ class OrderbookWebSocket:
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._send_lock = asyncio.Lock()
+
+    def register_callback(self, cb: Callable[[str, UnifiedOrderbook], None]) -> None:
+        """Register an orderbook update callback."""
+        if cb not in self._update_callbacks:
+            self._update_callbacks.append(cb)
+
+    def unregister_callback(self, cb: Callable[[str, UnifiedOrderbook], None]) -> None:
+        """Unregister an orderbook update callback."""
+        try:
+            self._update_callbacks.remove(cb)
+        except ValueError:
+            pass
+
+    def get_connection_status(self) -> dict:
+        """Get connection health status."""
+        return {
+            "enabled": self.config.enabled,
+            "connected": self.is_connected,
+            "subscribed_tokens": len(self._subscribed_tokens),
+            "cached_orderbooks": len(self._orderbooks),
+            "last_pong_age_seconds": round(time.time() - self._last_pong_time, 1),
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -137,6 +167,10 @@ class OrderbookWebSocket:
 
     async def connect(self) -> None:
         """Establish WebSocket connection."""
+        if not self.config.enabled:
+            logger.info("WebSocket disabled, skipping connect")
+            return
+
         if self._running:
             return
 
@@ -152,12 +186,13 @@ class OrderbookWebSocket:
                 ping_timeout=None,
             )
             self._connected = True
-            self._reconnect_delay = 1.0  # Reset on successful connect
+            self._reconnect_delay = self.config.reconnect_delay_seconds
+            self._last_pong_time = time.time()
             logger.info("WebSocket connected successfully")
 
-            # Resubscribe to any pending tokens
+            # Resubscribe to any pending tokens (batched to avoid hammering server)
             if self._pending_subscriptions:
-                await self._subscribe(list(self._pending_subscriptions))
+                await self._subscribe_batched(list(self._pending_subscriptions))
                 self._pending_subscriptions.clear()
 
             # Start listener and heartbeat tasks
@@ -239,9 +274,35 @@ class OrderbookWebSocket:
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
 
+    async def _subscribe_batched(self, token_ids: List[str], batch_size: int = 20, delay: float = 0.5) -> None:
+        """Subscribe in batches to avoid hammering server after reconnect."""
+        for i in range(0, len(token_ids), batch_size):
+            batch = token_ids[i:i + batch_size]
+            await self._subscribe(batch)
+            if i + batch_size < len(token_ids):
+                await asyncio.sleep(delay)
+
     async def unsubscribe(self, token_ids: List[str]) -> None:
         """Unsubscribe from token updates."""
-        if not self._ws or not token_ids:
+        if not token_ids:
+            return
+
+        token_set = set(token_ids)
+
+        # Always drop local subscription state, even if the socket is already
+        # disconnected. Otherwise dead tokens can linger in the shared client
+        # and get resubscribed on the next reconnect.
+        self._pending_subscriptions -= token_set
+        self._subscribed_tokens -= token_set
+        for token_id in token_ids:
+            self._token_to_bin.pop(token_id, None)
+            self._orderbooks.pop(token_id, None)
+
+        if not self._ws or not self.is_connected:
+            logger.info(
+                "Unsubscribed locally from %d tokens (socket disconnected)",
+                len(token_ids),
+            )
             return
 
         msg = {
@@ -251,7 +312,6 @@ class OrderbookWebSocket:
 
         try:
             await self._send_json(msg)
-            self._subscribed_tokens -= set(token_ids)
             logger.info(f"Unsubscribed from {len(token_ids)} tokens")
         except Exception as e:
             logger.error(f"Unsubscribe failed: {e}")
@@ -267,7 +327,10 @@ class OrderbookWebSocket:
                 message = await self._ws.recv()
                 if isinstance(message, str):
                     raw = message.strip()
-                    if raw in {APP_PING_MESSAGE, APP_PONG_MESSAGE}:
+                    if raw == APP_PONG_MESSAGE:
+                        self._last_pong_time = time.time()
+                        continue
+                    if raw == APP_PING_MESSAGE:
                         continue
                 data = json.loads(message)
                 self._process_data(data)
@@ -289,13 +352,22 @@ class OrderbookWebSocket:
                 await asyncio.sleep(1)
 
     async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to keep connection alive."""
+        """Send periodic heartbeats and detect dead connections via PONG timeout."""
         while self._running:
             try:
                 await asyncio.sleep(self.config.heartbeat_interval_seconds)
 
                 if self.is_connected:
                     await self._send_message(APP_PING_MESSAGE)
+
+                    # Check for PONG timeout (dead connection detection)
+                    pong_age = time.time() - self._last_pong_time
+                    if pong_age > 30.0:
+                        logger.warning(
+                            f"No PONG received for {pong_age:.0f}s, forcing reconnect"
+                        )
+                        if self._ws:
+                            await self._ws.close()
 
             except asyncio.CancelledError:
                 break
@@ -333,12 +405,13 @@ class OrderbookWebSocket:
                     ping_timeout=None,
                 )
                 self._connected = True
-                self._reconnect_delay = 1.0  # Reset on successful connect
+                self._reconnect_delay = self.config.reconnect_delay_seconds
+                self._last_pong_time = time.time()
                 logger.info("WebSocket reconnected")
 
-                # Resubscribe
+                # Resubscribe (batched to avoid hammering server)
                 if self._pending_subscriptions:
-                    await self._subscribe(list(self._pending_subscriptions))
+                    await self._subscribe_batched(list(self._pending_subscriptions))
                     self._pending_subscriptions.clear()
 
                 break
@@ -396,9 +469,12 @@ class OrderbookWebSocket:
 
         self._orderbooks[token_id] = orderbook
 
-        # Call update callback if provided
-        if self.on_orderbook_update:
-            self.on_orderbook_update(token_id, orderbook)
+        # Notify all registered callbacks
+        for cb in self._update_callbacks:
+            try:
+                cb(token_id, orderbook)
+            except Exception as e:
+                logger.error(f"Error in orderbook update callback: {e}")
 
     def _handle_price_change(self, data: dict) -> None:
         """Handle incremental price update."""
@@ -428,8 +504,12 @@ class OrderbookWebSocket:
 
         orderbook.last_updated = time.time()
 
-        if self.on_orderbook_update:
-            self.on_orderbook_update(token_id, orderbook)
+        # Notify all registered callbacks
+        for cb in self._update_callbacks:
+            try:
+                cb(token_id, orderbook)
+            except Exception as e:
+                logger.error(f"Error in orderbook update callback: {e}")
 
     def _update_level(
         self,
@@ -477,6 +557,7 @@ class OrderbookManager:
         config: WebSocketConfig,
         clob_client=None,  # ClobClient for fallback
         on_significant_update: Optional[Callable[[str, int, UnifiedOrderbook], None]] = None,
+        ws_client: Optional[OrderbookWebSocket] = None,
     ):
         """
         Initialize orderbook manager.
@@ -487,12 +568,17 @@ class OrderbookManager:
             on_significant_update: Optional callback for significant orderbook changes.
                                    Called with (token_id, bin_index, orderbook).
                                    Use this to trigger trading logic on WS updates.
+            ws_client: Optional external OrderbookWebSocket (shared connection).
+                      If provided, this manager won't create/destroy its own WS.
         """
         self.config = config
         self.clob_client = clob_client
         self.on_significant_update = on_significant_update
 
-        self._ws_client: Optional[OrderbookWebSocket] = None
+        # Track whether we own the WS (and should connect/disconnect it)
+        self._ws_client: Optional[OrderbookWebSocket] = ws_client
+        self._owns_ws = ws_client is None
+
         self._orderbooks: Dict[str, UnifiedOrderbook] = {}
         self._token_to_bin: Dict[str, int] = {}
 
@@ -501,22 +587,44 @@ class OrderbookManager:
 
     async def start(self) -> None:
         """Start the orderbook manager."""
-        if self.config.enabled:
+        if not self.config.enabled:
+            logger.info("WebSocket disabled, using REST API polling")
+            return
+
+        if self._owns_ws:
+            # Create and connect our own WS
             self._ws_client = OrderbookWebSocket(
                 config=self.config,
                 on_orderbook_update=self._on_ws_update,
             )
             await self._ws_client.connect()
         else:
-            logger.info("WebSocket disabled, using REST API polling")
+            # External WS: just register our callback
+            self._ws_client.register_callback(self._on_ws_update)
 
     async def stop(self) -> None:
         """Stop the orderbook manager."""
-        if self._ws_client:
+        if not self._ws_client:
+            return
+
+        if self._owns_ws:
             await self._ws_client.disconnect()
+        else:
+            # External WS: unregister callback + unsubscribe our tokens
+            self._ws_client.unregister_callback(self._on_ws_update)
+            own_tokens = list(self._token_to_bin.keys())
+            if own_tokens:
+                await self._ws_client.unsubscribe(own_tokens)
+        self._orderbooks.clear()
+        self._last_best_prices.clear()
+        self._token_to_bin.clear()
 
     def _on_ws_update(self, token_id: str, orderbook: UnifiedOrderbook) -> None:
         """Handle orderbook update from WebSocket."""
+        # Token filter: only process tokens this manager subscribed to
+        if token_id not in self._token_to_bin:
+            return
+
         old_orderbook = self._orderbooks.get(token_id)
         self._orderbooks[token_id] = orderbook
 
