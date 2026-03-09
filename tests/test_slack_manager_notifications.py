@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -8,38 +10,12 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     FillNotification,
     MultiEventManager,
 )
+from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from src.algo.musk_tweet_count.kelly.config import KellyConfig
 from src.algo.musk_tweet_count.kelly.executor import BalanceAllowanceErrorContext
 from src.algo.musk_tweet_count.kelly.orderbook import OrderbookLevel, UnifiedOrderbook
 from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
 from src.algo.musk_tweet_count.kelly.user_stream import FillEvent, OrderStatus
-
-
-def _base_health(*, errors_count: int = 0) -> dict:
-    return {
-        "status": "healthy",
-        "uptime_hours": 12.0,
-        "active_events": 2,
-        "pending_events": 1,
-        "available_capital": 250.0,
-        "allocated_capital": 750.0,
-        "total_pnl": 42.5,
-        "errors_count": errors_count,
-        "last_data_refresh_source": "xtracker",
-        "shared_data_version": 7,
-        "user_stream": {
-            "connected": True,
-            "pending_orders": 1,
-            "fill_count": 5,
-        },
-        "realtime_tracker": {
-            "enabled": True,
-            "consecutive_errors": 0,
-            "backoff_until": None,
-            "last_poll_time": "2026-03-06T12:00:00+00:00",
-        },
-        "active_event_names": ["Event A", "Event B"],
-    }
 
 
 def _make_manager() -> MultiEventManager:
@@ -53,24 +29,63 @@ def _make_manager() -> MultiEventManager:
         balance_allowance_cooldown_seconds=1800,
     )
     manager.kelly_config = KellyConfig()
+    manager.config = SimpleNamespace(
+        dry_run=False,
+        max_data_age_seconds=300,
+    )
     manager._tz = ZoneInfo("UTC")
     manager._slack_tz = ZoneInfo("Asia/Singapore")
-    manager._last_slack_health_notification = datetime.now(manager._tz)
-    manager._last_slack_health_signature = MultiEventManager._health_digest_signature(
-        _base_health()
-    )
+    now = datetime.now(manager._tz)
+    manager._last_data_refresh_time = now - timedelta(minutes=1)
+    manager._last_data_refresh_source = "xtracker"
+    manager._last_xtracker_refresh_time = now - timedelta(minutes=1)
+    manager._last_slack_health_notification = now
+    manager._last_slack_health_signature = None
+    manager._last_slack_health_degraded = None
     manager._pending_fill_notifications = []
     manager._first_pending_fill_at = None
     manager._last_pending_fill_at = None
     manager._seen_fill_notification_keys = {}
+    manager._last_integrity_alert_state = {}
     manager._active_events = {}
+    manager._pending_events = {}
+    manager._completed_events = []
+    manager._running = True
+    manager._start_time = now - timedelta(hours=12)
+    manager._last_cleanup_time = now - timedelta(hours=1)
+    manager._errors_count = 0
+    manager.shared_data_version = 7
+    manager.capital_pool = SimpleNamespace(
+        get_summary=lambda: {
+            "total_capital": 250.0,
+            "available_capital": 50.0,
+            "allocated_capital": 200.0,
+            "total_value": 250.0,
+            "num_active_events": len(manager._active_events),
+            "num_settled_events": 0,
+            "active_events": {},
+            "config": {},
+        },
+        get_performance_summary=lambda: {
+            "num_events": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+    )
     return manager
 
 
-def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
+def _make_active_event(
+    event_id: str,
+    short_name: str,
+    *,
+    frozen: bool = False,
+    missing_bid: bool = False,
+) -> ActiveEvent:
     portfolio = Portfolio(
         initial_capital=100.0,
-        capital=82.0,
+        capital=95.08,
         num_bins=2,
         bin_upper_bounds=[9, 19],
         probabilities=[0.35, 0.65],
@@ -80,6 +95,8 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
     pos.yes_avg_cost = 0.41
     pos.collateral_used = pos.yes_shares * pos.yes_avg_cost
 
+    yes_bids = [] if missing_bid else [OrderbookLevel(price=0.42, size=40.0)]
+    yes_asks = [OrderbookLevel(price=0.45, size=40.0)]
     orderbooks = {
         "token-0": UnifiedOrderbook(
             bin_index=0,
@@ -90,13 +107,21 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
         "token-1": UnifiedOrderbook(
             bin_index=1,
             yes_token_id="token-1",
-            yes_bids=[OrderbookLevel(price=0.42, size=40.0)],
-            yes_asks=[OrderbookLevel(price=0.45, size=40.0)],
+            yes_bids=yes_bids,
+            yes_asks=yes_asks,
         ),
     }
     orderbook_manager = SimpleNamespace(
         get_orderbook=lambda token_id: orderbooks.get(token_id),
     )
+    integrity = {
+        "frozen": frozen,
+        "reason": "overlay_conflict" if frozen else None,
+        "overlay_entries": 1 if frozen else 0,
+        "deadline_at": "2026-03-07T01:00:00+00:00" if frozen else None,
+        "last_forced_api_recovery_at": None,
+        "unmatched_api_delta_count": 0,
+    }
     kelly_bot = SimpleNamespace(
         portfolio=portfolio,
         orderbook_manager=orderbook_manager,
@@ -104,16 +129,7 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
     )
     bot = SimpleNamespace(
         kelly_bot=kelly_bot,
-        _market_bins=[(0, 9), (10, 19)],
-        _cached_probabilities=[0.35, 0.65],
-        _cached_forecast_mean=16.0,
-        _cached_forecast_std=3.0,
-        _cached_forecast_breakdown={"past_count": 12, "past_days": 6, "remaining_days": 1},
-        _cached_forecast_time=datetime(2026, 3, 7, 0, 0, tzinfo=timezone.utc),
-        _get_market_cumulative_count=lambda: 12,
-        _last_known_count=12,
-        get_effective_count_for_dead_bins=lambda count: count,
-        _get_timing=lambda: (120.0, 24.0),
+        get_state_summary=lambda: {"integrity": integrity},
     )
     info = EventInfo(
         event_id=event_id,
@@ -122,8 +138,8 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
         settlement_date=date(2026, 3, 10),
         market_start_date=date(2026, 3, 3),
         bins=[
-            {"lower_bound": 0, "upper_bound": 9},
-            {"lower_bound": 10, "upper_bound": 19},
+            {"lower_bound": 0, "upper_bound": 9, "token_id": "token-0", "no_token_id": "no-token-0"},
+            {"lower_bound": 10, "upper_bound": 19, "token_id": "token-1", "no_token_id": "no-token-1"},
         ],
     )
     return ActiveEvent(
@@ -135,21 +151,54 @@ def _make_active_event(event_id: str, short_name: str) -> ActiveEvent:
     )
 
 
-def test_health_digest_ignores_error_counter_increments_after_first_error():
-    manager = _make_manager()
-    sent = []
-    manager._last_slack_health_signature = MultiEventManager._health_digest_signature(
-        _base_health(errors_count=1)
-    )
-
-    manager.get_health = lambda: _base_health(errors_count=2)
-    manager._notify_slack = lambda level, title, lines=None, **kwargs: sent.append(
-        (level, title, lines or [], kwargs)
-    )
-
-    manager._maybe_notify_health()
-
-    assert sent == []
+def _base_health(
+    manager: MultiEventManager,
+    *,
+    errors_count: int = 0,
+    realtime_errors: int = 0,
+    realtime_backoff: str | None = None,
+    user_stream_connected: bool = True,
+) -> dict:
+    capital_snapshot = manager._build_capital_snapshot()
+    frozen_events = [event.short_name for event in capital_snapshot.events if event.frozen]
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(manager._tz).isoformat(),
+        "uptime_hours": 12.0,
+        "uptime_days": 0.5,
+        "active_events": len(manager._active_events),
+        "pending_events": 1,
+        "completed_events_in_history": 0,
+        "total_events_started": len(manager._active_events),
+        "total_events_completed": 0,
+        "available_capital": 50.0,
+        "allocated_capital": 200.0,
+        "total_capital": 250.0,
+        "total_pnl": 0.0,
+        "errors_count": errors_count,
+        "last_data_refresh_source": "xtracker",
+        "last_data_refresh_time": manager._last_data_refresh_time.isoformat(),
+        "last_xtracker_refresh_time": manager._last_xtracker_refresh_time.isoformat(),
+        "shared_data_version": 7,
+        "capital_snapshot": capital_snapshot,
+        "user_stream": {
+            "enabled": True,
+            "connected": user_stream_connected,
+            "pending_orders": 1,
+            "fill_count": 5,
+            "message_count": 8,
+            "last_message_age_seconds": 4.0,
+        },
+        "realtime_tracker": {
+            "enabled": True,
+            "consecutive_errors": realtime_errors,
+            "backoff_until": realtime_backoff,
+            "last_poll_time": "2026-03-06T12:00:00+00:00",
+        },
+        "active_event_names": [event.short_name for event in capital_snapshot.events],
+        "frozen_events": len(frozen_events),
+        "frozen_event_names": frozen_events,
+    }
 
 
 def test_fmt_slack_timestamp_uses_sgt():
@@ -161,7 +210,89 @@ def test_fmt_slack_timestamp_uses_sgt():
     )
 
 
-def test_fill_summary_batches_multiple_confirmed_fills():
+def test_capital_snapshot_uses_best_bid_liquidation():
+    manager = _make_manager()
+    manager._active_events = {"event-a": _make_active_event("event-a", "Event A")}
+
+    snapshot = manager._build_capital_snapshot()
+
+    assert snapshot.baseline_total == 250.0
+    assert snapshot.unallocated_idle == 150.0
+    assert snapshot.alloc_budget_total == 100.0
+    assert snapshot.event_idle_cash_total == 95.08
+    assert round(snapshot.open_cost_total, 2) == 4.92
+    assert round(snapshot.open_liq_total, 2) == 5.04
+    assert round(snapshot.open_pnl_total, 2) == 0.12
+    assert round(snapshot.asset_now_total, 2) == 250.12
+    assert snapshot.events[0].short_name == "Event A"
+
+
+def test_startup_digest_uses_capital_rollup():
+    manager = _make_manager()
+    manager._active_events = {"event-a": _make_active_event("event-a", "Event A")}
+    sent = []
+    manager.get_health = lambda: _base_health(manager)
+    manager._notify_slack = lambda level, title, lines=None, **kwargs: sent.append(
+        (level, title, lines or [], kwargs)
+    )
+
+    manager._notify_startup()
+
+    assert len(sent) == 1
+    level, title, lines, _ = sent[0]
+    assert level == "info"
+    assert title == "Startup digest"
+    assert any("subsystems:" in line for line in lines)
+    assert any("capital: baseline=$250.00" in line for line in lines)
+    assert any("asset_now=$250.12" in line for line in lines)
+
+
+def test_health_digest_is_clamped_when_healthy():
+    manager = _make_manager()
+    manager._active_events = {"event-a": _make_active_event("event-a", "Event A")}
+    sent = []
+    healthy = _base_health(manager)
+    manager.get_health = lambda: healthy
+    manager._notify_slack = lambda level, title, lines=None, **kwargs: sent.append(
+        (level, title, lines or [], kwargs)
+    )
+    manager._last_slack_health_signature = MultiEventManager._health_digest_signature(healthy)
+    manager._last_slack_health_notification = datetime.now(manager._tz) - timedelta(hours=1)
+    manager._last_slack_health_degraded = False
+
+    manager._maybe_notify_health()
+
+    assert sent == []
+
+    manager._last_slack_health_notification = datetime.now(manager._tz) - timedelta(hours=7)
+    manager._maybe_notify_health()
+
+    assert len(sent) == 1
+    assert sent[0][1] == "Health digest"
+    assert any("capital: baseline=$250.00" in line for line in sent[0][2])
+
+
+def test_health_digest_sends_immediately_on_degraded_change():
+    manager = _make_manager()
+    manager._active_events = {"event-a": _make_active_event("event-a", "Event A")}
+    sent = []
+    healthy = _base_health(manager)
+    degraded = _base_health(manager, realtime_errors=3)
+    manager._notify_slack = lambda level, title, lines=None, **kwargs: sent.append(
+        (level, title, lines or [], kwargs)
+    )
+    manager._last_slack_health_signature = MultiEventManager._health_digest_signature(healthy)
+    manager._last_slack_health_notification = datetime.now(manager._tz)
+    manager._last_slack_health_degraded = False
+    manager.get_health = lambda: degraded
+
+    manager._maybe_notify_health()
+
+    assert len(sent) == 1
+    assert any("realtime=degraded" in line for line in sent[0][2])
+
+
+def test_fill_digest_batches_by_event_without_samples():
     manager = _make_manager()
     now = datetime.now(manager._tz)
     manager._first_pending_fill_at = now - timedelta(minutes=25)
@@ -184,20 +315,22 @@ def test_fill_summary_batches_multiple_confirmed_fills():
             price=0.30,
             notional=1.50,
             timestamp=now - timedelta(minutes=20),
+            token_type="YES",
         ),
         FillNotification(
             event_id="event-a",
             event_short_name="Event A",
             order_id="order-a2",
             match_id="match-a2",
-            bin_index=2,
-            bin_range="20-29",
+            bin_index=1,
+            bin_range="10-19",
             side="SELL",
             status="CONFIRMED",
             size=4.0,
             price=0.60,
             notional=2.40,
             timestamp=now - timedelta(minutes=18),
+            token_type="YES",
         ),
         FillNotification(
             event_id="event-b",
@@ -212,6 +345,7 @@ def test_fill_summary_batches_multiple_confirmed_fills():
             price=0.80,
             notional=1.60,
             timestamp=now - timedelta(minutes=16),
+            token_type="NO",
         ),
     ]
     sent = []
@@ -224,32 +358,21 @@ def test_fill_summary_batches_multiple_confirmed_fills():
     assert len(sent) == 1
     level, title, lines, _ = sent[0]
     assert level == "info"
-    assert title == "Fill summary"
-    assert "fills=3" in lines[0]
-    assert "SGT" in lines[0]
-    assert "total_notional=$5.50" in lines[0]
-    assert "Event A: fills=2 notional=$3.90" in lines
-    assert "Event B: fills=1 notional=$1.60" in lines
-    assert "samples:" in lines
-    assert any("holdings: capital=$82.00" in line for line in lines)
-    assert any("Range     Holdings" in line for line in lines)
-    assert any("forecast_as_of=2026-03-07 08:00:00 SGT" in line for line in lines)
-    assert any("Bin  Range" in line for line in lines)
+    assert title == "Fill digest"
+    assert "gross_buy=$3.10" in lines[0]
+    assert "gross_sell=$2.40" in lines[0]
+    assert "net_signed=$0.70" in lines[0]
+    assert any("Event A | fills=2 buy=$1.50 sell=$2.40 net=$-0.90" in line for line in lines)
+    assert any("Event B | fills=1 buy=$1.60 sell=$0.00 net=$1.60" in line for line in lines)
+    assert "samples:" not in lines
+    assert not any("holdings:" in line for line in lines)
+    assert not any("forecast_as_of" in line for line in lines)
     assert manager._pending_fill_notifications == []
-    assert manager._first_pending_fill_at is None
-    assert manager._last_pending_fill_at is None
 
 
 def test_notify_fill_dedupes_repeated_confirmed_fill():
     manager = _make_manager()
-    event_info = EventInfo(
-        event_id="event-a",
-        title="Event Title",
-        short_name="Event A",
-        settlement_date=date(2026, 3, 10),
-        market_start_date=date(2026, 3, 3),
-        bins=[],
-    )
+    active = _make_active_event("event-a", "Event A")
     fill = FillEvent(
         order_id="order-1",
         token_id="token-1",
@@ -261,10 +384,11 @@ def test_notify_fill_dedupes_repeated_confirmed_fill():
         match_id="match-1",
     )
 
-    manager._notify_fill(event_info, 1, fill, bin_range="10-19")
-    manager._notify_fill(event_info, 1, fill, bin_range="10-19")
+    manager._notify_fill(active.info, 1, fill, bin_range="10-19")
+    manager._notify_fill(active.info, 1, fill, bin_range="10-19")
 
     assert len(manager._pending_fill_notifications) == 1
+    assert manager._pending_fill_notifications[0].token_type == "YES"
 
 
 def test_format_exception_details_include_type_and_location():
@@ -315,8 +439,28 @@ def test_balance_allowance_alert_uses_configured_cooldown():
     manager._notify_balance_allowance_error(event_info, context)
 
     assert len(sent) == 1
-    level, title, _, kwargs = sent[0]
+    level, title, lines, kwargs = sent[0]
     assert level == "warning"
     assert title == "Balance / allowance rejection: Event A"
     assert kwargs["dedupe_key"] == "balance_allowance:event-123:2:token-2"
     assert kwargs["cooldown_seconds"] == 1800
+    assert any("impact=order not sent or not fully executable" in line for line in lines)
+    assert any("action=inspect balance, allowances, and recent fills before retrying" in line for line in lines)
+
+
+def test_capital_pool_logs_use_explicit_terms(caplog):
+    async def scenario():
+        pool = CapitalPool(CapitalPoolConfig(total_capital=500.0), max_per_event=200.0)
+        await pool.request_capital("event-a", 150.0)
+        await pool.return_capital("event-a", 175.0)
+        await pool.restore_allocation("event-b", 80.0)
+        await pool.set_total_from_api(520.0)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+
+    messages = [record.message for record in caplog.records]
+    assert any("[CAPITAL][ALLOCATE] event=event-a" in message for message in messages)
+    assert any("[CAPITAL][RELEASE] event=event-a" in message for message in messages)
+    assert any("[CAPITAL][RESTORE] event=event-b" in message for message in messages)
+    assert any("[CAPITAL][SYNC_API] baseline_total=$520.00" in message for message in messages)

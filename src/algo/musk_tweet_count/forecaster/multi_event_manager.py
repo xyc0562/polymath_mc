@@ -15,6 +15,7 @@ Key features:
 import asyncio
 import logging
 import traceback
+from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
@@ -50,6 +51,8 @@ logger = logging.getLogger(__name__)
 COUNT_MISMATCH_THRESHOLD = 5
 SLACK_TIMEZONE = ZoneInfo("Asia/Singapore")
 SLACK_FILL_DEDUPE_TTL = timedelta(hours=24)
+HEALTHY_SLACK_DIGEST_MIN_INTERVAL = timedelta(hours=6)
+MAX_SLACK_EVENT_LINES = 10
 
 TICK_SOURCE_PRIORITY = {
     "startup": 0,
@@ -113,6 +116,97 @@ class FillNotification:
     price: float
     notional: float
     timestamp: datetime
+    token_type: str = "YES"
+
+
+class SlackMessageKind(str, Enum):
+    STARTUP_DIGEST = "startup_digest"
+    HEALTH_DIGEST = "health_digest"
+    FILL_DIGEST = "fill_digest"
+    REALTIME_GAP_ALERT = "realtime_gap_alert"
+    TWITTER_COOKIE_ERROR = "twitter_cookie_error"
+    BALANCE_ALLOWANCE_ALERT = "balance_allowance_alert"
+    INTEGRITY_FREEZE_ALERT = "integrity_freeze_alert"
+    INTEGRITY_RECOVERY_ALERT = "integrity_recovery_alert"
+    FILL_ROUTING_ALERT = "fill_routing_alert"
+    STALE_ORDER_ALERT = "stale_order_alert"
+    EVENT_RUNTIME_ALERT = "event_runtime_alert"
+    MAIN_LOOP_ALERT = "main_loop_alert"
+    CAPITAL_RESYNC_ALERT = "capital_resync_alert"
+
+
+@dataclass(frozen=True)
+class SlackRenderedMessage:
+    level: str
+    title: str
+    lines: List[str]
+    dedupe_key: Optional[str] = None
+    cooldown_seconds: float = 0.0
+    mention: bool = False
+
+
+@dataclass(frozen=True)
+class SlackEventCapitalSnapshot:
+    event_id: str
+    short_name: str
+    alloc_budget: float
+    idle_cash: float
+    open_cost: float
+    open_liq: float
+    open_pnl: float
+    asset_now: float
+    stale_px_positions: int = 0
+    stale_px_fallback_cost: float = 0.0
+    frozen: bool = False
+    integrity_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "short_name": self.short_name,
+            "alloc_budget": self.alloc_budget,
+            "idle_cash": self.idle_cash,
+            "open_cost": self.open_cost,
+            "open_liq": self.open_liq,
+            "open_pnl": self.open_pnl,
+            "asset_now": self.asset_now,
+            "stale_px_positions": self.stale_px_positions,
+            "stale_px_fallback_cost": self.stale_px_fallback_cost,
+            "frozen": self.frozen,
+            "integrity_reason": self.integrity_reason,
+        }
+
+
+@dataclass(frozen=True)
+class SlackCapitalSnapshot:
+    baseline_total: float
+    unallocated_idle: float
+    alloc_budget_total: float
+    event_idle_cash_total: float
+    open_cost_total: float
+    open_liq_total: float
+    open_pnl_total: float
+    asset_now_total: float
+    total_events: int
+    total_stale_px_positions: int
+    total_stale_px_fallback_cost: float
+    events: List[SlackEventCapitalSnapshot] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "baseline_total": self.baseline_total,
+            "unallocated_idle": self.unallocated_idle,
+            "alloc_budget_total": self.alloc_budget_total,
+            "event_idle_cash_total": self.event_idle_cash_total,
+            "open_cost_total": self.open_cost_total,
+            "open_liq_total": self.open_liq_total,
+            "open_pnl_total": self.open_pnl_total,
+            "asset_now_total": self.asset_now_total,
+            "total_events": self.total_events,
+            "total_stale_px_positions": self.total_stale_px_positions,
+            "total_stale_px_fallback_cost": self.total_stale_px_fallback_cost,
+            "events": [event.to_dict() for event in self.events],
+        }
 
 
 @dataclass
@@ -381,10 +475,12 @@ class MultiEventManager:
         self._last_health_log_time: Optional[datetime] = None
         self._last_slack_health_notification: Optional[datetime] = None
         self._last_slack_health_signature: Optional[Tuple[Any, ...]] = None
+        self._last_slack_health_degraded: Optional[bool] = None
         self._pending_fill_notifications: List[FillNotification] = []
         self._first_pending_fill_at: Optional[datetime] = None
         self._last_pending_fill_at: Optional[datetime] = None
         self._seen_fill_notification_keys: Dict[str, datetime] = {}
+        self._last_integrity_alert_state: Dict[str, Tuple[bool, Optional[str], Optional[str]]] = {}
         self._total_events_started: int = 0
         self._total_events_completed: int = 0
         self._total_trades_executed: int = 0
@@ -491,156 +587,596 @@ class MultiEventManager:
             lines.append(f"at {last.filename}:{last.lineno} in {last.name}")
         return lines
 
-    def _format_event_holdings_lines(self, active: ActiveEvent) -> List[str]:
-        if not active.bot.kelly_bot or not active.bot.kelly_bot.portfolio:
-            return ["holdings=unavailable"]
+    def _get_event_integrity_summary(self, active: ActiveEvent) -> Dict[str, Any]:
+        try:
+            return active.bot.get_state_summary().get("integrity", {})
+        except Exception:
+            return {}
 
-        portfolio = active.bot.kelly_bot.portfolio
-        nonzero_positions = []
-        for bin_idx, pos in sorted(portfolio.positions.items()):
-            if pos.yes_shares <= 0.01 and pos.no_shares <= 0.01:
-                continue
-            lower, upper = self._get_event_bin_bounds(active, bin_idx)
-            range_label = self._format_bin_range_label(lower, upper)
-            yes_part = (
-                f"YES {pos.yes_shares:6.1f} @ {self._fmt_price_cents(pos.yes_avg_cost):>5}"
-                if pos.yes_shares > 0.01 else "YES      -"
-            )
-            no_part = (
-                f"NO {pos.no_shares:6.1f} @ {self._fmt_price_cents(pos.no_avg_cost):>5}"
-                if pos.no_shares > 0.01 else "NO       -"
-            )
-            nonzero_positions.append(f"{range_label:<9} {yes_part} | {no_part}")
+    def _infer_fill_token_type(
+        self,
+        event_info: EventInfo,
+        bin_index: int,
+        token_id: str,
+    ) -> str:
+        if bin_index < 0 or bin_index >= len(event_info.bins):
+            return "UNK"
+        bin_def = event_info.bins[bin_index]
+        if token_id == bin_def.get("token_id"):
+            return "YES"
+        if token_id == bin_def.get("no_token_id"):
+            return "NO"
+        return "UNK"
 
-        summary = (
-            f"holdings: capital={self._fmt_usd(portfolio.capital)} "
-            f"available={self._fmt_usd(portfolio.available_capital)} "
-            f"invested={self._fmt_usd(portfolio.total_collateral_used)} "
-            f"positions={len(nonzero_positions)}"
+    def _build_event_capital_snapshot(
+        self,
+        active: ActiveEvent,
+    ) -> SlackEventCapitalSnapshot:
+        alloc_budget = float(active.allocated_capital)
+        idle_cash = alloc_budget
+        open_cost = 0.0
+        open_liq = 0.0
+        stale_px_positions = 0
+        stale_px_fallback_cost = 0.0
+
+        integrity = self._get_event_integrity_summary(active)
+        kelly_bot = getattr(active.bot, "kelly_bot", None)
+        portfolio = getattr(kelly_bot, "portfolio", None)
+        orderbook_manager = getattr(kelly_bot, "orderbook_manager", None)
+        bin_token_ids = getattr(kelly_bot, "bin_token_ids", {}) or {}
+
+        if portfolio is not None:
+            idle_cash = float(portfolio.capital)
+            for bin_idx, pos in sorted(portfolio.positions.items()):
+                token_id = bin_token_ids.get(bin_idx)
+                orderbook = (
+                    orderbook_manager.get_orderbook(token_id)
+                    if orderbook_manager is not None and token_id
+                    else None
+                )
+
+                if pos.yes_shares > 0.01:
+                    yes_cost = pos.yes_shares * pos.yes_avg_cost
+                    open_cost += yes_cost
+                    yes_bid = orderbook.best_yes_bid if orderbook else None
+                    if yes_bid is None:
+                        stale_px_positions += 1
+                        stale_px_fallback_cost += yes_cost
+                        open_liq += yes_cost
+                    else:
+                        open_liq += pos.yes_shares * yes_bid
+
+                if pos.no_shares > 0.01:
+                    no_cost = pos.no_shares * pos.no_avg_cost
+                    open_cost += no_cost
+                    no_bid = orderbook.best_no_bid if orderbook else None
+                    if no_bid is None:
+                        stale_px_positions += 1
+                        stale_px_fallback_cost += no_cost
+                        open_liq += no_cost
+                    else:
+                        open_liq += pos.no_shares * no_bid
+
+        open_pnl = open_liq - open_cost
+        asset_now = idle_cash + open_liq
+        return SlackEventCapitalSnapshot(
+            event_id=active.info.event_id,
+            short_name=active.info.short_name,
+            alloc_budget=alloc_budget,
+            idle_cash=idle_cash,
+            open_cost=open_cost,
+            open_liq=open_liq,
+            open_pnl=open_pnl,
+            asset_now=asset_now,
+            stale_px_positions=stale_px_positions,
+            stale_px_fallback_cost=stale_px_fallback_cost,
+            frozen=bool(integrity.get("frozen")),
+            integrity_reason=integrity.get("reason"),
         )
-        if not nonzero_positions:
-            return [summary, "holdings: flat"]
 
-        lines = [summary, "```", f"{'Range':<9} Holdings"]
-        lines.extend(nonzero_positions[:10])
-        if len(nonzero_positions) > 10:
-            lines.append(f"... {len(nonzero_positions) - 10} more position(s)")
-        lines.append("```")
+    def _build_capital_snapshot(self) -> SlackCapitalSnapshot:
+        events = [
+            self._build_event_capital_snapshot(active)
+            for active in self._active_events.values()
+        ]
+        events.sort(
+            key=lambda event: (
+                0 if event.frozen else 1,
+                -event.alloc_budget,
+                event.short_name,
+            )
+        )
+
+        pool_summary = self.capital_pool.get_summary() if hasattr(self, "capital_pool") else {}
+        baseline_total = float(pool_summary.get("total_capital", 0.0))
+        alloc_budget_total = sum(event.alloc_budget for event in events)
+        event_idle_cash_total = sum(event.idle_cash for event in events)
+        open_cost_total = sum(event.open_cost for event in events)
+        open_liq_total = sum(event.open_liq for event in events)
+        unallocated_idle = baseline_total - alloc_budget_total
+        open_pnl_total = open_liq_total - open_cost_total
+        asset_now_total = unallocated_idle + event_idle_cash_total + open_liq_total
+        return SlackCapitalSnapshot(
+            baseline_total=baseline_total,
+            unallocated_idle=unallocated_idle,
+            alloc_budget_total=alloc_budget_total,
+            event_idle_cash_total=event_idle_cash_total,
+            open_cost_total=open_cost_total,
+            open_liq_total=open_liq_total,
+            open_pnl_total=open_pnl_total,
+            asset_now_total=asset_now_total,
+            total_events=len(events),
+            total_stale_px_positions=sum(event.stale_px_positions for event in events),
+            total_stale_px_fallback_cost=sum(
+                event.stale_px_fallback_cost for event in events
+            ),
+            events=events,
+        )
+
+    def _format_capital_total_line(self, snapshot: SlackCapitalSnapshot) -> str:
+        return (
+            f"capital: baseline={self._fmt_usd(snapshot.baseline_total)} "
+            f"unallocated_idle={self._fmt_usd(snapshot.unallocated_idle)} "
+            f"open_cost={self._fmt_usd(snapshot.open_cost_total)} "
+            f"open_liq={self._fmt_usd(snapshot.open_liq_total)} "
+            f"open_pnl={self._fmt_usd(snapshot.open_pnl_total)} "
+            f"asset_now={self._fmt_usd(snapshot.asset_now_total)}"
+        )
+
+    def _format_event_capital_line(self, event: SlackEventCapitalSnapshot) -> str:
+        label = f"{event.short_name} [FROZEN]" if event.frozen else event.short_name
+        line = (
+            f"{label} | alloc={self._fmt_usd(event.alloc_budget)} "
+            f"idle={self._fmt_usd(event.idle_cash)} "
+            f"cost={self._fmt_usd(event.open_cost)} "
+            f"liq={self._fmt_usd(event.open_liq)} "
+            f"pnl={self._fmt_usd(event.open_pnl)} "
+            f"asset={self._fmt_usd(event.asset_now)}"
+        )
+        if event.stale_px_positions:
+            line += (
+                f" | stale_px={event.stale_px_positions} "
+                f"fallback_cost={self._fmt_usd(event.stale_px_fallback_cost)}"
+            )
+        return line
+
+    def _format_event_capital_lines(
+        self,
+        events: List[SlackEventCapitalSnapshot],
+        *,
+        max_items: int = MAX_SLACK_EVENT_LINES,
+    ) -> List[str]:
+        if not events:
+            return ["events=none"]
+
+        lines = [self._format_event_capital_line(event) for event in events[:max_items]]
+        remainder = events[max_items:]
+        if remainder:
+            lines.append(
+                "..."
+                f" {len(remainder)} more | alloc={self._fmt_usd(sum(e.alloc_budget for e in remainder))} "
+                f"idle={self._fmt_usd(sum(e.idle_cash for e in remainder))} "
+                f"cost={self._fmt_usd(sum(e.open_cost for e in remainder))} "
+                f"liq={self._fmt_usd(sum(e.open_liq for e in remainder))} "
+                f"pnl={self._fmt_usd(sum(e.open_pnl for e in remainder))} "
+                f"asset={self._fmt_usd(sum(e.asset_now for e in remainder))}"
+            )
         return lines
 
-    def _format_event_probability_table_lines(self, active: ActiveEvent) -> List[str]:
-        bot = active.bot
-        if not bot.kelly_bot or not bot.kelly_bot.portfolio:
-            return ["probability table unavailable"]
+    @staticmethod
+    def _coerce_capital_snapshot(snapshot: Any) -> SlackCapitalSnapshot:
+        if isinstance(snapshot, SlackCapitalSnapshot):
+            return snapshot
+        if isinstance(snapshot, dict):
+            return SlackCapitalSnapshot(
+                baseline_total=snapshot["baseline_total"],
+                unallocated_idle=snapshot["unallocated_idle"],
+                alloc_budget_total=snapshot["alloc_budget_total"],
+                event_idle_cash_total=snapshot["event_idle_cash_total"],
+                open_cost_total=snapshot["open_cost_total"],
+                open_liq_total=snapshot["open_liq_total"],
+                open_pnl_total=snapshot["open_pnl_total"],
+                asset_now_total=snapshot["asset_now_total"],
+                total_events=snapshot["total_events"],
+                total_stale_px_positions=snapshot["total_stale_px_positions"],
+                total_stale_px_fallback_cost=snapshot["total_stale_px_fallback_cost"],
+                events=[
+                    SlackEventCapitalSnapshot(**event)
+                    for event in snapshot.get("events", [])
+                ],
+            )
+        raise TypeError(f"Unsupported capital snapshot type: {type(snapshot).__name__}")
 
-        try:
-            current_count = bot._get_market_cumulative_count()
-        except Exception:
-            current_count = bot._last_known_count or 0
-        effective_count = bot.get_effective_count_for_dead_bins(current_count)
-        hours_elapsed, hours_remaining = bot._get_timing()
+    def _is_health_degraded(self, health: Dict[str, Any]) -> bool:
+        if health.get("status") != "healthy":
+            return True
+        if health.get("frozen_events", 0) > 0:
+            return True
+        if health.get("errors_count", 0) > 0:
+            return True
 
-        probabilities = list(bot._cached_probabilities or [])
-        if not probabilities:
-            probabilities = list(bot.kelly_bot.portfolio.probabilities or [])
-        if not probabilities:
-            return ["probability table unavailable (no cached probabilities)"]
+        user_stream = health.get("user_stream", {})
+        if user_stream.get("enabled", False) and not user_stream.get("connected", False):
+            return True
+        if not self.config.dry_run and not user_stream.get("enabled", False):
+            return True
 
-        forecast_line = (
-            f"state: count={effective_count} time_left={self._format_time_remaining(hours_remaining)} "
-            f"forecast_as_of={self._fmt_slack_timestamp(bot._cached_forecast_time)}"
+        realtime = health.get("realtime_tracker", {})
+        if realtime.get("enabled", False):
+            if realtime.get("backoff_until"):
+                return True
+            if (realtime.get("consecutive_errors", 0) or 0) >= 3:
+                return True
+
+        is_fresh, _ = self.is_data_fresh()
+        return not is_fresh
+
+    def _build_subsystem_summary(self, health: Dict[str, Any]) -> str:
+        user_stream = health.get("user_stream", {})
+        realtime = health.get("realtime_tracker", {})
+        return (
+            "subsystems: "
+            f"user_stream={'on' if user_stream.get('enabled', False) else 'off'} "
+            f"twikit={'on' if realtime.get('enabled', False) else 'off'} "
+            "xtracker=on"
         )
-        if bot._cached_forecast_mean is None:
-            forecast_summary = "forecast: unavailable"
-        elif bot._cached_forecast_breakdown:
-            past_count = bot._cached_forecast_breakdown["past_count"]
-            past_days = bot._cached_forecast_breakdown["past_days"]
-            remaining_days = bot._cached_forecast_breakdown["remaining_days"]
-            forecast_remaining = bot._cached_forecast_mean - past_count
-            std_part = (
-                f" (std {bot._cached_forecast_std:.0f})"
-                if bot._cached_forecast_std is not None else ""
-            )
-            forecast_summary = (
-                f"forecast: {past_count} ({past_days}d actual) + "
-                f"{forecast_remaining:.0f} ({remaining_days}d forecast) = "
-                f"{bot._cached_forecast_mean:.0f}{std_part}"
-            )
-        else:
-            std_part = (
-                f" +/- {bot._cached_forecast_std:.0f}"
-                if bot._cached_forecast_std is not None else ""
-            )
-            forecast_summary = f"forecast: {bot._cached_forecast_mean:.0f}{std_part}"
 
-        try:
-            yes_prices, no_prices = bot.kelly_bot.portfolio.get_reservation_prices(
-                self.kelly_config.w_floor,
-                self.kelly_config.kelly_fraction,
-            )
-        except Exception:
-            yes_prices = []
-            no_prices = []
+    def _build_startup_digest_lines(self, health: Dict[str, Any]) -> List[str]:
+        snapshot_obj = self._coerce_capital_snapshot(health["capital_snapshot"])
+        lines = [
+            f"mode={'DRY RUN' if self.config.dry_run else 'LIVE'} active={health['active_events']} pending={health['pending_events']}",
+            self._build_subsystem_summary(health),
+            self._format_capital_total_line(snapshot_obj),
+        ]
+        if health["active_event_names"]:
+            lines.append("events=" + ", ".join(health["active_event_names"][:5]))
+        return lines
 
-        from ..kelly.candidates import compute_buy_yes_threshold
+    def _build_health_digest_lines(self, health: Dict[str, Any]) -> List[str]:
+        snapshot_obj = self._coerce_capital_snapshot(health["capital_snapshot"])
+        lines = [
+            f"status={health['status']} uptime={health['uptime_hours']:.1f}h active={health['active_events']} pending={health['pending_events']} frozen={health['frozen_events']} as_of={self._fmt_slack_timestamp(health.get('timestamp'))}",
+            self._format_capital_total_line(snapshot_obj),
+        ]
+        lines.extend(self._format_event_capital_lines(snapshot_obj.events))
+
+        user_stream = health.get("user_stream", {})
+        if user_stream.get("enabled", False) and not user_stream.get("connected", False):
+            lines.append(
+                f"user_stream=degraded connected={user_stream.get('connected', False)} pending_orders={user_stream.get('pending_orders', 0)} last_msg_age={user_stream.get('last_message_age_seconds', 'n/a')}"
+            )
+        elif not self.config.dry_run and not user_stream.get("enabled", False):
+            lines.append("user_stream=disabled impact=fill confirmations unavailable")
+
+        realtime = health.get("realtime_tracker", {})
+        if realtime.get("enabled", False) and (
+            realtime.get("backoff_until")
+            or (realtime.get("consecutive_errors", 0) or 0) >= 3
+        ):
+            lines.append(
+                f"realtime=degraded errors={realtime.get('consecutive_errors', 0)} backoff_until={self._fmt_slack_timestamp(realtime.get('backoff_until'))} last_poll={self._fmt_slack_timestamp(realtime.get('last_poll_time'))}"
+            )
+
+        is_fresh, age_seconds = self.is_data_fresh()
+        if not is_fresh:
+            age_label = "n/a" if age_seconds == float("inf") else f"{age_seconds:.0f}s"
+            lines.append(
+                f"data=stale source={health.get('last_data_refresh_source') or 'unknown'} age={age_label} refreshed_at={self._fmt_slack_timestamp(health.get('last_data_refresh_time'))}"
+            )
+
+        if health.get("errors_count", 0):
+            lines.append(f"errors={health['errors_count']}")
+        if health.get("frozen_event_names"):
+            lines.append("frozen_events=" + ", ".join(health["frozen_event_names"]))
+        return lines
+
+    def _build_fill_digest_lines(
+        self,
+        fills: List[FillNotification],
+        *,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> List[str]:
+        gross_buy = 0.0
+        gross_sell = 0.0
+        event_groups: Dict[str, Dict[str, Any]] = {}
+
+        for fill in fills:
+            if fill.side.upper() == "BUY":
+                gross_buy += fill.notional
+            else:
+                gross_sell += fill.notional
+
+            group = event_groups.setdefault(
+                fill.event_id,
+                {
+                    "name": fill.event_short_name,
+                    "fills": 0,
+                    "buy_notional": 0.0,
+                    "sell_notional": 0.0,
+                    "bin_groups": {},
+                },
+            )
+            group["fills"] += 1
+            if fill.side.upper() == "BUY":
+                group["buy_notional"] += fill.notional
+            else:
+                group["sell_notional"] += fill.notional
+
+            bin_key = (fill.bin_index, fill.bin_range, fill.token_type, fill.side.upper())
+            bin_group = group["bin_groups"].setdefault(
+                bin_key,
+                {"size": 0.0, "notional": 0.0},
+            )
+            bin_group["size"] += fill.size
+            bin_group["notional"] += fill.notional
 
         lines = [
-            forecast_line,
-            forecast_summary,
-            "```",
-            f"{'Bin':<4} {'Range':<9} {'Model':>6} {'c*_Y':>6} {'Y.Ask':>6} {'Y.Thr':>6} {'c*_N':>6} {'N.Ask':>6} {'N.Thr':>6} {'Y.Pos':>7} {'N.Pos':>7} {'Signal':>8}",
+            f"window={self._fmt_slack_timestamp(started_at)} -> {self._fmt_slack_timestamp(ended_at)} fills={len(fills)} gross_buy={self._fmt_usd(gross_buy)} gross_sell={self._fmt_usd(gross_sell)} net_signed={self._fmt_usd(gross_buy - gross_sell)} events={len(event_groups)}",
         ]
 
-        for bin_idx, (lower, upper) in enumerate(bot._market_bins):
-            if upper < effective_count:
-                continue
-
-            range_label = self._format_bin_range_label(lower, upper)
-            model_prob = probabilities[bin_idx] if bin_idx < len(probabilities) else 0.0
-            kelly_yes = yes_prices[bin_idx] if bin_idx < len(yes_prices) else model_prob
-            kelly_no = no_prices[bin_idx] if bin_idx < len(no_prices) else 1.0 - model_prob
-            yes_threshold = compute_buy_yes_threshold(kelly_yes, self.kelly_config.edge_buffer)
-            no_threshold = compute_buy_yes_threshold(kelly_no, self.kelly_config.edge_buffer)
-
-            token_id = bot.kelly_bot.bin_token_ids.get(bin_idx)
-            orderbook = bot.kelly_bot.orderbook_manager.get_orderbook(token_id) if token_id else None
-            yes_ask = orderbook.best_yes_ask if orderbook else None
-            no_ask = orderbook.best_no_ask if orderbook else None
-
-            position = bot.kelly_bot.portfolio.get_position(bin_idx)
-            yes_pos = position.yes_shares if position else 0.0
-            no_pos = position.no_shares if position else 0.0
-
-            signal = ""
-            if no_ask is not None and no_ask <= no_threshold:
-                signal = "BUY_NO"
-            elif yes_ask is not None and yes_ask <= yes_threshold:
-                signal = "BUY_YES"
-
-            yes_pos_str = f"{yes_pos:6.0f}" if yes_pos > 0 else "     -"
-            no_pos_str = f"{no_pos:6.0f}" if no_pos > 0 else "     -"
-            yes_ask_str = f"{yes_ask * 100:5.1f}%" if yes_ask is not None else "  N/A "
-            no_ask_str = f"{no_ask * 100:5.1f}%" if no_ask is not None else "  N/A "
-
+        max_events = getattr(self.slack_notifier, "fill_summary_max_examples", 5)
+        sorted_events = sorted(
+            event_groups.values(),
+            key=lambda item: (
+                -(item["buy_notional"] + item["sell_notional"]),
+                item["name"],
+            ),
+        )
+        for group in sorted_events[:max_events]:
+            exposures = []
+            sorted_bins = sorted(
+                group["bin_groups"].items(),
+                key=lambda item: -abs(item[1]["notional"]),
+            )
+            for (bin_index, bin_range, token_type, side), values in sorted_bins[:2]:
+                avg_price = values["notional"] / values["size"] if values["size"] > 0 else 0.0
+                notional = values["notional"] if side == "BUY" else -values["notional"]
+                range_part = f" ({bin_range})" if bin_range else ""
+                exposures.append(
+                    f"{bin_index}{range_part} {token_type} {side} {self._fmt_usd(notional)} @ {self._fmt_price_cents(avg_price)}"
+                )
             lines.append(
-                f"{bin_idx:<4} {range_label:<9} {model_prob:>5.1%} "
-                f"{kelly_yes * 100:>5.1f}% {yes_ask_str:>6} {yes_threshold * 100:>5.1f}% "
-                f"{kelly_no * 100:>5.1f}% {no_ask_str:>6} {no_threshold * 100:>5.1f}% "
-                f"{yes_pos_str:>7} {no_pos_str:>7} {signal:>8}"
+                f"{group['name']} | fills={group['fills']} "
+                f"buy={self._fmt_usd(group['buy_notional'])} "
+                f"sell={self._fmt_usd(group['sell_notional'])} "
+                f"net={self._fmt_usd(group['buy_notional'] - group['sell_notional'])} | "
+                f"bins={'; '.join(exposures) if exposures else 'n/a'}"
             )
 
-        lines.append("```")
+        remainder = sorted_events[max_events:]
+        if remainder:
+            lines.append(
+                f"... {len(remainder)} more events | "
+                f"buy={self._fmt_usd(sum(item['buy_notional'] for item in remainder))} "
+                f"sell={self._fmt_usd(sum(item['sell_notional'] for item in remainder))} "
+                f"net={self._fmt_usd(sum(item['buy_notional'] - item['sell_notional'] for item in remainder))}"
+            )
+
         return lines
 
-    def _build_fill_summary_event_lines(self, event_id: str) -> List[str]:
-        active = self._active_events.get(event_id)
-        if not active:
-            return [f"event={event_id} current_state=unavailable (inactive)"]
+    @staticmethod
+    def _health_digest_signature(health: Dict[str, Any]) -> Tuple[Any, ...]:
+        user_stream = health.get("user_stream", {})
+        realtime = health.get("realtime_tracker", {})
+        return (
+            health.get("status"),
+            tuple(health.get("active_event_names", [])),
+            tuple(health.get("frozen_event_names", [])),
+            bool(health.get("errors_count")),
+            user_stream.get("enabled", False),
+            user_stream.get("connected", False),
+            realtime.get("enabled", False),
+            bool(realtime.get("backoff_until")),
+            bool((realtime.get("consecutive_errors", 0) or 0) >= 3),
+            health.get("last_data_refresh_source"),
+        )
 
-        lines = [f"event={active.info.short_name} ({event_id})"]
-        lines.extend(self._format_event_holdings_lines(active))
-        lines.extend(self._format_event_probability_table_lines(active))
-        return lines
+    def _build_slack_message(
+        self,
+        kind: SlackMessageKind,
+        **payload: Any,
+    ) -> SlackRenderedMessage:
+        if kind is SlackMessageKind.STARTUP_DIGEST:
+            health = payload["health"]
+            return SlackRenderedMessage("info", "Startup digest", self._build_startup_digest_lines(health))
+        if kind is SlackMessageKind.HEALTH_DIGEST:
+            health = payload["health"]
+            return SlackRenderedMessage("info", "Health digest", self._build_health_digest_lines(health))
+        if kind is SlackMessageKind.FILL_DIGEST:
+            return SlackRenderedMessage(
+                "info",
+                "Fill digest",
+                self._build_fill_digest_lines(
+                    payload["fills"],
+                    started_at=payload["started_at"],
+                    ended_at=payload["ended_at"],
+                ),
+            )
+        if kind is SlackMessageKind.REALTIME_GAP_ALERT:
+            return SlackRenderedMessage(
+                "warning",
+                "Realtime gap detected",
+                [
+                    "what=gap_detected source=twikit",
+                    "impact=forcing authoritative XTracker refresh; provisional edge degraded until sync completes",
+                    "action=check tracker continuity if this repeats",
+                ],
+                dedupe_key="realtime_gap_detected",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.TWITTER_COOKIE_ERROR:
+            cookie_label = payload["cookie_label"]
+            cookie_err = payload["cookie_error"]
+            consecutive = payload["consecutive_errors"]
+            return SlackRenderedMessage(
+                "error",
+                "Twitter cookie error",
+                [
+                    f"what=cookie_failure label={cookie_label} error={cookie_err}",
+                    f"impact=twikit early-detection degraded consecutive_errors={consecutive}",
+                    "action=refresh config/twitter_cookies.json and verify Twikit session",
+                ],
+                dedupe_key=f"realtime_cookie_error_{cookie_label}",
+                cooldown_seconds=3600.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.BALANCE_ALLOWANCE_ALERT:
+            event_info = payload["event_info"]
+            context = payload["context"]
+            bin_label = (
+                f"{context.bin_index} ({context.bin_range})"
+                if context.bin_range else str(context.bin_index)
+            )
+            clob_balance = (
+                f"{context.clob_available_shares:.2f}"
+                if context.clob_available_shares is not None else "unknown"
+            )
+            return SlackRenderedMessage(
+                "warning",
+                f"Balance / allowance rejection: {event_info.short_name}",
+                [
+                    f"what=order_rejected event={event_info.event_id} action={context.action} token_type={context.token_type} bin={bin_label}",
+                    "impact=order not sent or not fully executable; local inventory / allowance may be stale",
+                    "action=inspect balance, allowances, and recent fills before retrying",
+                    f"requested size={context.requested_size:.2f} price={context.requested_price:.4f} limit_price={context.requested_limit_price:.4f} notional={self._fmt_usd(context.requested_notional)}",
+                    f"fair={context.reservation_price:.4f} edge={context.edge:+.2%} utility={context.utility_gain:.6f}",
+                    f"local_yes={context.local_yes_shares:.2f} @ {context.local_yes_avg_cost:.4f} local_no={context.local_no_shares:.2f} @ {context.local_no_avg_cost:.4f}",
+                    f"portfolio_available={self._fmt_usd(context.portfolio_available_capital or 0.0)} collateral={self._fmt_usd(context.portfolio_total_collateral or 0.0)} pending_orders={context.pending_orders_count}",
+                    f"clob_balance={clob_balance} raw_balance={context.raw_balance or 'n/a'} nonzero_allowances={context.nonzero_allowances if context.nonzero_allowances is not None else 'unknown'}",
+                    f"allowances={context.allowances if context.allowances is not None else 'n/a'}",
+                    f"error={context.error}",
+                ],
+                dedupe_key=f"balance_allowance:{event_info.event_id}:{context.bin_index}:{context.token_id}",
+                cooldown_seconds=(
+                    self.slack_notifier.balance_allowance_cooldown_seconds
+                    if self.slack_notifier else 0.0
+                ),
+                mention=True,
+            )
+        if kind is SlackMessageKind.INTEGRITY_FREEZE_ALERT:
+            active = payload["active"]
+            integrity = payload["integrity"]
+            return SlackRenderedMessage(
+                "warning",
+                f"Integrity freeze: {active.info.short_name}",
+                [
+                    f"what=event_frozen reason={integrity.get('reason') or 'unknown'}",
+                    f"impact=trading paused for this event overlay_entries={integrity.get('overlay_entries', 0)}",
+                    f"action=monitor API reconciliation or wait for deadline={self._fmt_slack_timestamp(integrity.get('deadline_at'))}",
+                ],
+                dedupe_key=f"integrity_freeze:{active.info.event_id}:{integrity.get('reason')}",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.INTEGRITY_RECOVERY_ALERT:
+            active = payload["active"]
+            integrity = payload["integrity"]
+            return SlackRenderedMessage(
+                "warning",
+                f"Integrity forced recovery: {active.info.short_name}",
+                [
+                    "what=forced_api_recovery",
+                    f"impact=overlay discarded; trading resumed with API truth unmatched_api_delta_count={integrity.get('unmatched_api_delta_count', 0)}",
+                    f"action=review event logs if this repeats last_forced_api_recovery_at={self._fmt_slack_timestamp(integrity.get('last_forced_api_recovery_at'))}",
+                ],
+                dedupe_key=f"integrity_recovery:{active.info.event_id}:{integrity.get('last_forced_api_recovery_at')}",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.FILL_ROUTING_ALERT:
+            active = payload["active"]
+            bin_index = payload["bin_index"]
+            error = payload["error"]
+            return SlackRenderedMessage(
+                "error",
+                f"Fill routing failed: {active.info.short_name}",
+                [
+                    f"what=fill_routing_failed event={active.info.event_id} bin={bin_index}",
+                    "impact=fill may not be reflected promptly in local execution state",
+                    "action=inspect routing and executor logs before trusting position state",
+                    f"error={error}",
+                ],
+                dedupe_key=f"fill_routing_error:{active.info.event_id}:{bin_index}",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.STALE_ORDER_ALERT:
+            active = payload["active"]
+            bin_index = payload["bin_index"]
+            error = payload["error"]
+            return SlackRenderedMessage(
+                "error",
+                f"Stale order handling failed: {active.info.short_name}",
+                [
+                    f"what=stale_order_handling_failed event={active.info.event_id} bin={bin_index}",
+                    "impact=pending-order cleanup may be incomplete",
+                    "action=inspect executor state and stale-order logs",
+                    f"error={error}",
+                ],
+                dedupe_key=f"stale_order_error:{active.info.event_id}:{bin_index}",
+                cooldown_seconds=300.0,
+            )
+        if kind is SlackMessageKind.EVENT_RUNTIME_ALERT:
+            event_id = payload["event_id"]
+            event_name = payload["event_name"]
+            details = payload["details"]
+            return SlackRenderedMessage(
+                "error",
+                f"Event runtime error: {event_name}",
+                [
+                    f"what=event_runtime_error event={event_id}",
+                    "impact=event trading stopped and cleanup started",
+                    "action=inspect exception and event logs",
+                    *details,
+                ],
+                dedupe_key=f"event_runtime_error:{event_id}",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.MAIN_LOOP_ALERT:
+            details = payload["details"]
+            return SlackRenderedMessage(
+                "error",
+                "Main loop error",
+                [
+                    "what=manager_main_loop_error",
+                    "impact=manager loop backed off before retrying",
+                    "action=inspect exception and runtime health",
+                    *details,
+                ],
+                dedupe_key="multi_event_manager_main_loop",
+                cooldown_seconds=300.0,
+                mention=True,
+            )
+        if kind is SlackMessageKind.CAPITAL_RESYNC_ALERT:
+            error = payload["error"]
+            return SlackRenderedMessage(
+                "warning",
+                "Capital re-sync failed",
+                [
+                    "what=capital_resync_failed",
+                    "impact=baseline capital may be stale until the next successful sync",
+                    "action=inspect Polymarket balance/positions API health",
+                    f"error={error}",
+                ],
+                dedupe_key="capital_resync_failed",
+                cooldown_seconds=1800.0,
+                mention=True,
+            )
+        raise ValueError(f"Unsupported SlackMessageKind: {kind}")
+
+    def _send_slack_message(self, kind: SlackMessageKind, **payload: Any) -> None:
+        rendered = self._build_slack_message(kind, **payload)
+        self._notify_slack(
+            rendered.level,
+            rendered.title,
+            rendered.lines,
+            dedupe_key=rendered.dedupe_key,
+            cooldown_seconds=rendered.cooldown_seconds,
+            mention=rendered.mention,
+        )
 
     def _notify_slack(
         self,
@@ -681,109 +1217,51 @@ class MultiEventManager:
 
     def _notify_startup(self) -> None:
         health = self.get_health()
-        lines = [
-            f"mode={'DRY RUN' if self.config.dry_run else 'LIVE'} active={health['active_events']} pending={health['pending_events']}",
-            f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
-            f"data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')} refreshed_at={self._fmt_slack_timestamp(health.get('last_data_refresh_time'))}",
-        ]
-        if health["active_event_names"]:
-            lines.append("events=" + ", ".join(health["active_event_names"][:5]))
-        self._notify_slack("info", "Multi-event manager started", lines)
+        self._send_slack_message(SlackMessageKind.STARTUP_DIGEST, health=health)
         self._last_slack_health_notification = datetime.now(self._tz)
         self._last_slack_health_signature = self._health_digest_signature(health)
-
-    @staticmethod
-    def _health_digest_signature(health: Dict[str, Any]) -> Tuple[Any, ...]:
-        """Build a coarse health signature for change-driven Slack digests."""
-        user_stream = health.get("user_stream", {})
-        realtime = health.get("realtime_tracker", {})
-        return (
-            health.get("status"),
-            user_stream.get("connected", False),
-            bool(health.get("errors_count")),
-            bool(health.get("frozen_events")),
-            realtime.get("enabled", False),
-            bool(realtime.get("backoff_until")),
-            bool((realtime.get("consecutive_errors", 0) or 0) >= 3),
-        )
+        self._last_slack_health_degraded = self._is_health_degraded(health)
 
     def _maybe_notify_health(self, *, force: bool = False) -> None:
         if not self.slack_notifier:
             return
-        interval = max(0, self.slack_notifier.health_interval_seconds)
 
         now = datetime.now(self._tz)
         health = self.get_health()
         signature = self._health_digest_signature(health)
+        degraded = self._is_health_degraded(health)
         changed = signature != self._last_slack_health_signature
-        interval_elapsed = (
-            self._last_slack_health_notification is None or
-            (
-                interval > 0 and
-                (now - self._last_slack_health_notification).total_seconds() >= interval
-            )
+        previous_degraded = self._last_slack_health_degraded
+        configured_interval = max(0, self.slack_notifier.health_interval_seconds)
+        healthy_interval = max(
+            configured_interval,
+            int(HEALTHY_SLACK_DIGEST_MIN_INTERVAL.total_seconds()),
         )
+        last_sent = self._last_slack_health_notification
 
-        if not force:
-            if self.slack_notifier.health_on_change_only:
-                if not changed and not interval_elapsed:
-                    return
-            elif interval <= 0 or not interval_elapsed:
-                return
+        should_send = force
+        if not should_send:
+            if degraded:
+                interval_elapsed = (
+                    last_sent is None or
+                    (configured_interval > 0 and (now - last_sent).total_seconds() >= configured_interval)
+                )
+                should_send = changed or interval_elapsed
+            else:
+                interval_elapsed = (
+                    last_sent is None or
+                    (now - last_sent).total_seconds() >= healthy_interval
+                )
+                recovered = previous_degraded is True and changed
+                should_send = recovered or interval_elapsed
 
-        lines = [
-            f"status={health['status']} uptime={health['uptime_hours']:.1f}h active={health['active_events']} pending={health['pending_events']} as_of={self._fmt_slack_timestamp(health.get('timestamp'))}",
-            f"capital available={self._fmt_usd(health['available_capital'])} allocated={self._fmt_usd(health['allocated_capital'])} pnl={self._fmt_usd(health['total_pnl'])}",
-            f"errors={health['errors_count']} data source={health.get('last_data_refresh_source') or 'unknown'} version={health.get('shared_data_version')}",
-        ]
-        user_stream = health.get("user_stream", {})
-        lines.append(
-            f"user_stream connected={user_stream.get('connected', False)} pending_orders={user_stream.get('pending_orders', 0)} fills={user_stream.get('fill_count', 0)}"
-        )
-        realtime = health.get("realtime_tracker", {})
-        if realtime.get("enabled", False):
-            lines.append(
-                f"realtime errors={realtime.get('consecutive_errors', 0)} last_poll={self._fmt_slack_timestamp(realtime.get('last_poll_time'))}"
-            )
-        if health["active_event_names"]:
-            lines.append("events=" + ", ".join(health["active_event_names"][:5]))
+        if not should_send:
+            return
 
-        self._notify_slack("info", "Health digest", lines)
+        self._send_slack_message(SlackMessageKind.HEALTH_DIGEST, health=health)
         self._last_slack_health_notification = now
         self._last_slack_health_signature = signature
-
-    def _notify_event_started(
-        self,
-        event_info: EventInfo,
-        allocated_capital: float,
-        num_active: int,
-    ) -> None:
-        self._notify_slack(
-            "info",
-            f"Event started: {event_info.short_name}",
-            [
-                f"event_id={event_info.event_id}",
-                f"dates={event_info.market_start_date} -> {event_info.settlement_date}",
-                f"allocated={self._fmt_usd(allocated_capital)} active_events={num_active}",
-                f"pool_available={self._fmt_usd(self.capital_pool.available_capital)}",
-            ],
-        )
-
-    def _notify_event_completed(
-        self,
-        event_info: EventInfo,
-        final_value: float,
-        num_active: int,
-    ) -> None:
-        self._notify_slack(
-            "info",
-            f"Event completed: {event_info.short_name}",
-            [
-                f"event_id={event_info.event_id}",
-                f"returned={self._fmt_usd(final_value)} active_events={num_active}",
-                f"pool_available={self._fmt_usd(self.capital_pool.available_capital)}",
-            ],
-        )
+        self._last_slack_health_degraded = degraded
 
     def _notify_fill(
         self,
@@ -812,6 +1290,11 @@ class MultiEventManager:
                 match_id=fill_event.match_id,
                 bin_index=bin_index,
                 bin_range=bin_range,
+                token_type=self._infer_fill_token_type(
+                    event_info,
+                    bin_index,
+                    fill_event.token_id,
+                ),
                 side=fill_event.side,
                 status=fill_event.status.value,
                 size=fill_event.size,
@@ -842,81 +1325,22 @@ class MultiEventManager:
         self._pending_fill_notifications = []
         self._first_pending_fill_at = None
         self._last_pending_fill_at = None
-
-        event_totals: Dict[str, Tuple[str, int, float]] = {}
-        for fill in fills:
-            _, count, total_notional = event_totals.get(fill.event_id, (fill.event_short_name, 0, 0.0))
-            event_totals[fill.event_id] = (fill.event_short_name, count + 1, total_notional + fill.notional)
-
-        lines = [
-            f"window={self._fmt_slack_timestamp(started_at)} -> {self._fmt_slack_timestamp(now)} fills={len(fills)} total_notional={self._fmt_usd(sum(fill.notional for fill in fills))} events={len(event_totals)}",
-        ]
-        for event_name, count, total_notional in (
-            item[1] for item in sorted(
-                event_totals.items(),
-                key=lambda item: (-item[1][1], item[1][0]),
-            )[: self.slack_notifier.fill_summary_max_examples]
-        ):
-            lines.append(
-                f"{event_name}: fills={count} notional={self._fmt_usd(total_notional)}"
-            )
-
-        lines.append("samples:")
-        for fill in fills[: self.slack_notifier.fill_summary_max_examples]:
-            bin_label = (
-                f"{fill.bin_index} ({fill.bin_range})"
-                if fill.bin_range else str(fill.bin_index)
-            )
-            lines.append(
-                f"{fill.event_short_name}: {fill.side} bin={bin_label} size={fill.size:.2f} price={fill.price:.4f} notional={self._fmt_usd(fill.notional)} at={self._fmt_slack_timestamp(fill.timestamp)}"
-            )
-
-        detailed_event_ids = [
-            event_id for event_id, _ in sorted(
-                event_totals.items(),
-                key=lambda item: (-item[1][1], item[1][0]),
-            )[: self.slack_notifier.fill_summary_max_examples]
-        ]
-        for event_id in detailed_event_ids:
-            lines.append("")
-            lines.extend(self._build_fill_summary_event_lines(event_id))
-
-        self._notify_slack("info", "Fill summary", lines)
+        self._send_slack_message(
+            SlackMessageKind.FILL_DIGEST,
+            fills=fills,
+            started_at=started_at,
+            ended_at=now,
+        )
 
     def _notify_balance_allowance_error(
         self,
         event_info: EventInfo,
         context: BalanceAllowanceErrorContext,
     ) -> None:
-        bin_label = (
-            f"{context.bin_index} ({context.bin_range})"
-            if context.bin_range else str(context.bin_index)
-        )
-        clob_balance = (
-            f"{context.clob_available_shares:.2f}"
-            if context.clob_available_shares is not None else "unknown"
-        )
-        lines = [
-            f"event_id={event_info.event_id} action={context.action} side={context.side} token_type={context.token_type}",
-            f"bin={bin_label} token={context.token_id}",
-            f"requested_size={context.requested_size:.2f} requested_price={context.requested_price:.4f} limit_price={context.requested_limit_price:.4f} notional={self._fmt_usd(context.requested_notional)}",
-            f"fair={context.reservation_price:.4f} edge={context.edge:+.2%} utility={context.utility_gain:.6f}",
-            f"local_yes={context.local_yes_shares:.2f} @ {context.local_yes_avg_cost:.4f} local_no={context.local_no_shares:.2f} @ {context.local_no_avg_cost:.4f}",
-            f"portfolio_available={self._fmt_usd(context.portfolio_available_capital or 0.0)} collateral={self._fmt_usd(context.portfolio_total_collateral or 0.0)} pending_orders={context.pending_orders_count}",
-            f"clob_balance={clob_balance} raw_balance={context.raw_balance or 'n/a'} nonzero_allowances={context.nonzero_allowances if context.nonzero_allowances is not None else 'unknown'}",
-            f"allowances={context.allowances if context.allowances is not None else 'n/a'}",
-            f"error={context.error}",
-        ]
-        self._notify_slack(
-            "warning",
-            f"Balance / allowance rejection: {event_info.short_name}",
-            lines,
-            dedupe_key=f"balance_allowance:{event_info.event_id}:{context.bin_index}:{context.token_id}",
-            cooldown_seconds=(
-                self.slack_notifier.balance_allowance_cooldown_seconds
-                if self.slack_notifier else 0.0
-            ),
-            mention=True,
+        self._send_slack_message(
+            SlackMessageKind.BALANCE_ALLOWANCE_ALERT,
+            event_info=event_info,
+            context=context,
         )
 
     def _build_position_fingerprint(self, bot: GASKellyTradingBot) -> Optional[Tuple[Any, ...]]:
@@ -944,6 +1368,39 @@ class MultiEventManager:
             round(portfolio.total_collateral_used, 2),
             tuple(positions),
         )
+
+    def _maybe_notify_integrity_state_changes(self) -> None:
+        if not self.slack_notifier:
+            return
+
+        next_state: Dict[str, Tuple[bool, Optional[str], Optional[str]]] = {}
+        for event_id, active in self._active_events.items():
+            integrity = self._get_event_integrity_summary(active)
+            current_state = (
+                bool(integrity.get("frozen")),
+                integrity.get("reason"),
+                integrity.get("last_forced_api_recovery_at"),
+            )
+            next_state[event_id] = current_state
+            previous_state = self._last_integrity_alert_state.get(event_id)
+
+            if current_state[0] and (not previous_state or not previous_state[0]):
+                self._send_slack_message(
+                    SlackMessageKind.INTEGRITY_FREEZE_ALERT,
+                    active=active,
+                    integrity=integrity,
+                )
+
+            if current_state[2] and (
+                not previous_state or previous_state[2] != current_state[2]
+            ):
+                self._send_slack_message(
+                    SlackMessageKind.INTEGRITY_RECOVERY_ALERT,
+                    active=active,
+                    integrity=integrity,
+                )
+
+        self._last_integrity_alert_state = next_state
 
     async def _maybe_wait_for_event_stabilization(self, event_id: str, active: ActiveEvent) -> bool:
         """
@@ -1117,27 +1574,28 @@ class MultiEventManager:
         Fetches USDC balance and existing positions to determine total capital.
         Called automatically if capital_pool.total_capital is 0.
         """
-        logger.info("Auto-detecting capital from Polymarket API...")
+        logger.info("[CAPITAL][INIT_API] begin source=polymarket")
 
         # Fetch USDC balance
         usdc_balance = await self.fetch_usdc_balance()
 
         # Fetch existing positions with actual values from API
         all_positions = await self.fetch_all_positions()
-        position_value = 0.0
+        position_cost = 0.0
 
         # Use actual values from API (cost basis / initialValue)
         for token_id, pos_info in all_positions.items():
-            position_value += pos_info["cost_basis"]
+            position_cost += pos_info["cost_basis"]
 
-        total_capital = usdc_balance + position_value
+        total_capital = usdc_balance + position_cost
 
         # Set capital in pool
         await self.capital_pool.set_total_from_api(total_capital)
 
         logger.info(
-            f"Capital auto-detected: ${usdc_balance:.2f} USDC + "
-            f"${position_value:.2f} positions = ${total_capital:.2f} total"
+            f"[CAPITAL][INIT_API] usdc_idle={self._fmt_usd(usdc_balance)} "
+            f"position_cost={self._fmt_usd(position_cost)} "
+            f"baseline_total={self._fmt_usd(total_capital)}"
         )
 
     async def prefetch_shared_data(self, n_days: Optional[int] = None) -> None:
@@ -1469,29 +1927,16 @@ class MultiEventManager:
         cookie_err = self.realtime_tracker.last_cookie_error
         if cookie_err:
             cookie_label = self.realtime_tracker._last_cookie_error_label or "unknown"
-            self._notify_slack(
-                "error",
-                f"Twitter cookie error: {cookie_err}",
-                [
-                    f"Cookie '{cookie_label}' failed with: {cookie_err}.",
-                    f"Consecutive errors: {self.realtime_tracker.consecutive_errors}.",
-                    "Check/refresh cookies in config/twitter_cookies.json.",
-                ],
-                dedupe_key=f"realtime_cookie_error_{cookie_label}",
-                cooldown_seconds=3600.0,
-                mention=True,
+            self._send_slack_message(
+                SlackMessageKind.TWITTER_COOKIE_ERROR,
+                cookie_label=cookie_label,
+                cookie_error=cookie_err,
+                consecutive_errors=self.realtime_tracker.consecutive_errors,
             )
 
         if result.gap_detected:
             logger.warning("Realtime gap detected; forcing authoritative XTracker refresh")
-            self._notify_slack(
-                "warning",
-                "Realtime gap detected",
-                ["Forcing authoritative XTracker refresh."],
-                dedupe_key="realtime_gap_detected",
-                cooldown_seconds=300.0,
-                mention=True,
-            )
+            self._send_slack_message(SlackMessageKind.REALTIME_GAP_ALERT)
             refresh_outcome = await self.refresh_shared_data()
             if refresh_outcome.effective_changed:
                 await self._queue_sync_tick_requests(
@@ -1573,13 +2018,11 @@ class MultiEventManager:
                 )
         except Exception as e:
             logger.error(f"[{active.info.short_name}] Error routing fill bin={bin_index}: {e}", exc_info=True)
-            self._notify_slack(
-                "error",
-                f"Fill routing failed: {active.info.short_name}",
-                [f"bin={bin_index}", str(e)],
-                dedupe_key=f"fill_routing_error:{event_id}:{bin_index}",
-                cooldown_seconds=300.0,
-                mention=True,
+            self._send_slack_message(
+                SlackMessageKind.FILL_ROUTING_ALERT,
+                active=active,
+                bin_index=bin_index,
+                error=str(e),
             )
 
     async def _handle_global_stale_order(self, pending: PendingOrder) -> None:
@@ -1609,12 +2052,11 @@ class MultiEventManager:
                 await active.bot.kelly_bot.kelly_executor.handle_stale_order(pending)
         except Exception as e:
             logger.error(f"[{active.info.short_name}] Error handling stale order bin={bin_index}: {e}", exc_info=True)
-            self._notify_slack(
-                "error",
-                f"Stale order handling failed: {active.info.short_name}",
-                [f"bin={bin_index}", str(e)],
-                dedupe_key=f"stale_order_error:{event_id}:{bin_index}",
-                cooldown_seconds=300.0,
+            self._send_slack_message(
+                SlackMessageKind.STALE_ORDER_ALERT,
+                active=active,
+                bin_index=bin_index,
+                error=str(e),
             )
 
     def _register_event_tokens(self, event_info: EventInfo) -> None:
@@ -2244,11 +2686,9 @@ class MultiEventManager:
         )
 
         logger.info(
-            f"Event {event_id} started. "
-            f"Active events: {num_active}, "
-            f"Pool available: ${self.capital_pool.available_capital:.2f}"
+            f"[EVENT][START] event={event_id} short_name={event_info.short_name} "
+            f"alloc_budget={self._fmt_usd(allocated_capital)} active_events={num_active}"
         )
-        self._notify_event_started(event_info, allocated_capital, num_active)
 
     async def _run_event(
         self,
@@ -2270,13 +2710,11 @@ class MultiEventManager:
             logger.error(f"Event {event_id} error: {e}", exc_info=True)
             self._errors_count += 1
             event_name = getattr(bot.bot_config, "event_name", event_id)
-            self._notify_slack(
-                "error",
-                f"Event runtime error: {event_name}",
-                [str(e)],
-                dedupe_key=f"event_runtime_error:{event_id}",
-                cooldown_seconds=300.0,
-                mention=True,
+            self._send_slack_message(
+                SlackMessageKind.EVENT_RUNTIME_ALERT,
+                event_id=event_id,
+                event_name=event_name,
+                details=self._format_exception_details(e),
             )
         finally:
             await self._cleanup_event(event_id, bot)
@@ -2326,9 +2764,12 @@ class MultiEventManager:
                 # For early termination, just return the allocated amount
                 final_value = allocated_capital if allocated_capital > 0 else position_value
 
-                logger.debug(
-                    f"Event {event_id} cleanup: allocated=${allocated_capital:.2f}, "
-                    f"position_value=${position_value:.2f}, returning=${final_value:.2f}"
+                cleanup_basis = "alloc_budget" if allocated_capital > 0 else "fallback_open_cost"
+                logger.info(
+                    f"[CAPITAL][RELEASE] event={event_id} cleanup_basis={cleanup_basis} "
+                    f"alloc_budget={self._fmt_usd(allocated_capital)} "
+                    f"open_cost={self._fmt_usd(position_value)} "
+                    f"returned={self._fmt_usd(final_value)}"
                 )
             else:
                 # Fallback: return initial allocation
@@ -2354,12 +2795,9 @@ class MultiEventManager:
             await self._sync_user_stream_markets()
 
             logger.info(
-                f"Event {event_id} completed. "
-                f"Active events: {num_active}, "
-                f"Pool available: ${self.capital_pool.available_capital:.2f}"
+                f"[EVENT][COMPLETE] event={event_id} returned={self._fmt_usd(final_value)} "
+                f"active_events={num_active}"
             )
-            if event_info is not None:
-                self._notify_event_completed(event_info, final_value, num_active)
 
             # Try to start pending events with freed capital
             if self._running:
@@ -2536,6 +2974,7 @@ class MultiEventManager:
 
                 # Integrity deadlines (every poll cycle)
                 await self._enforce_integrity_deadlines()
+                self._maybe_notify_integrity_state_changes()
 
                 # Capital values + status (every poll cycle)
                 await self._update_capital_values()
@@ -2557,13 +2996,9 @@ class MultiEventManager:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 self._errors_count += 1
-                self._notify_slack(
-                    "error",
-                    "Main loop error",
-                    self._format_exception_details(e),
-                    dedupe_key="multi_event_manager_main_loop",
-                    cooldown_seconds=300.0,
-                    mention=True,
+                self._send_slack_message(
+                    SlackMessageKind.MAIN_LOOP_ALERT,
+                    details=self._format_exception_details(e),
                 )
                 await asyncio.sleep(60)  # Back off on error
 
@@ -2576,14 +3011,7 @@ class MultiEventManager:
             await self._initialize_capital_from_api()
         except Exception as e:
             logger.warning(f"Capital re-sync failed: {e}")
-            self._notify_slack(
-                "warning",
-                "Capital re-sync failed",
-                [str(e)],
-                dedupe_key="capital_resync_failed",
-                cooldown_seconds=1800.0,
-                mention=True,
-            )
+            self._send_slack_message(SlackMessageKind.CAPITAL_RESYNC_ALERT, error=str(e))
 
     async def _update_capital_values(self) -> None:
         """Update capital pool with current portfolio values."""
@@ -2609,13 +3037,17 @@ class MultiEventManager:
                 logger.debug(f"Error updating value for {event_id}: {e}")
 
     def _log_status(self) -> None:
-        """Log current status."""
-        summary = self.capital_pool.get_summary()
-        logger.info(
-            f"Status: {summary['num_active_events']} active events, "
-            f"${summary['available_capital']:.2f} available, "
-            f"${summary['allocated_capital']:.2f} allocated, "
-            f"total value ${summary['total_value']:.2f}"
+        """Log terse capital status on the hot poll loop."""
+        snapshot = self._build_capital_snapshot()
+        logger.debug(
+            f"[CAPITAL][SNAPSHOT] baseline_total={self._fmt_usd(snapshot.baseline_total)} "
+            f"unallocated_idle={self._fmt_usd(snapshot.unallocated_idle)} "
+            f"alloc_budget_total={self._fmt_usd(snapshot.alloc_budget_total)} "
+            f"event_idle_cash_total={self._fmt_usd(snapshot.event_idle_cash_total)} "
+            f"open_cost_total={self._fmt_usd(snapshot.open_cost_total)} "
+            f"open_liq_total={self._fmt_usd(snapshot.open_liq_total)} "
+            f"open_pnl_total={self._fmt_usd(snapshot.open_pnl_total)} "
+            f"asset_now_total={self._fmt_usd(snapshot.asset_now_total)}"
         )
 
     async def _shutdown(self) -> None:
@@ -2657,13 +3089,10 @@ class MultiEventManager:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current status for monitoring."""
+        capital_snapshot = self._build_capital_snapshot()
         active_events = {}
         for event_id, active in self._active_events.items():
-            integrity = {}
-            try:
-                integrity = active.bot.get_state_summary().get("integrity", {})
-            except Exception:
-                integrity = {}
+            integrity = self._get_event_integrity_summary(active)
             active_events[event_id] = {
                 "short_name": active.info.short_name,
                 "settlement_date": active.info.settlement_date.isoformat(),
@@ -2675,6 +3104,7 @@ class MultiEventManager:
         return {
             "running": self._running,
             "capital_pool": self.capital_pool.get_summary(),
+            "capital_snapshot": capital_snapshot.to_dict(),
             "performance": self.capital_pool.get_performance_summary(),
             "shared_data_version": self.shared_data_version,
             "last_data_refresh_time": (
@@ -2768,6 +3198,7 @@ class MultiEventManager:
         # Capital pool stats
         pool_summary = self.capital_pool.get_summary()
         pool_performance = self.capital_pool.get_performance_summary()
+        capital_snapshot = self._build_capital_snapshot()
 
         # Time since last cleanup
         time_since_cleanup = None
@@ -2777,10 +3208,7 @@ class MultiEventManager:
         frozen_event_names = []
         frozen_events = 0
         for active in self._active_events.values():
-            try:
-                integrity = active.bot.get_state_summary().get("integrity", {})
-            except Exception:
-                integrity = {}
+            integrity = self._get_event_integrity_summary(active)
             if integrity.get("frozen"):
                 frozen_events += 1
                 frozen_event_names.append(active.info.short_name)
@@ -2815,6 +3243,7 @@ class MultiEventManager:
             "available_capital": pool_summary.get("available_capital", 0),
             "allocated_capital": pool_summary.get("allocated_capital", 0),
             "total_pnl": pool_performance.get("total_pnl", 0),
+            "capital_snapshot": capital_snapshot.to_dict(),
 
             # Maintenance
             "last_cleanup_hours_ago": round(time_since_cleanup, 2) if time_since_cleanup else None,
@@ -2869,6 +3298,7 @@ class MultiEventManager:
     def _log_health(self) -> None:
         """Log health status in a human-readable format."""
         health = self.get_health()
+        snapshot = self._coerce_capital_snapshot(health["capital_snapshot"])
 
         logger.info("=" * 70)
         logger.info("HEALTH CHECK REPORT")
@@ -2886,10 +3316,37 @@ class MultiEventManager:
             logger.info(f"    Active names: {', '.join(health['active_event_names'])}")
         logger.info("")
         logger.info("  CAPITAL:")
-        logger.info(f"    Total: ${health['total_capital']:.2f}")
-        logger.info(f"    Available: ${health['available_capital']:.2f}")
-        logger.info(f"    Allocated: ${health['allocated_capital']:.2f}")
-        logger.info(f"    Total P&L: ${health['total_pnl']:.2f}")
+        logger.info(
+            f"    [CAPITAL][SNAPSHOT] baseline_total={self._fmt_usd(snapshot.baseline_total)} "
+            f"unallocated_idle={self._fmt_usd(snapshot.unallocated_idle)} "
+            f"alloc_budget_total={self._fmt_usd(snapshot.alloc_budget_total)} "
+            f"event_idle_cash_total={self._fmt_usd(snapshot.event_idle_cash_total)} "
+            f"open_cost_total={self._fmt_usd(snapshot.open_cost_total)} "
+            f"open_liq_total={self._fmt_usd(snapshot.open_liq_total)} "
+            f"open_pnl_total={self._fmt_usd(snapshot.open_pnl_total)} "
+            f"asset_now_total={self._fmt_usd(snapshot.asset_now_total)}"
+        )
+        logger.info(f"    Baseline total: {self._fmt_usd(snapshot.baseline_total)}")
+        logger.info(f"    Pool unallocated idle: {self._fmt_usd(snapshot.unallocated_idle)}")
+        logger.info(f"    Alloc budget total: {self._fmt_usd(snapshot.alloc_budget_total)}")
+        logger.info(f"    Event idle cash total: {self._fmt_usd(snapshot.event_idle_cash_total)}")
+        logger.info(f"    Open cost total: {self._fmt_usd(snapshot.open_cost_total)}")
+        logger.info(f"    Open liq total: {self._fmt_usd(snapshot.open_liq_total)}")
+        logger.info(f"    Open P&L total: {self._fmt_usd(snapshot.open_pnl_total)}")
+        logger.info(f"    Asset now total: {self._fmt_usd(snapshot.asset_now_total)}")
+        for event_line in self._format_event_capital_lines(snapshot.events):
+            logger.info(f"    {event_line}")
+        if snapshot.unallocated_idle < -0.01:
+            logger.warning(
+                f"[CAPITAL][WARN] pool_unallocated_idle={self._fmt_usd(snapshot.unallocated_idle)} "
+                f"alloc_budget_total={self._fmt_usd(snapshot.alloc_budget_total)} "
+                f"baseline_total={self._fmt_usd(snapshot.baseline_total)}"
+            )
+        if snapshot.total_stale_px_positions >= 3:
+            logger.warning(
+                f"[CAPITAL][WARN] stale_px_positions={snapshot.total_stale_px_positions} "
+                f"fallback_cost={self._fmt_usd(snapshot.total_stale_px_fallback_cost)}"
+            )
         logger.info("")
         logger.info("  RESOURCES:")
         if health['memory_mb']:
@@ -3117,7 +3574,7 @@ class MultiEventManager:
 
         # 5. Compute capital per event from positions
         event_positions: Dict[str, Dict[str, dict]] = {}  # event_id -> {token_id: pos_info}
-        event_values: Dict[str, float] = {}  # event_id -> total value
+        event_values: Dict[str, float] = {}  # event_id -> restored cost basis
 
         for token_id, pos_info in all_positions.items():
             event_info = token_to_event.get(token_id)
@@ -3132,13 +3589,14 @@ class MultiEventManager:
                 event_values[event_id] += pos_info["cost_basis"]
 
                 logger.info(
-                    f"Position: {pos_info['shares']:.2f} shares @ ${pos_info['avg_price']:.4f} = ${pos_info['cost_basis']:.2f} "
-                    f"of {event_info.short_name} (token {token_id[:16]}...)"
+                    f"[CAPITAL][RESTORE] token={token_id[:16]}... event={event_info.short_name} "
+                    f"shares={pos_info['shares']:.2f} avg_price=${pos_info['avg_price']:.4f} "
+                    f"restored_basis=${pos_info['cost_basis']:.2f}"
                 )
 
         # 6. Compute total capital and restore allocations
-        total_position_value = sum(event_values.values())
-        total_capital = usdc_balance + total_position_value
+        total_position_cost = sum(event_values.values())
+        total_capital = usdc_balance + total_position_cost
 
         await self.capital_pool.set_total_from_api(total_capital)
 
@@ -3161,7 +3619,10 @@ class MultiEventManager:
             event_id = event_info.event_id
             async with self._events_lock:
                 self._pending_events[event_id] = event_info
-            logger.info(f"[PRIORITY] Restored event {event_info.short_name} with ${event_values[event_id]:.2f} position value")
+            logger.info(
+                f"[CAPITAL][RESTORE] event={event_info.short_name} "
+                f"restored_basis=${event_values[event_id]:.2f} priority=with_positions"
+            )
 
         await self._sync_user_stream_markets()
 
@@ -3180,9 +3641,9 @@ class MultiEventManager:
 
         logger.info("=" * 60)
         logger.info(f"STATE RECONSTRUCTION COMPLETE")
-        logger.info(f"  Total capital: ${total_capital:.2f}")
-        logger.info(f"  USDC balance: ${usdc_balance:.2f}")
-        logger.info(f"  Position value: ${total_position_value:.2f}")
+        logger.info(f"  [CAPITAL][INIT_API] baseline_total={self._fmt_usd(total_capital)}")
+        logger.info(f"  [CAPITAL][INIT_API] usdc_idle={self._fmt_usd(usdc_balance)}")
+        logger.info(f"  [CAPITAL][INIT_API] position_cost={self._fmt_usd(total_position_cost)}")
         logger.info(f"  Events with positions: {len(event_positions)}")
         logger.info(f"  Events discovered: {len(discovered_events)}")
         logger.info("=" * 60)

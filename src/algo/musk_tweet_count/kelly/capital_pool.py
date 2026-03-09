@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -79,12 +79,12 @@ class CapitalPool:
 
         if config.total_capital > 0:
             logger.info(
-                f"Capital pool initialized: total=${config.total_capital:.2f}, "
+                f"[CAPITAL][INIT] baseline_total=${config.total_capital:.2f} "
                 f"max_per_event=${max_per_event:.2f}"
             )
         else:
             logger.info(
-                "Capital pool initialized with auto-detect mode "
+                "[CAPITAL][INIT] baseline_total=auto_detect "
                 "(will fetch from API on startup)"
             )
 
@@ -127,8 +127,8 @@ class CapitalPool:
             # Check if capital pool is initialized
             if self.config.total_capital <= 0 and not self._initialized_from_api:
                 logger.warning(
-                    "Capital pool not initialized (total_capital=0). "
-                    "Call set_total_from_api() first or set total_capital in config."
+                    "[CAPITAL][WARN] pool not initialized "
+                    "(call set_total_from_api() first or configure total_capital)"
                 )
                 return 0.0
 
@@ -137,7 +137,8 @@ class CapitalPool:
                 existing = self._allocations[event_id]
                 # Return existing allocation value so the event can start
                 logger.info(
-                    f"Event {event_id} has restored allocation: ${existing.current_value:.2f}"
+                    f"[CAPITAL][ALLOCATE] event={event_id} "
+                    f"restored_allocation_reused=${existing.current_value:.2f}"
                 )
                 return existing.current_value
 
@@ -153,26 +154,29 @@ class CapitalPool:
             # Check minimum threshold
             if allocated < self.config.min_allocation:
                 logger.warning(
-                    f"Insufficient capital for event {event_id}: "
-                    f"${allocated:.2f} < min ${self.config.min_allocation:.2f}"
+                    f"[CAPITAL][ALLOCATE] event={event_id} "
+                    f"requested=${max_amount:.2f} granted=${allocated:.2f} "
+                    f"min_required=${self.config.min_allocation:.2f} result=insufficient"
                 )
                 return 0.0
 
             # Create allocation
+            available_before = self._available
             allocation = EventAllocation(
                 event_id=event_id,
                 initial_allocation=allocated,
                 current_value=allocated,
-                allocated_at=datetime.utcnow(),
+                allocated_at=datetime.now(timezone.utc),
             )
 
             self._allocations[event_id] = allocation
             self._available -= allocated
 
             logger.info(
-                f"Allocated ${allocated:.2f} to event {event_id} "
-                f"(pool: ${self._available:.2f} available, "
-                f"{len(self._allocations)} active events)"
+                f"[CAPITAL][ALLOCATE] event={event_id} "
+                f"requested=${max_amount:.2f} granted=${allocated:.2f} "
+                f"pool_unallocated_idle=${available_before:.2f}->${self._available:.2f} "
+                f"active_events={len(self._allocations)}"
             )
 
             return allocated
@@ -191,11 +195,11 @@ class CapitalPool:
         """
         async with self._lock:
             if event_id not in self._allocations:
-                logger.warning(f"No allocation found for event {event_id}")
+                logger.warning(f"[CAPITAL][WARN] no allocation found for event={event_id}")
                 return
 
             allocation = self._allocations[event_id]
-            allocation.settled_at = datetime.utcnow()
+            allocation.settled_at = datetime.now(timezone.utc)
             allocation.final_value = final_value
 
             # Calculate P&L
@@ -203,6 +207,7 @@ class CapitalPool:
             pnl_pct = (pnl / allocation.initial_allocation * 100) if allocation.initial_allocation > 0 else 0
 
             # Return capital to pool
+            available_before = self._available
             self._available += final_value
 
             # Move to history
@@ -210,10 +215,11 @@ class CapitalPool:
             del self._allocations[event_id]
 
             logger.info(
-                f"Event {event_id} deallocated: ${final_value:.2f} returned to pool "
-                f"(P&L: ${pnl:+.2f}, {pnl_pct:+.1f}%) "
-                f"(pool: ${self._available:.2f} available, "
-                f"{len(self._allocations)} active events)"
+                f"[CAPITAL][RELEASE] event={event_id} "
+                f"alloc_budget=${allocation.initial_allocation:.2f} "
+                f"returned=${final_value:.2f} realized_pnl=${pnl:+.2f} ({pnl_pct:+.1f}%) "
+                f"pool_unallocated_idle=${available_before:.2f}->${self._available:.2f} "
+                f"active_events={len(self._allocations)}"
             )
 
     async def update_value(
@@ -249,8 +255,9 @@ class CapitalPool:
                 if now - self._last_negative_warning_time > 60:
                     self._last_negative_warning_time = now
                     logger.warning(
-                        f"Capital pool available is negative: ${self._available:.2f} "
-                        f"(allocated exceeds total capital)"
+                        f"[CAPITAL][WARN] tracking_pool_available_negative=${self._available:.2f} "
+                        f"alloc_current=${self.allocated_capital:.2f} "
+                        f"baseline_total=${self.config.total_capital:.2f}"
                     )
 
     async def get_allocation(self, event_id: str) -> Optional[EventAllocation]:
@@ -299,7 +306,9 @@ class CapitalPool:
         """
         async with self._lock:
             if event_id in self._allocations:
-                logger.warning(f"Event {event_id} already has allocation, updating value")
+                logger.warning(
+                    f"[CAPITAL][RESTORE] event={event_id} already present, updating current value"
+                )
                 self._allocations[event_id].current_value = current_value
                 return
 
@@ -307,15 +316,17 @@ class CapitalPool:
                 event_id=event_id,
                 initial_allocation=current_value,  # Unknown, use current as initial
                 current_value=current_value,
-                allocated_at=datetime.utcnow(),
+                allocated_at=datetime.now(timezone.utc),
             )
 
             self._allocations[event_id] = allocation
+            available_before = self._available
             self._available -= current_value
 
             logger.info(
-                f"Restored allocation for event {event_id}: ${current_value:.2f} "
-                f"(pool: ${self._available:.2f} available)"
+                f"[CAPITAL][RESTORE] event={event_id} "
+                f"restored_basis=${current_value:.2f} "
+                f"pool_unallocated_idle=${available_before:.2f}->${self._available:.2f}"
             )
 
     async def set_total_from_api(self, total_value: float) -> None:
@@ -334,8 +345,8 @@ class CapitalPool:
             self._initialized_from_api = True
 
             logger.info(
-                f"Capital pool synced from API: ${total_value:.2f} total, "
-                f"${allocated:.2f} allocated, ${self._available:.2f} available"
+                f"[CAPITAL][SYNC_API] baseline_total=${total_value:.2f} "
+                f"alloc_current=${allocated:.2f} pool_unallocated_idle=${self._available:.2f}"
             )
 
     @property
