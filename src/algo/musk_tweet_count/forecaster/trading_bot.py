@@ -1411,6 +1411,18 @@ class GASKellyTradingBot:
                         f"rem={bs['remaining_mean']:.1f}+/-{bs['remaining_std']:.1f}"
                     )
 
+            quiet_str = ""
+            if nowcast and hasattr(nowcast, '_last_quiet') and nowcast._last_quiet:
+                quiet = nowcast._last_quiet
+                quiet_str = (
+                    f" | quiet: state={quiet['state']}, "
+                    f"idle={quiet['night_idle_prior']:.2f}, onset={quiet['sleep_onset_confidence']:.2f}, "
+                    f"wake={quiet['wake_continuation_confidence']:.2f}, strength={quiet['quiet_strength']:.2f}, "
+                    f"silence={quiet['silence_min']}min, recent15={quiet['recent15']}, "
+                    f"recent60={quiet['recent60']}, recent180={quiet['recent180']}, "
+                    f"regime_eff={quiet['regime_eff']:.2f}x"
+                )
+
             logger.info(
                 f"Monte Carlo recomputed: mean={forecast.mean:.1f}, "
                 f"std={forecast.std:.1f}, "
@@ -1419,6 +1431,7 @@ class GASKellyTradingBot:
                 f"{breakdown_str}"
                 f"{regime_str}"
                 f"{impulse_str}"
+                f"{quiet_str}"
                 f"{bootstrap_str}"
             )
 

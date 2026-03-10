@@ -90,6 +90,7 @@ class BucketNowcastConfig:
     bootstrap_recent60_sigma: float = 4.0
     bootstrap_recent180_sigma: float = 8.0
     bootstrap_silence_sigma_minutes: float = 60.0
+    bootstrap_quiet_sigma: float = 0.25
     bootstrap_min_effective_n: float = 5.0
     bootstrap_full_effective_n: float = 20.0
 
@@ -115,6 +116,22 @@ class BucketNowcastConfig:
     impulse_lookback_minutes: int = 360                # How far back for expected excitation calc
     impulse_min_expected_excitation: float = 0.3       # Below this, treat as low-data period
     impulse_overrides_path: str = "config/impulse_overrides.yaml"  # Time-of-day rate_mult overrides
+
+    # Learned overnight quiet-state model
+    use_overnight_quiet: bool = True
+    use_overnight_quiet_runtime_mask: bool = False
+    use_overnight_quiet_regime_damping: bool = False
+    use_overnight_quiet_bootstrap_matching: bool = True
+    overnight_quiet_start_tau: int = 750               # 00:30 ET
+    overnight_quiet_end_tau: int = 1110                # 06:30 ET
+    overnight_session_gap_minutes: int = 12
+    overnight_idle_horizon_minutes: int = 60
+    overnight_sleep_onset_horizon_minutes: int = 120
+    overnight_wake_horizon_minutes: int = 60
+    overnight_sustained_wake_min_tweets: int = 3
+    overnight_profile_min_weighted_samples: float = 5.0
+    overnight_profile_laplace_alpha: float = 1.0
+    overnight_fallback_mix: float = 0.35
 
 
 @dataclass

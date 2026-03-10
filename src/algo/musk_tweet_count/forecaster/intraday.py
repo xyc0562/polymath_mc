@@ -768,6 +768,66 @@ class HistoricalSuffixProfile:
     final_count: int
 
 
+@dataclass
+class OvernightQuietProfile:
+    """Learned overnight quiet-state priors and continuation tables."""
+
+    tau_values: np.ndarray
+    night_idle_prior: np.ndarray
+    sleep_onset_success: np.ndarray
+    sleep_onset_total: np.ndarray
+    wake_success: np.ndarray
+    wake_total: np.ndarray
+    wake_relief_curve: np.ndarray
+    prior_activity_edges: Tuple[float, float]
+
+
+@dataclass
+class OvernightFeatureSnapshot:
+    """Runtime or historical snapshot of overnight activity state."""
+
+    tau_now: int
+    tau_bin_idx: int
+    recent15: int
+    recent60: int
+    recent180: int
+    silence_min: int
+    last_session_tweets: int
+    last_session_duration_min: int
+    prior_activity_score: float
+    prior_activity_bin: int
+    silence_bin: int
+    has_recent_activity: bool
+    wake_session_tweets: int
+    wake_session_bin: int
+    recent15_bin: int
+    has_wake_session: bool
+
+
+@dataclass
+class OvernightQuietState:
+    """Soft overnight quiet-state diagnostics for the current tick."""
+
+    state: str
+    tau_now: int
+    night_idle_prior: float
+    sleep_onset_confidence: float
+    wake_continuation_confidence: float
+    quiet_strength: float
+    regime_eff: float
+    silence_min: int
+    recent15: int
+    recent60: int
+    recent180: int
+    prior_activity_score: float
+    prior_activity_bin: int
+    silence_bin: int
+    wake_session_bin: Optional[int]
+    idle_source: str
+    onset_source: str
+    wake_source: str
+
+
 def _load_impulse_overrides(path: str) -> List[ImpulseOverrideWindow]:
     """Load impulse rate_mult overrides from YAML. Returns empty list if file not found."""
     import os
@@ -848,9 +908,12 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         self._last_regime: Optional[Dict[str, float | int | None]] = None
         self._last_impulse: Optional[Dict[str, float | int | None]] = None
         self._last_bootstrap: Optional[Dict[str, float | int]] = None
+        self._last_quiet: Optional[Dict[str, float | int | str | None]] = None
 
         # Historical suffix profiles for optional direct historical bootstrap
         self._historical_suffix_profiles: List[HistoricalSuffixProfile] = []
+        self._weekday_overnight_profile: Optional[OvernightQuietProfile] = None
+        self._weekend_overnight_profile: Optional[OvernightQuietProfile] = None
 
         # Fitted flag
         self._fitted = False
@@ -910,6 +973,14 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             historical_counts=historical_counts,
             as_of_date=today,
         )
+        (
+            self._weekday_overnight_profile,
+            self._weekend_overnight_profile,
+        ) = self._build_overnight_quiet_profiles(
+            historical_events=historical_events,
+            historical_counts=historical_counts,
+            as_of_date=today,
+        )
 
         self._fitted = True
 
@@ -961,6 +1032,620 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             )
 
         return profiles
+
+    def _weighted_quantile(
+        self,
+        values: np.ndarray,
+        weights: np.ndarray,
+        q: float,
+    ) -> float:
+        """Weighted quantile helper for learned activity-score bins."""
+        if values.size == 0:
+            return 0.0
+        if values.size == 1:
+            return float(values[0])
+
+        order = np.argsort(values)
+        sorted_values = values[order]
+        sorted_weights = weights[order]
+        cumulative = np.cumsum(sorted_weights)
+        total = float(cumulative[-1])
+        if total <= 0:
+            return float(np.quantile(sorted_values, q))
+        target = q * total
+        return float(np.interp(target, cumulative, sorted_values))
+
+    def _tau_to_overnight_bin(self, tau_now: int) -> Optional[int]:
+        if not self.config.use_overnight_quiet:
+            return None
+        if tau_now < self.config.overnight_quiet_start_tau or tau_now >= self.config.overnight_quiet_end_tau:
+            return None
+        return int((tau_now - self.config.overnight_quiet_start_tau) // 5)
+
+    def _silence_bin(self, silence_min: int) -> int:
+        if silence_min < 10:
+            return 0
+        if silence_min < 20:
+            return 1
+        if silence_min < 40:
+            return 2
+        if silence_min < 60:
+            return 3
+        if silence_min < 90:
+            return 4
+        return 5
+
+    def _recent15_bin(self, recent15: int) -> int:
+        if recent15 <= 0:
+            return 0
+        if recent15 == 1:
+            return 1
+        return 2
+
+    def _wake_session_bin(self, wake_session_tweets: int) -> int:
+        if wake_session_tweets <= 1:
+            return 0
+        if wake_session_tweets <= 3:
+            return 1
+        return 2
+
+    def _prior_activity_bin(
+        self,
+        prior_activity_score: float,
+        edges: Tuple[float, float],
+    ) -> int:
+        low_edge, high_edge = edges
+        if prior_activity_score <= low_edge:
+            return 0
+        if prior_activity_score <= high_edge:
+            return 1
+        return 2
+
+    def _sessionize_taus(
+        self,
+        taus: np.ndarray,
+        tau_now: int,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Group past tweet taus into sessions as (start, end, count, gap_before)."""
+        if taus.size == 0:
+            return []
+
+        hi = np.searchsorted(taus, tau_now, side="right")
+        if hi <= 0:
+            return []
+
+        past = taus[:hi]
+        gap_threshold = self.config.overnight_session_gap_minutes
+        sessions: List[Tuple[int, int, int, int]] = []
+
+        start = end = int(past[0])
+        count = 1
+        prev_tau = int(past[0])
+        gap_before = start
+
+        for raw_tau in past[1:]:
+            tau_val = int(raw_tau)
+            if tau_val - prev_tau > gap_threshold:
+                sessions.append((start, end, count, gap_before))
+                gap_before = tau_val - prev_tau
+                start = end = tau_val
+                count = 1
+            else:
+                end = tau_val
+                count += 1
+            prev_tau = tau_val
+
+        sessions.append((start, end, count, gap_before))
+        return sessions
+
+    def _compute_prior_activity_score(
+        self,
+        recent180: int,
+        last_session_tweets: int,
+        last_session_duration_min: int,
+    ) -> float:
+        """Continuous recent-activity score used for learned prior-activity bins."""
+        return (
+            float(recent180)
+            + 0.5 * float(last_session_tweets)
+            + 0.1 * float(min(last_session_duration_min, 90))
+        )
+
+    def _compute_overnight_snapshot_from_taus(
+        self,
+        taus: np.ndarray,
+        tau_now: int,
+        edges: Tuple[float, float],
+    ) -> OvernightFeatureSnapshot:
+        recent15 = self._count_taus_in_window(taus, tau_now - 15, tau_now)
+        recent60 = self._count_taus_in_window(taus, tau_now - 60, tau_now)
+        recent180 = self._count_taus_in_window(taus, tau_now - 180, tau_now)
+        silence_min = self._get_silence_minutes(taus, tau_now)
+
+        sessions = self._sessionize_taus(taus, tau_now)
+        active_session = bool(sessions and silence_min <= self.config.overnight_session_gap_minutes)
+        last_completed = None
+        if active_session and len(sessions) >= 2:
+            last_completed = sessions[-2]
+        elif not active_session and sessions:
+            last_completed = sessions[-1]
+
+        last_session_tweets = int(last_completed[2]) if last_completed else 0
+        last_session_duration = int(max(1, last_completed[1] - last_completed[0])) if last_completed else 0
+
+        prior_activity_score = self._compute_prior_activity_score(
+            recent180=recent180,
+            last_session_tweets=last_session_tweets,
+            last_session_duration_min=last_session_duration,
+        )
+        prior_activity_bin = self._prior_activity_bin(prior_activity_score, edges)
+        has_recent_activity = recent180 > 0 or last_session_tweets > 0
+
+        wake_session_tweets = 0
+        has_wake_session = False
+        if sessions:
+            last_session = sessions[-1]
+            wake_gap_before = int(last_session[3])
+            if wake_gap_before >= 20 and silence_min <= 15:
+                wake_session_tweets = int(last_session[2])
+                has_wake_session = True
+
+        tau_bin_idx = self._tau_to_overnight_bin(tau_now)
+        if tau_bin_idx is None:
+            tau_bin_idx = -1
+
+        return OvernightFeatureSnapshot(
+            tau_now=tau_now,
+            tau_bin_idx=tau_bin_idx,
+            recent15=recent15,
+            recent60=recent60,
+            recent180=recent180,
+            silence_min=silence_min,
+            last_session_tweets=last_session_tweets,
+            last_session_duration_min=last_session_duration,
+            prior_activity_score=prior_activity_score,
+            prior_activity_bin=prior_activity_bin,
+            silence_bin=self._silence_bin(silence_min),
+            has_recent_activity=has_recent_activity,
+            wake_session_tweets=wake_session_tweets,
+            wake_session_bin=self._wake_session_bin(wake_session_tweets),
+            recent15_bin=self._recent15_bin(recent15),
+            has_wake_session=has_wake_session,
+        )
+
+    def _build_overnight_quiet_profiles(
+        self,
+        historical_events: Dict[date, List[TweetEvent]],
+        historical_counts: Dict[date, int],
+        as_of_date: date,
+    ) -> Tuple[Optional[OvernightQuietProfile], Optional[OvernightQuietProfile]]:
+        """Build separate weekday/weekend overnight quiet profiles from historical tweets."""
+        if not self.config.use_overnight_quiet:
+            return None, None
+
+        weekday_days: List[Tuple[np.ndarray, float]] = []
+        weekend_days: List[Tuple[np.ndarray, float]] = []
+
+        for contract_date, _final_count in historical_counts.items():
+            days_ago = (as_of_date - contract_date).days
+            if days_ago > self.config.training_window_days:
+                continue
+
+            events = historical_events.get(contract_date, [])
+            taus = np.asarray(
+                sorted(self.contract_utils.get_tau(event.timestamp, contract_date) for event in events),
+                dtype=np.int16,
+            )
+            weight = float(np.exp(-days_ago / self.config.weight_half_life_days * np.log(2)))
+            target = weekend_days if self.contract_utils.is_weekend(contract_date) else weekday_days
+            target.append((taus, weight))
+
+        return (
+            self._fit_overnight_quiet_profile(weekday_days),
+            self._fit_overnight_quiet_profile(weekend_days),
+        )
+
+    def _fit_overnight_quiet_profile(
+        self,
+        day_records: List[Tuple[np.ndarray, float]],
+    ) -> Optional[OvernightQuietProfile]:
+        """Fit one overnight quiet profile from historical day tau arrays."""
+        if not day_records:
+            return None
+
+        start_tau = self.config.overnight_quiet_start_tau
+        end_tau = self.config.overnight_quiet_end_tau
+        tau_values = np.arange(start_tau, end_tau, 5, dtype=np.int16)
+        n_tau = int(tau_values.size)
+        alpha = self.config.overnight_profile_laplace_alpha
+        min_samples = self.config.overnight_profile_min_weighted_samples
+
+        training_records: List[Dict[str, float | int | bool]] = []
+        prior_scores: List[float] = []
+        prior_score_weights: List[float] = []
+        idle_success = np.zeros(n_tau, dtype=float)
+        idle_total = np.zeros(n_tau, dtype=float)
+        wake_relief_counts = np.zeros(288, dtype=float)
+
+        provisional_edges = (1.0, 3.0)
+        for taus, weight in day_records:
+            five_min_counts = np.zeros(288, dtype=float)
+            for raw_tau in taus:
+                idx = int(raw_tau) // 5
+                if 0 <= idx < five_min_counts.size:
+                    five_min_counts[idx] += 1.0
+            wake_relief_counts += five_min_counts * weight
+
+            for tau_now in tau_values:
+                tau_int = int(tau_now)
+                snapshot = self._compute_overnight_snapshot_from_taus(taus, tau_int, provisional_edges)
+                idle_label = 1 if self._count_taus_in_window(
+                    taus, tau_int, tau_int + self.config.overnight_idle_horizon_minutes,
+                ) == 0 else 0
+                onset_label = 1 if self._count_taus_in_window(
+                    taus, tau_int, tau_int + self.config.overnight_sleep_onset_horizon_minutes,
+                ) == 0 else 0
+                wake_label = 1 if self._count_taus_in_window(
+                    taus, tau_int, tau_int + self.config.overnight_wake_horizon_minutes,
+                ) >= self.config.overnight_sustained_wake_min_tweets else 0
+
+                tau_idx = snapshot.tau_bin_idx
+                idle_success[tau_idx] += weight * idle_label
+                idle_total[tau_idx] += weight
+
+                record = {
+                    "tau_idx": tau_idx,
+                    "prior_activity_score": snapshot.prior_activity_score,
+                    "silence_bin": snapshot.silence_bin,
+                    "has_recent_activity": snapshot.has_recent_activity,
+                    "wake_session_bin": snapshot.wake_session_bin,
+                    "recent15_bin": snapshot.recent15_bin,
+                    "has_wake_session": snapshot.has_wake_session,
+                    "idle_label": idle_label,
+                    "onset_label": onset_label,
+                    "wake_label": wake_label,
+                    "weight": weight,
+                }
+                training_records.append(record)
+
+                if snapshot.has_recent_activity:
+                    prior_scores.append(snapshot.prior_activity_score)
+                    prior_score_weights.append(weight)
+
+        if prior_scores:
+            score_values = np.asarray(prior_scores, dtype=float)
+            score_weights = np.asarray(prior_score_weights, dtype=float)
+            low_edge = self._weighted_quantile(score_values, score_weights, 1.0 / 3.0)
+            high_edge = self._weighted_quantile(score_values, score_weights, 2.0 / 3.0)
+            if high_edge <= low_edge:
+                high_edge = low_edge + 1e-3
+            prior_edges = (float(low_edge), float(high_edge))
+        else:
+            prior_edges = provisional_edges
+
+        onset_success = np.zeros((n_tau, 3, 6), dtype=float)
+        onset_total = np.zeros((n_tau, 3, 6), dtype=float)
+        wake_success = np.zeros((n_tau, 3, 3), dtype=float)
+        wake_total = np.zeros((n_tau, 3, 3), dtype=float)
+
+        for record in training_records:
+            tau_idx = int(record["tau_idx"])
+            weight = float(record["weight"])
+            if bool(record["has_recent_activity"]):
+                prior_bin = self._prior_activity_bin(float(record["prior_activity_score"]), prior_edges)
+                silence_bin = int(record["silence_bin"])
+                onset_success[tau_idx, prior_bin, silence_bin] += weight * float(record["onset_label"])
+                onset_total[tau_idx, prior_bin, silence_bin] += weight
+
+            if bool(record["has_wake_session"]):
+                wake_bin = int(record["wake_session_bin"])
+                recent15_bin = int(record["recent15_bin"])
+                wake_success[tau_idx, wake_bin, recent15_bin] += weight * float(record["wake_label"])
+                wake_total[tau_idx, wake_bin, recent15_bin] += weight
+
+        global_idle = float((idle_success.sum() + alpha) / (idle_total.sum() + 2.0 * alpha))
+        night_idle_prior = np.full(n_tau, global_idle, dtype=float)
+        for idx in range(n_tau):
+            total = float(idle_total[idx])
+            if total <= 0:
+                continue
+            tau_prob = float((idle_success[idx] + alpha) / (total + 2.0 * alpha))
+            if total < min_samples:
+                shrink = max(0.0, min(1.0, total / min_samples))
+                tau_prob = shrink * tau_prob + (1.0 - shrink) * global_idle
+            night_idle_prior[idx] = tau_prob
+
+        ref_start = 900 // 5   # 03:00 ET
+        ref_end = 1200 // 5    # 08:00 ET
+        ref_max = float(np.max(wake_relief_counts[ref_start:ref_end])) if ref_end > ref_start else 0.0
+        if ref_max <= 0:
+            wake_relief_5m = np.ones(288, dtype=float)
+        else:
+            wake_relief_5m = np.clip(wake_relief_counts / ref_max, 0.15, 1.0)
+        wake_relief_5m[ref_end:] = 1.0
+        wake_relief_curve = np.repeat(wake_relief_5m, 5)[:1440]
+
+        return OvernightQuietProfile(
+            tau_values=tau_values,
+            night_idle_prior=night_idle_prior,
+            sleep_onset_success=onset_success,
+            sleep_onset_total=onset_total,
+            wake_success=wake_success,
+            wake_total=wake_total,
+            wake_relief_curve=wake_relief_curve,
+            prior_activity_edges=prior_edges,
+        )
+
+    def _get_overnight_profile(self, is_weekend: bool) -> Optional[OvernightQuietProfile]:
+        return self._weekend_overnight_profile if is_weekend else self._weekday_overnight_profile
+
+    def _estimate_binary_probability(
+        self,
+        success: float,
+        total: float,
+        fallback_prob: float,
+        source_name: str,
+        fallback_source: str,
+    ) -> Tuple[float, str]:
+        """Estimate Bernoulli probability with shrinkage toward a fallback prior."""
+        alpha = self.config.overnight_profile_laplace_alpha
+        min_samples = self.config.overnight_profile_min_weighted_samples
+        mix = self.config.overnight_fallback_mix
+        if total <= 0:
+            return float(fallback_prob), fallback_source
+
+        prob = float((success + alpha) / (total + 2.0 * alpha))
+        if total < min_samples:
+            shrink = max(0.0, min(1.0, total / min_samples))
+            prob = shrink * prob + (1.0 - shrink) * fallback_prob
+            return prob, f"{source_name}->backoff({fallback_source})"
+
+        prob = (1.0 - mix) * prob + mix * fallback_prob
+        return float(prob), source_name
+
+    def _lookup_sleep_onset_probability(
+        self,
+        profile: OvernightQuietProfile,
+        snapshot: OvernightFeatureSnapshot,
+    ) -> Tuple[float, str]:
+        if not snapshot.has_recent_activity:
+            return 0.0, "no_recent_activity"
+
+        tau_idx = snapshot.tau_bin_idx
+        idle_prior = float(profile.night_idle_prior[tau_idx])
+
+        prior_success = float(profile.sleep_onset_success[tau_idx, snapshot.prior_activity_bin, :].sum())
+        prior_total = float(profile.sleep_onset_total[tau_idx, snapshot.prior_activity_bin, :].sum())
+        prior_prob, prior_source = self._estimate_binary_probability(
+            success=prior_success,
+            total=prior_total,
+            fallback_prob=idle_prior,
+            source_name="tau+prior",
+            fallback_source="idle_tau",
+        )
+
+        silence_success = float(profile.sleep_onset_success[tau_idx, :, snapshot.silence_bin].sum())
+        silence_total = float(profile.sleep_onset_total[tau_idx, :, snapshot.silence_bin].sum())
+        silence_prob, silence_source = self._estimate_binary_probability(
+            success=silence_success,
+            total=silence_total,
+            fallback_prob=idle_prior,
+            source_name="tau+silence",
+            fallback_source="idle_tau",
+        )
+
+        combined_weight = prior_total + silence_total
+        if combined_weight > 0:
+            marginal_prob = ((prior_prob * prior_total) + (silence_prob * silence_total)) / combined_weight
+            marginal_source = f"marginal({prior_source}|{silence_source})"
+        else:
+            marginal_prob = idle_prior
+            marginal_source = "idle_tau"
+
+        full_success = float(profile.sleep_onset_success[
+            tau_idx, snapshot.prior_activity_bin, snapshot.silence_bin
+        ])
+        full_total = float(profile.sleep_onset_total[
+            tau_idx, snapshot.prior_activity_bin, snapshot.silence_bin
+        ])
+        return self._estimate_binary_probability(
+            success=full_success,
+            total=full_total,
+            fallback_prob=float(marginal_prob),
+            source_name="tau+prior+silence",
+            fallback_source=marginal_source,
+        )
+
+    def _lookup_wake_probability(
+        self,
+        profile: OvernightQuietProfile,
+        snapshot: OvernightFeatureSnapshot,
+    ) -> Tuple[float, str]:
+        if not snapshot.has_wake_session:
+            return 0.0, "no_wake_session"
+
+        tau_idx = snapshot.tau_bin_idx
+        base_prob = max(0.0, 1.0 - float(profile.night_idle_prior[tau_idx]))
+
+        wake_success = float(profile.wake_success[tau_idx, snapshot.wake_session_bin, :].sum())
+        wake_total = float(profile.wake_total[tau_idx, snapshot.wake_session_bin, :].sum())
+        wake_prob, wake_source = self._estimate_binary_probability(
+            success=wake_success,
+            total=wake_total,
+            fallback_prob=base_prob,
+            source_name="tau+wake",
+            fallback_source="1-idle_tau",
+        )
+
+        recent_success = float(profile.wake_success[tau_idx, :, snapshot.recent15_bin].sum())
+        recent_total = float(profile.wake_total[tau_idx, :, snapshot.recent15_bin].sum())
+        recent_prob, recent_source = self._estimate_binary_probability(
+            success=recent_success,
+            total=recent_total,
+            fallback_prob=base_prob,
+            source_name="tau+recent15",
+            fallback_source="1-idle_tau",
+        )
+
+        combined_weight = wake_total + recent_total
+        if combined_weight > 0:
+            marginal_prob = ((wake_prob * wake_total) + (recent_prob * recent_total)) / combined_weight
+            marginal_source = f"marginal({wake_source}|{recent_source})"
+        else:
+            marginal_prob = base_prob
+            marginal_source = "1-idle_tau"
+
+        full_success = float(profile.wake_success[
+            tau_idx, snapshot.wake_session_bin, snapshot.recent15_bin
+        ])
+        full_total = float(profile.wake_total[
+            tau_idx, snapshot.wake_session_bin, snapshot.recent15_bin
+        ])
+        return self._estimate_binary_probability(
+            success=full_success,
+            total=full_total,
+            fallback_prob=float(marginal_prob),
+            source_name="tau+wake+recent15",
+            fallback_source=marginal_source,
+        )
+
+    def _compute_overnight_quiet_state_from_taus(
+        self,
+        taus: np.ndarray,
+        tau_now: int,
+        is_weekend: bool,
+        regime: float = 1.0,
+    ) -> OvernightQuietState:
+        profile = self._get_overnight_profile(is_weekend)
+        tau_idx = self._tau_to_overnight_bin(tau_now)
+        if not self.config.use_overnight_quiet or profile is None or tau_idx is None:
+            return OvernightQuietState(
+                state="inactive",
+                tau_now=tau_now,
+                night_idle_prior=0.0,
+                sleep_onset_confidence=0.0,
+                wake_continuation_confidence=0.0,
+                quiet_strength=0.0,
+                regime_eff=float(regime),
+                silence_min=self._get_silence_minutes(taus, tau_now),
+                recent15=self._count_taus_in_window(taus, tau_now - 15, tau_now),
+                recent60=self._count_taus_in_window(taus, tau_now - 60, tau_now),
+                recent180=self._count_taus_in_window(taus, tau_now - 180, tau_now),
+                prior_activity_score=0.0,
+                prior_activity_bin=0,
+                silence_bin=self._silence_bin(self._get_silence_minutes(taus, tau_now)),
+                wake_session_bin=None,
+                idle_source="inactive",
+                onset_source="inactive",
+                wake_source="inactive",
+            )
+
+        snapshot = self._compute_overnight_snapshot_from_taus(taus, tau_now, profile.prior_activity_edges)
+        night_idle_prior = float(profile.night_idle_prior[tau_idx])
+        sleep_onset_confidence, onset_source = self._lookup_sleep_onset_probability(profile, snapshot)
+        wake_continuation_confidence, wake_source = self._lookup_wake_probability(profile, snapshot)
+        inferred_quiet_strength = max(night_idle_prior, sleep_onset_confidence) * (1.0 - wake_continuation_confidence)
+        inferred_quiet_strength = float(np.clip(inferred_quiet_strength, 0.0, 1.0))
+        quiet_strength = (
+            inferred_quiet_strength
+            if self.config.use_overnight_quiet_runtime_mask
+            else 0.0
+        )
+        regime_eff = (
+            float(1.0 + (regime - 1.0) * (1.0 - sleep_onset_confidence))
+            if self.config.use_overnight_quiet_regime_damping
+            else float(regime)
+        )
+
+        if wake_continuation_confidence >= 0.5:
+            state = "night_wake"
+        elif inferred_quiet_strength >= 0.55 or sleep_onset_confidence >= 0.55:
+            state = "overnight_quiet"
+        elif snapshot.recent15 >= 2 or snapshot.recent60 >= 4:
+            state = "awake_active"
+        else:
+            state = "awake_quiet"
+
+        return OvernightQuietState(
+            state=state,
+            tau_now=tau_now,
+            night_idle_prior=night_idle_prior,
+            sleep_onset_confidence=float(np.clip(sleep_onset_confidence, 0.0, 1.0)),
+            wake_continuation_confidence=float(np.clip(wake_continuation_confidence, 0.0, 1.0)),
+            quiet_strength=quiet_strength,
+            regime_eff=regime_eff,
+            silence_min=snapshot.silence_min,
+            recent15=snapshot.recent15,
+            recent60=snapshot.recent60,
+            recent180=snapshot.recent180,
+            prior_activity_score=snapshot.prior_activity_score,
+            prior_activity_bin=snapshot.prior_activity_bin,
+            silence_bin=snapshot.silence_bin,
+            wake_session_bin=snapshot.wake_session_bin if snapshot.has_wake_session else None,
+            idle_source="idle_tau",
+            onset_source=onset_source,
+            wake_source=wake_source,
+        )
+
+    def _compute_overnight_quiet_state(
+        self,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+        regime: float = 1.0,
+    ) -> OvernightQuietState:
+        event_taus = np.asarray(
+            sorted(
+                self.contract_utils.get_tau(event.timestamp, contract_date)
+                for event in events
+                if event.timestamp < now
+            ),
+            dtype=np.int16,
+        )
+        tau_now = self.contract_utils.get_tau(now, contract_date)
+        is_weekend = self.contract_utils.is_weekend(contract_date)
+        return self._compute_overnight_quiet_state_from_taus(
+            event_taus,
+            tau_now=int(tau_now),
+            is_weekend=is_weekend,
+            regime=regime,
+        )
+
+    def _quiet_mask_at_tau(
+        self,
+        tau_value: int,
+        profile: Optional[OvernightQuietProfile],
+        quiet_state: Optional[OvernightQuietState],
+    ) -> float:
+        if quiet_state is None or quiet_state.quiet_strength <= 0.0 or profile is None:
+            return 1.0
+        tau_idx = max(0, min(int(tau_value), profile.wake_relief_curve.size - 1))
+        wake_relief = float(profile.wake_relief_curve[tau_idx])
+        return float(1.0 - quiet_state.quiet_strength * (1.0 - wake_relief))
+
+    def _avg_quiet_mult_for_slice(
+        self,
+        tau_now: int,
+        rel_start: float,
+        rel_end: float,
+        profile: Optional[OvernightQuietProfile],
+        quiet_state: Optional[OvernightQuietState],
+    ) -> float:
+        if quiet_state is None or quiet_state.quiet_strength <= 0.0 or profile is None:
+            return 1.0
+        span = rel_end - rel_start
+        if span <= 0:
+            return 1.0
+        start_min = int(math.floor(rel_start))
+        end_min = int(math.ceil(rel_end))
+        if end_min <= start_min:
+            return self._quiet_mask_at_tau(int(tau_now + rel_start), profile, quiet_state)
+
+        vals = [
+            self._quiet_mask_at_tau(tau_now + minute, profile, quiet_state)
+            for minute in range(start_min, end_min)
+        ]
+        return float(np.mean(vals)) if vals else 1.0
 
     def _count_events_per_bucket(
         self,
@@ -1254,6 +1939,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         expected_so_far: float,
         n_simulations: int,
         rng: np.random.Generator,
+        current_quiet_state: Optional[OvernightQuietState] = None,
     ) -> Optional[np.ndarray]:
         """Sample remaining final counts from weighted historical suffix analogs."""
         hours_left = max(0.0, end_tau - tau_now) / 60.0
@@ -1305,6 +1991,28 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 current_silence - hist_silence,
                 self.config.bootstrap_silence_sigma_minutes,
             )
+            if (
+                current_quiet_state is not None
+                and self.config.use_overnight_quiet_bootstrap_matching
+            ):
+                hist_quiet_state = self._compute_overnight_quiet_state_from_taus(
+                    taus=profile.taus,
+                    tau_now=tau_now,
+                    is_weekend=is_weekend,
+                    regime=1.0,
+                )
+                weight *= self._gaussian_weight(
+                    current_quiet_state.sleep_onset_confidence - hist_quiet_state.sleep_onset_confidence,
+                    self.config.bootstrap_quiet_sigma,
+                )
+                if (
+                    current_quiet_state.wake_continuation_confidence > 0.0
+                    or hist_quiet_state.wake_continuation_confidence > 0.0
+                ):
+                    weight *= self._gaussian_weight(
+                        current_quiet_state.wake_continuation_confidence - hist_quiet_state.wake_continuation_confidence,
+                        self.config.bootstrap_quiet_sigma,
+                    )
 
             if weight <= 0.0:
                 continue
@@ -1485,6 +2193,8 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         # --- Bucket component (from tau_now to end_tau, scaled by rate_mult) ---
         tau_now = int(tau)
+        quiet_profile = self._get_overnight_profile(is_weekend)
+        quiet_state: Optional[OvernightQuietState] = None
         if tau_now < end_tau:
             # Compute regime from observed vs expected at tau_now
             full_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
@@ -1499,6 +2209,13 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 raw_regime = None
                 regime = 1.0
 
+            quiet_state = self._compute_overnight_quiet_state_from_taus(
+                taus=event_taus,
+                tau_now=tau_now,
+                is_weekend=is_weekend,
+                regime=float(regime),
+            )
+
             self._last_regime = {
                 "tau_now": tau_now,
                 "bucket_idx": int(full_bucket_idx),
@@ -1507,6 +2224,25 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 "raw_regime": round(raw_regime, 3) if raw_regime is not None else None,
                 "regime": round(float(regime), 3),
                 "min_expected": self.config.min_expected_for_regime,
+            }
+            self._last_quiet = {
+                "state": quiet_state.state,
+                "night_idle_prior": round(quiet_state.night_idle_prior, 3),
+                "sleep_onset_confidence": round(quiet_state.sleep_onset_confidence, 3),
+                "wake_continuation_confidence": round(quiet_state.wake_continuation_confidence, 3),
+                "quiet_strength": round(quiet_state.quiet_strength, 3),
+                "regime_eff": round(quiet_state.regime_eff, 3),
+                "silence_min": quiet_state.silence_min,
+                "recent15": quiet_state.recent15,
+                "recent60": quiet_state.recent60,
+                "recent180": quiet_state.recent180,
+                "prior_activity_score": round(quiet_state.prior_activity_score, 2),
+                "prior_activity_bin": quiet_state.prior_activity_bin,
+                "silence_bin": quiet_state.silence_bin,
+                "wake_session_bin": quiet_state.wake_session_bin,
+                "idle_source": quiet_state.idle_source,
+                "onset_source": quiet_state.onset_source,
+                "wake_source": quiet_state.wake_source,
             }
 
             # Determine which bucket tau_now falls in
@@ -1533,8 +2269,15 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                         avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
                 else:
                     avg_mult = 1.0
+                quiet_avg_mult = self._avg_quiet_mult_for_slice(
+                    tau_now=tau_now,
+                    rel_start=rel_start,
+                    rel_end=rel_end,
+                    profile=quiet_profile,
+                    quiet_state=quiet_state,
+                )
 
-                remaining_mean = b.mean * fraction * regime * avg_mult
+                remaining_mean = b.mean * fraction * quiet_state.regime_eff * avg_mult * quiet_avg_mult
                 k = b.dispersion_k
                 if std_inflation_factor > 1.0:
                     k = k / std_inflation_factor
@@ -1565,8 +2308,15 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                         avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
                 else:
                     avg_mult = 1.0
+                quiet_avg_mult = self._avg_quiet_mult_for_slice(
+                    tau_now=tau_now,
+                    rel_start=rel_start,
+                    rel_end=rel_end,
+                    profile=quiet_profile,
+                    quiet_state=quiet_state,
+                )
 
-                bucket_mean = b.mean * fraction * regime * avg_mult
+                bucket_mean = b.mean * fraction * quiet_state.regime_eff * avg_mult * quiet_avg_mult
                 k = b.dispersion_k
                 if std_inflation_factor > 1.0:
                     k = k / std_inflation_factor
@@ -1584,6 +2334,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 expected_so_far=expected_so_far,
                 n_simulations=n_simulations,
                 rng=rng,
+                current_quiet_state=quiet_state,
             )
             if bootstrap_samples is not None and self._last_bootstrap:
                 alpha = self._last_bootstrap["alpha"]
@@ -1592,6 +2343,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         else:
             self._last_regime = None
             self._last_bootstrap = None
+            self._last_quiet = None
 
         return samples
 
