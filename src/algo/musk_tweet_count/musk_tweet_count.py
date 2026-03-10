@@ -16,6 +16,7 @@ import time
 import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
@@ -419,11 +420,11 @@ class GammaAPIClient:
                 logger.info(f"Skipping event with unknown month: {title}")
                 return None, None
 
-            # Create datetime objects (counting is 12:00 PM EST to 11:59:59 AM EST)
-            # EST is UTC-5, so 12:00 PM EST = 17:00 UTC
-            start_date = datetime(year, start_month, start_day, 17, 0, 0, tzinfo=timezone.utc)
-            # End date 11:59:59 AM EST = 16:59:59 UTC
-            end_date = datetime(year, end_month, end_day, 16, 59, 59, tzinfo=timezone.utc)
+            # Create datetime objects (counting is 12:00 PM ET to 11:59:59 AM ET)
+            # Use America/New_York so DST (EDT=UTC-4 vs EST=UTC-5) is handled automatically.
+            et = ZoneInfo("America/New_York")
+            start_date = datetime(year, start_month, start_day, 12, 0, 0, tzinfo=et).astimezone(timezone.utc)
+            end_date = datetime(year, end_month, end_day, 11, 59, 59, tzinfo=et).astimezone(timezone.utc)
 
             # Check if duration is exactly 7 days
             if require_7_days:
