@@ -13,7 +13,7 @@ import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -768,31 +768,247 @@ class HistoricalSuffixProfile:
     final_count: int
 
 
+@dataclass
+class DecaySegment:
+    """One segment of a piecewise decay schedule with uniform parameters."""
+
+    start_tau: int
+    end_tau: int
+    halflife: float
+    decay: float
+    floor: float
+    ceiling: float
+
+
+def _validate_impulse_overrides(
+    overrides: List[ImpulseOverrideWindow],
+) -> List[ImpulseOverrideWindow]:
+    """Normalize, sort, and validate impulse override windows."""
+    validated: List[ImpulseOverrideWindow] = []
+
+    for override in sorted(overrides, key=lambda ov: (ov.start, ov.end, ov.name)):
+        start = int(override.start)
+        end = int(override.end)
+        floor = None if override.floor is None else float(override.floor)
+        ceiling = None if override.ceiling is None else float(override.ceiling)
+        halflife = (
+            None
+            if override.impulse_decay_halflife is None
+            else float(override.impulse_decay_halflife)
+        )
+
+        if start < 0 or end > 1440:
+            raise ValueError(
+                f"Impulse override '{override.name}' must stay within [0, 1440], got {start}-{end}"
+            )
+        if start >= end:
+            raise ValueError(
+                f"Impulse override '{override.name}' must satisfy start < end, got {start}-{end}"
+            )
+        if floor is not None and floor < 0:
+            raise ValueError(
+                f"Impulse override '{override.name}' floor must be >= 0, got {floor}"
+            )
+        if ceiling is not None and ceiling <= 0:
+            raise ValueError(
+                f"Impulse override '{override.name}' ceiling must be > 0, got {ceiling}"
+            )
+        if floor is not None and ceiling is not None and floor > ceiling:
+            raise ValueError(
+                f"Impulse override '{override.name}' floor {floor} exceeds ceiling {ceiling}"
+            )
+        if halflife is not None and halflife <= 0:
+            raise ValueError(
+                f"Impulse override '{override.name}' impulse_decay_halflife must be > 0, got {halflife}"
+            )
+        if validated and start < validated[-1].end:
+            raise ValueError(
+                f"Impulse override '{override.name}' overlaps with '{validated[-1].name}'"
+            )
+
+        validated.append(
+            ImpulseOverrideWindow(
+                name=override.name,
+                start=start,
+                end=end,
+                floor=floor,
+                ceiling=ceiling,
+                impulse_decay_halflife=halflife,
+            )
+        )
+
+    return validated
+
+
+def _resolve_decay_params(
+    tau: int,
+    overrides: List[ImpulseOverrideWindow],
+    default_halflife: float,
+    default_floor: float,
+    default_ceiling: float,
+) -> Tuple[Optional[str], float, float, float]:
+    """Resolve decay and clamp params active at a specific tau."""
+    active_override = None
+    for override in overrides:
+        if override.start <= tau < override.end:
+            active_override = override
+            break
+
+    halflife = (
+        active_override.impulse_decay_halflife
+        if active_override is not None and active_override.impulse_decay_halflife is not None
+        else default_halflife
+    )
+    floor = (
+        active_override.floor
+        if active_override is not None and active_override.floor is not None
+        else default_floor
+    )
+    ceiling = (
+        active_override.ceiling
+        if active_override is not None and active_override.ceiling is not None
+        else default_ceiling
+    )
+    return (active_override.name if active_override is not None else None, halflife, floor, ceiling)
+
+
+def _build_decay_schedule(
+    tau_start: int,
+    tau_end: int,
+    overrides: List[ImpulseOverrideWindow],
+    default_halflife: float,
+    default_floor: float,
+    default_ceiling: float,
+) -> List[DecaySegment]:
+    """Build a disjoint piecewise decay schedule covering [tau_start, tau_end)."""
+    tau_start = max(0, int(tau_start))
+    tau_end = min(1440, int(tau_end))
+    if tau_end <= tau_start:
+        return []
+
+    boundaries = {tau_start, tau_end}
+    for override in overrides:
+        if tau_start < override.start < tau_end:
+            boundaries.add(override.start)
+        if tau_start < override.end < tau_end:
+            boundaries.add(override.end)
+
+    ordered = sorted(boundaries)
+    schedule: List[DecaySegment] = []
+    for start_tau, end_tau in zip(ordered, ordered[1:]):
+        _, halflife, floor, ceiling = _resolve_decay_params(
+            start_tau,
+            overrides,
+            default_halflife,
+            default_floor,
+            default_ceiling,
+        )
+        schedule.append(
+            DecaySegment(
+                start_tau=start_tau,
+                end_tau=end_tau,
+                halflife=halflife,
+                decay=math.log(2) / halflife,
+                floor=floor,
+                ceiling=ceiling,
+            )
+        )
+
+    return schedule
+
+
+def _piecewise_decay_factor_tau(
+    tau_start: int,
+    tau_end: int,
+    schedule: List[DecaySegment],
+) -> float:
+    """Compute piecewise exponential decay over integer tau overlaps."""
+    if tau_end <= tau_start:
+        return 1.0
+
+    total_decay = 0.0
+    for segment in schedule:
+        overlap_start = max(int(tau_start), segment.start_tau)
+        overlap_end = min(int(tau_end), segment.end_tau)
+        if overlap_end > overlap_start:
+            total_decay += segment.decay * (overlap_end - overlap_start)
+
+    return math.exp(-total_decay)
+
+
+def _piecewise_decay_factor_exact(
+    start_dt: datetime,
+    end_dt: datetime,
+    contract_date: date,
+    schedule: List[DecaySegment],
+    contract_utils: ContractDayUtils,
+) -> float:
+    """Compute piecewise exponential decay over exact timestamp overlaps."""
+    if end_dt <= start_dt:
+        return 1.0
+
+    day_start_utc, day_end_utc = contract_utils.get_contract_day_bounds_utc(contract_date)
+    start_utc = max(start_dt.astimezone(timezone.utc), day_start_utc)
+    end_utc = min(end_dt.astimezone(timezone.utc), day_end_utc)
+    if end_utc <= start_utc:
+        return 1.0
+
+    total_decay = 0.0
+    for segment in schedule:
+        segment_start = day_start_utc + timedelta(minutes=segment.start_tau)
+        segment_end = day_start_utc + timedelta(minutes=segment.end_tau)
+        overlap_start = max(start_utc, segment_start)
+        overlap_end = min(end_utc, segment_end)
+        if overlap_end > overlap_start:
+            overlap_minutes = (overlap_end - overlap_start).total_seconds() / 60.0
+            total_decay += segment.decay * overlap_minutes
+
+    return math.exp(-total_decay)
+
+
 def _load_impulse_overrides(path: str) -> List[ImpulseOverrideWindow]:
     """Load impulse rate_mult overrides from YAML. Returns empty list if file not found."""
     import os
     if not os.path.exists(path):
         logger.warning(f"Impulse overrides file not found: {path}")
         return []
+    import yaml
+
     try:
-        import yaml
         with open(path, "r") as f:
-            data = yaml.safe_load(f)
-        overrides = []
-        for name, window in (data.get("overrides") or {}).items():
-            overrides.append(ImpulseOverrideWindow(
-                name=name,
-                start=int(window["start"]),
-                end=int(window["end"]),
-                floor=window.get("floor"),
-                ceiling=window.get("ceiling"),
-                impulse_decay_halflife=window.get("impulse_decay_halflife"),
-            ))
-        logger.info(f"Loaded {len(overrides)} impulse override windows from {path}")
-        return overrides
-    except Exception as e:
-        logger.error(f"Failed to load impulse overrides from {path}: {e}")
-        return []
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        raise ValueError(f"Failed to parse impulse overrides from {path}: {exc}") from exc
+
+    raw_overrides = data.get("overrides") or {}
+    if not isinstance(raw_overrides, dict):
+        raise ValueError(f"Impulse overrides in {path} must be a mapping")
+
+    overrides = []
+    try:
+        for name, window in raw_overrides.items():
+            if not isinstance(window, dict):
+                raise ValueError(f"Impulse override '{name}' must be a mapping")
+            overrides.append(
+                ImpulseOverrideWindow(
+                    name=str(name),
+                    start=int(window["start"]),
+                    end=int(window["end"]),
+                    floor=window.get("floor"),
+                    ceiling=window.get("ceiling"),
+                    impulse_decay_halflife=window.get("impulse_decay_halflife"),
+                )
+            )
+    except KeyError as exc:
+        raise ValueError(
+            f"Impulse override in {path} is missing required key: {exc.args[0]}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric values in impulse overrides {path}: {exc}") from exc
+
+    validated = _validate_impulse_overrides(overrides)
+    logger.info(f"Loaded {len(validated)} impulse override windows from {path}")
+    return validated
 
 
 class BucketIntradayForecaster(BaseIntradayForecaster):
@@ -1197,6 +1413,107 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         )
         return 1.0 + integral / span
 
+    def _avg_rate_mult_for_slice_piecewise(
+        self,
+        rate_mult_now: float,
+        tau_now: int,
+        abs_start: int,
+        abs_end: int,
+        forward_schedule: List[DecaySegment],
+        silence_halflife: float,
+    ) -> float:
+        """Average forward rate_mult over a slice using piecewise decay/clamps."""
+        span = abs_end - abs_start
+        if span <= 0:
+            return 1.0
+
+        delta = rate_mult_now - 1.0
+        if abs(delta) < 1e-6:
+            return 1.0
+
+        if delta < 0:
+            if silence_halflife <= 0:
+                raise ValueError("impulse_silence_halflife_minutes must be > 0")
+            silence_decay = math.log(2) / silence_halflife
+        else:
+            silence_decay = 0.0
+
+        def unclamped_rate(delta_start: float, seg_decay: float, offset: float) -> float:
+            if abs(delta_start) < 1e-12:
+                return 1.0
+            if seg_decay <= 0:
+                return 1.0 + delta_start
+            return 1.0 + delta_start * math.exp(-seg_decay * offset)
+
+        def integral_unclamped(
+            delta_start: float,
+            seg_decay: float,
+            start_offset: float,
+            end_offset: float,
+        ) -> float:
+            if end_offset <= start_offset:
+                return 0.0
+            if abs(delta_start) < 1e-12:
+                return end_offset - start_offset
+            if seg_decay <= 0:
+                return (1.0 + delta_start) * (end_offset - start_offset)
+            return (
+                end_offset - start_offset
+                + (delta_start / seg_decay)
+                * (math.exp(-seg_decay * start_offset) - math.exp(-seg_decay * end_offset))
+            )
+
+        def crossing_offset(delta_start: float, seg_decay: float, threshold: float) -> Optional[float]:
+            if abs(delta_start) < 1e-12 or seg_decay <= 0:
+                return None
+            ratio = (threshold - 1.0) / delta_start
+            if ratio <= 0.0:
+                return None
+            return -math.log(ratio) / seg_decay
+
+        total_integral = 0.0
+        delta_at_segment_start = delta
+
+        for segment in forward_schedule:
+            seg_start = max(segment.start_tau, tau_now)
+            seg_end = segment.end_tau
+            if seg_end <= seg_start:
+                continue
+
+            seg_decay = segment.decay if delta >= 0 else silence_decay
+
+            lo = max(float(abs_start), float(seg_start))
+            hi = min(float(abs_end), float(seg_end))
+            if hi > lo:
+                local_lo = lo - seg_start
+                local_hi = hi - seg_start
+                boundaries = [local_lo, local_hi]
+                for threshold in (segment.floor, segment.ceiling):
+                    cross = crossing_offset(delta_at_segment_start, seg_decay, threshold)
+                    if cross is not None and local_lo < cross < local_hi:
+                        boundaries.append(cross)
+
+                boundaries = sorted(set(boundaries))
+                for start_offset, end_offset in zip(boundaries, boundaries[1:]):
+                    midpoint = 0.5 * (start_offset + end_offset)
+                    raw_mid = unclamped_rate(delta_at_segment_start, seg_decay, midpoint)
+                    clamped_mid = max(segment.floor, min(segment.ceiling, raw_mid))
+                    if math.isclose(raw_mid, clamped_mid, rel_tol=1e-9, abs_tol=1e-9):
+                        total_integral += integral_unclamped(
+                            delta_at_segment_start,
+                            seg_decay,
+                            start_offset,
+                            end_offset,
+                        )
+                    else:
+                        total_integral += clamped_mid * (end_offset - start_offset)
+
+            seg_span = seg_end - seg_start
+            if abs(delta_at_segment_start) >= 1e-12 and seg_decay > 0:
+                delta_at_segment_start *= math.exp(-seg_decay * seg_span)
+
+        return total_integral / span
+
     def _count_taus_in_window(self, taus: np.ndarray, start_tau: int, end_tau: int) -> int:
         """Count tweets with start_tau < tau <= end_tau."""
         if taus.size == 0 or end_tau <= start_tau:
@@ -1399,42 +1716,70 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             and tau > 10
         )
 
+        tau_now = int(tau)
         rate_mult = 1.0
-        forward_decay = 0.0
+        actual_schedule: List[DecaySegment] = []
+        expected_schedule: List[DecaySegment] = []
+        forward_schedule: List[DecaySegment] = []
 
         if use_impulse:
-            tau_now = int(tau)
-            halflife = self.config.impulse_decay_halflife_minutes
-
-            # Check if a time-of-day override changes the decay halflife
-            active_override_name = None
-            active_override = None
-            for ov in self._impulse_overrides:
-                if ov.start <= tau_now < ov.end:
-                    active_override = ov
-                    active_override_name = ov.name
-                    if ov.impulse_decay_halflife is not None:
-                        halflife = ov.impulse_decay_halflife
-                    break
-
-            decay = math.log(2) / halflife
+            active_override_name, _, active_floor, active_ceiling = _resolve_decay_params(
+                tau_now,
+                self._impulse_overrides,
+                self.config.impulse_decay_halflife_minutes,
+                self.config.impulse_floor,
+                self.config.impulse_ceiling,
+            )
+            actual_schedule_end = min(1440, int(math.ceil(tau)))
+            actual_schedule = _build_decay_schedule(
+                0,
+                actual_schedule_end,
+                self._impulse_overrides,
+                self.config.impulse_decay_halflife_minutes,
+                self.config.impulse_floor,
+                self.config.impulse_ceiling,
+            )
+            lookback = self.config.impulse_lookback_minutes
+            expected_schedule = _build_decay_schedule(
+                max(0, tau_now - lookback),
+                tau_now,
+                self._impulse_overrides,
+                self.config.impulse_decay_halflife_minutes,
+                self.config.impulse_floor,
+                self.config.impulse_ceiling,
+            )
+            forward_schedule = _build_decay_schedule(
+                tau_now,
+                end_tau,
+                self._impulse_overrides,
+                self.config.impulse_decay_halflife_minutes,
+                self.config.impulse_floor,
+                self.config.impulse_ceiling,
+            )
 
             # Actual excitation: each tweet adds a decaying boost
             excitation = 0.0
-            for e in events:
-                if e.timestamp < now:
-                    age_min = self.contract_utils.minutes_between(e.timestamp, now)
-                    if age_min > 0:
-                        excitation += math.exp(-decay * age_min)
+            for event in events:
+                if event.timestamp < now:
+                    excitation += _piecewise_decay_factor_exact(
+                        event.timestamp,
+                        now,
+                        contract_date,
+                        actual_schedule,
+                        self.contract_utils,
+                    )
 
             # Expected excitation from rate curve lookback
-            lookback = self.config.impulse_lookback_minutes
             expected_excitation = 0.0
             for t in range(1, lookback + 1):
                 past_time = now - timedelta(minutes=t)
                 past_tau = self.contract_utils.get_tau(past_time, contract_date)
                 if 0 <= past_tau < 1440:
-                    expected_excitation += self._rate_curve[past_tau] * math.exp(-decay * t)
+                    expected_excitation += self._rate_curve[past_tau] * _piecewise_decay_factor_tau(
+                        past_tau,
+                        tau_now,
+                        expected_schedule,
+                    )
 
             # Shifted-linear mapping
             min_expected = self.config.impulse_min_expected_excitation
@@ -1450,19 +1795,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
             shifted = excitation - neutral
             rate_mult = 1.0 + self.config.impulse_gain * shifted
-            rate_mult = max(self.config.impulse_floor, min(self.config.impulse_ceiling, rate_mult))
-
-            # Apply time-of-day floor/ceiling overrides
-            if active_override is not None:
-                ov_floor = active_override.floor if active_override.floor is not None else self.config.impulse_floor
-                ov_ceiling = active_override.ceiling if active_override.ceiling is not None else self.config.impulse_ceiling
-                rate_mult = max(ov_floor, min(ov_ceiling, rate_mult))
-
-            # Asymmetric forward decay
-            if rate_mult >= 1.0:
-                forward_decay = decay  # boost: halflife matches current decay
-            else:
-                forward_decay = math.log(2) / self.config.impulse_silence_halflife_minutes  # 90 min
+            rate_mult = max(active_floor, min(active_ceiling, rate_mult))
 
             # Logging
             last_tweet_ts = self._get_last_tweet_timestamp(events, now)
@@ -1479,12 +1812,14 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 "shifted": round(shifted, 2),
                 "rate_mult_now": round(rate_mult, 2),
                 "override": active_override_name,
+                "n_actual_decay_segments": len(actual_schedule),
+                "n_expected_decay_segments": len(expected_schedule),
+                "n_forward_decay_segments": len(forward_schedule),
             }
         else:
             self._last_impulse = None
 
         # --- Bucket component (from tau_now to end_tau, scaled by rate_mult) ---
-        tau_now = int(tau)
         if tau_now < end_tau:
             # Compute regime from observed vs expected at tau_now
             full_bucket_idx = min(tau // self.bucket_size, self.n_buckets - 1)
@@ -1512,25 +1847,32 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
             # Determine which bucket tau_now falls in
             bucket_start_idx = min(tau_now // self.bucket_size, self.n_buckets - 1)
             cutoff_minutes = self.config.impulse_cutoff_minutes
+            cutoff_tau = tau_now + int(cutoff_minutes)
 
             # Sample remaining portion of the bucket containing tau_now
             b = buckets[bucket_start_idx]
             bucket_end = min(b.end_tau, end_tau)
             fraction = (bucket_end - tau_now) / self.bucket_size
             if fraction > 0:
-                # Compute avg rate_mult for this slice
-                rel_start = 0.0
-                rel_end = float(bucket_end - tau_now)
-                if use_impulse and rel_start < cutoff_minutes:
-                    avg_mult = self._avg_rate_mult_for_slice(
-                        rate_mult, forward_decay,
-                        rel_start, min(rel_end, cutoff_minutes),
+                abs_start = tau_now
+                abs_end = bucket_end
+                if use_impulse and abs_start < cutoff_tau:
+                    effective_end = min(abs_end, cutoff_tau)
+                    avg_mult = self._avg_rate_mult_for_slice_piecewise(
+                        rate_mult_now=rate_mult,
+                        tau_now=tau_now,
+                        abs_start=abs_start,
+                        abs_end=effective_end,
+                        forward_schedule=forward_schedule,
+                        silence_halflife=self.config.impulse_silence_halflife_minutes,
                     )
-                    if rel_end > cutoff_minutes:
-                        # Blend: part under impulse, part at 1.0
-                        impulse_span = cutoff_minutes - rel_start
-                        rest_span = rel_end - cutoff_minutes
-                        avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
+                    if abs_end > cutoff_tau:
+                        impulse_span = effective_end - abs_start
+                        rest_span = abs_end - cutoff_tau
+                        avg_mult = (
+                            (avg_mult * impulse_span + 1.0 * rest_span)
+                            / (abs_end - abs_start)
+                        )
                 else:
                     avg_mult = 1.0
 
@@ -1551,18 +1893,25 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
                 bucket_end = min(b.end_tau, end_tau)
                 fraction = (bucket_end - b.start_tau) / self.bucket_size
 
-                # Compute avg rate_mult for this bucket slice
-                rel_start = float(b.start_tau - tau_now)
-                rel_end = float(bucket_end - tau_now)
-                if use_impulse and rel_start < cutoff_minutes:
-                    avg_mult = self._avg_rate_mult_for_slice(
-                        rate_mult, forward_decay,
-                        rel_start, min(rel_end, cutoff_minutes),
+                abs_start = b.start_tau
+                abs_end = bucket_end
+                if use_impulse and abs_start < cutoff_tau:
+                    effective_end = min(abs_end, cutoff_tau)
+                    avg_mult = self._avg_rate_mult_for_slice_piecewise(
+                        rate_mult_now=rate_mult,
+                        tau_now=tau_now,
+                        abs_start=abs_start,
+                        abs_end=effective_end,
+                        forward_schedule=forward_schedule,
+                        silence_halflife=self.config.impulse_silence_halflife_minutes,
                     )
-                    if rel_end > cutoff_minutes:
-                        impulse_span = cutoff_minutes - rel_start
-                        rest_span = rel_end - cutoff_minutes
-                        avg_mult = (avg_mult * impulse_span + 1.0 * rest_span) / (rel_end - rel_start)
+                    if abs_end > cutoff_tau:
+                        impulse_span = effective_end - abs_start
+                        rest_span = abs_end - cutoff_tau
+                        avg_mult = (
+                            (avg_mult * impulse_span + 1.0 * rest_span)
+                            / (abs_end - abs_start)
+                        )
                 else:
                     avg_mult = 1.0
 
