@@ -281,7 +281,9 @@ class OrderbookWebSocket:
             await self.force_resubscribe()
             return
 
-        all_tokens = list(self._subscribed_tokens)
+        # Sort for deterministic subscribe payloads; server semantics are set-like
+        # but stable ordering avoids flaky tests and easier log/debug diffing.
+        all_tokens = sorted(self._subscribed_tokens)
         msg = {
             "type": "MARKET",
             "assets_ids": all_tokens,
