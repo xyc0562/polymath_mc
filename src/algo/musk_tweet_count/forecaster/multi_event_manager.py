@@ -39,6 +39,7 @@ from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
 from ..kelly.websocket_client import OrderbookWebSocket, WebSocketConfig
 from ..kelly.executor import BalanceAllowanceErrorContext
+from ..kelly.integration import PositionSyncWarningContext
 
 try:
     from src.twitter_scraper import get_cookies_path as get_default_twitter_cookies_path
@@ -127,6 +128,7 @@ class SlackMessageKind(str, Enum):
     REALTIME_GAP_ALERT = "realtime_gap_alert"
     TWITTER_COOKIE_ERROR = "twitter_cookie_error"
     BALANCE_ALLOWANCE_ALERT = "balance_allowance_alert"
+    POSITION_SYNC_ALERT = "position_sync_alert"
     INTEGRITY_FREEZE_ALERT = "integrity_freeze_alert"
     INTEGRITY_RECOVERY_ALERT = "integrity_recovery_alert"
     FILL_ROUTING_ALERT = "fill_routing_alert"
@@ -1073,6 +1075,40 @@ class MultiEventManager:
                 ),
                 mention=True,
             )
+        if kind is SlackMessageKind.POSITION_SYNC_ALERT:
+            event_info = payload["event_info"]
+            context = payload["context"]
+            bin_info = None
+            if 0 <= context.bin_index < len(event_info.bins):
+                bin_info = event_info.bins[context.bin_index]
+            if bin_info:
+                bin_label = (
+                    f"{context.bin_index} ({bin_info['lower_bound']}-{bin_info['upper_bound']})"
+                )
+            else:
+                bin_label = str(context.bin_index)
+            balance_label = (
+                f"{context.verified_balance_shares:.2f}"
+                if context.verified_balance_shares is not None else "unknown"
+            )
+            missing_since = self._fmt_slack_timestamp(
+                datetime.fromtimestamp(context.missing_since, timezone.utc)
+                if context.missing_since > 0 else None
+            )
+            return SlackRenderedMessage(
+                "warning",
+                f"Position sync ambiguity: {event_info.short_name}",
+                [
+                    f"what=positions_api_omitted_side event={event_info.event_id} bin={bin_label} side={context.side}",
+                    "impact=local side retained; contradictory opposite-side buys stay blocked while risk-reducing sells remain allowed",
+                    "action=inspect positions API vs conditional token balance and recent partial fills",
+                    f"local_shares={context.local_shares:.2f} verified_balance={balance_label} token={context.token_id[:16] + '...' if context.token_id else 'unknown'}",
+                    f"missing_count={context.missing_count} missing_since={missing_since} reason={context.reason}",
+                ],
+                dedupe_key=f"position_sync:{event_info.event_id}:{context.bin_index}:{context.side}",
+                cooldown_seconds=900.0,
+                mention=True,
+            )
         if kind is SlackMessageKind.INTEGRITY_FREEZE_ALERT:
             active = payload["active"]
             integrity = payload["integrity"]
@@ -1357,6 +1393,17 @@ class MultiEventManager:
     ) -> None:
         self._send_slack_message(
             SlackMessageKind.BALANCE_ALLOWANCE_ALERT,
+            event_info=event_info,
+            context=context,
+        )
+
+    def _notify_position_sync_warning(
+        self,
+        event_info: EventInfo,
+        context: PositionSyncWarningContext,
+    ) -> None:
+        self._send_slack_message(
+            SlackMessageKind.POSITION_SYNC_ALERT,
             event_info=event_info,
             context=context,
         )
@@ -2643,6 +2690,12 @@ class MultiEventManager:
         ):
             bot.kelly_bot.kelly_executor.on_balance_allowance_error = (
                 lambda context, event_info=event_info: self._notify_balance_allowance_error(
+                    event_info,
+                    context,
+                )
+            )
+            bot.kelly_bot.on_position_sync_warning = (
+                lambda context, event_info=event_info: self._notify_position_sync_warning(
                     event_info,
                     context,
                 )

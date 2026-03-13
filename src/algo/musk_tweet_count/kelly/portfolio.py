@@ -47,6 +47,14 @@ class BinPosition:
     yes_unpriced_reserve: float = 0.0
     no_unpriced_reserve: float = 0.0
 
+    # Position side is missing from positions API but not yet verified closed.
+    yes_api_missing_unverified: bool = False
+    no_api_missing_unverified: bool = False
+    yes_api_missing_since: float = 0.0
+    no_api_missing_since: float = 0.0
+    yes_api_missing_count: int = 0
+    no_api_missing_count: int = 0
+
     # Collateral tied up in positions
     collateral_used: float = 0.0
 
@@ -92,6 +100,16 @@ class BinPosition:
     def has_no_unpriced_increment(self) -> bool:
         """Whether this bin has unresolved NO shares."""
         return self.no_unpriced_shares > 0.01
+
+    @property
+    def has_yes_api_missing_unverified(self) -> bool:
+        """Whether YES is temporarily retained despite missing from positions API."""
+        return self.yes_api_missing_unverified
+
+    @property
+    def has_no_api_missing_unverified(self) -> bool:
+        """Whether NO is temporarily retained despite missing from positions API."""
+        return self.no_api_missing_unverified
 
     def recompute_collateral_used(self) -> None:
         """Recompute collateral from priced cost basis plus unresolved reserve."""
@@ -169,6 +187,9 @@ class BinPosition:
             self.yes_unpriced_shares = 0.0
             self.yes_unpriced_reserve = 0.0
             self.yes_avg_cost = 0.0
+            self.yes_api_missing_unverified = False
+            self.yes_api_missing_since = 0.0
+            self.yes_api_missing_count = 0
         self.recompute_collateral_used()
         self.realized_pnl += pnl
 
@@ -213,6 +234,9 @@ class BinPosition:
             self.no_unpriced_shares = 0.0
             self.no_unpriced_reserve = 0.0
             self.no_avg_cost = 0.0
+            self.no_api_missing_unverified = False
+            self.no_api_missing_since = 0.0
+            self.no_api_missing_count = 0
         self.recompute_collateral_used()
         self.realized_pnl += pnl
 
@@ -485,6 +509,12 @@ class Portfolio:
                 no_unpriced_shares=pos.no_unpriced_shares,
                 yes_unpriced_reserve=pos.yes_unpriced_reserve,
                 no_unpriced_reserve=pos.no_unpriced_reserve,
+                yes_api_missing_unverified=pos.yes_api_missing_unverified,
+                no_api_missing_unverified=pos.no_api_missing_unverified,
+                yes_api_missing_since=pos.yes_api_missing_since,
+                no_api_missing_since=pos.no_api_missing_since,
+                yes_api_missing_count=pos.yes_api_missing_count,
+                no_api_missing_count=pos.no_api_missing_count,
                 collateral_used=pos.collateral_used,
                 realized_pnl=pos.realized_pnl,
             )

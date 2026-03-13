@@ -765,6 +765,80 @@ def test_sync_logging_reports_resolution_sources_and_uncertainty(monkeypatch, ca
     assert "cost basis uncertainty cleared" in caplog.text
 
 
+def test_missing_api_side_with_positive_conditional_balance_is_retained_and_sellable(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.2])
+    bot.portfolio.execute_buy_no(0, 251.1, 0.86523, "yes-0")
+    warnings = []
+    bot.on_position_sync_warning = warnings.append
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_balance():
+        return 0.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_balance)
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda token_id, refresh=True: 201.8 if token_id == "no-0" else None,
+    )
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.no_shares == pytest.approx(201.8)
+    assert position.no_avg_cost == pytest.approx(0.86523)
+    assert position.has_no_api_missing_unverified is True
+    assert len(warnings) == 1
+    assert warnings[0].side == "NO"
+    assert warnings[0].verified_balance_shares == pytest.approx(201.8)
+
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.11, 400.0)],
+            yes_asks=[(0.13, 400.0)],
+        )
+    }
+    candidates = generate_candidates(
+        portfolio=bot.portfolio,
+        orderbooks=orderbooks,
+        config=KellyConfig(),
+        hours_to_settlement=6.0,
+        verbose=True,
+    )
+
+    assert any(c.action == TradeAction.SELL_NO for c in candidates)
+    assert all(c.action != TradeAction.BUY_YES for c in candidates)
+    assert bot.get_status()["position_sync"]["warning_count"] == 1
+
+
+def test_missing_api_side_verified_zero_clears_position(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.4])
+    bot.portfolio.execute_buy_no(0, 75.0, 0.81, "yes-0")
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_balance():
+        return 0.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_balance)
+    monkeypatch.setattr(bot, "_fetch_conditional_balance_shares", lambda *_args, **_kwargs: 0.0)
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.no_shares == 0.0
+    assert position.has_no_api_missing_unverified is False
+    assert bot.get_status()["position_sync"]["warning_count"] == 0
+
+
 def test_generate_candidates_logs_sell_candidates_in_priority_order(monkeypatch, caplog):
     portfolio = Portfolio(
         initial_capital=100.0,

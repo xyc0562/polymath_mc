@@ -13,6 +13,7 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from src.algo.musk_tweet_count.kelly.config import KellyConfig
 from src.algo.musk_tweet_count.kelly.executor import BalanceAllowanceErrorContext
+from src.algo.musk_tweet_count.kelly.integration import PositionSyncWarningContext
 from src.algo.musk_tweet_count.kelly.orderbook import OrderbookLevel, UnifiedOrderbook
 from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
 from src.algo.musk_tweet_count.kelly.user_stream import FillEvent, OrderStatus
@@ -492,6 +493,47 @@ def test_balance_allowance_alert_uses_configured_cooldown():
     assert kwargs["cooldown_seconds"] == 1800
     assert any("impact=order not sent or not fully executable" in line for line in lines)
     assert any("action=inspect balance, allowances, and recent fills before retrying" in line for line in lines)
+
+
+def test_position_sync_alert_warns_about_retained_side():
+    manager = _make_manager()
+    sent = []
+    manager._notify_slack = lambda level, title, lines=None, **kwargs: sent.append(
+        (level, title, lines or [], kwargs)
+    )
+
+    event_info = EventInfo(
+        event_id="event-456",
+        title="Event Title",
+        short_name="Event B",
+        settlement_date=datetime(2026, 3, 10).date(),
+        market_start_date=datetime(2026, 3, 3).date(),
+        bins=[
+            {"lower_bound": 0, "upper_bound": 19},
+            {"lower_bound": 20, "upper_bound": 39},
+        ],
+    )
+    context = PositionSyncWarningContext(
+        bin_index=1,
+        side="NO",
+        token_id="token-no-1",
+        local_shares=201.8,
+        verified_balance_shares=201.8,
+        missing_since=datetime(2026, 3, 13, 8, 46, tzinfo=timezone.utc).timestamp(),
+        missing_count=1,
+        reason="positions_api_omitted_side_but_balance_positive",
+    )
+
+    manager._notify_position_sync_warning(event_info, context)
+
+    assert len(sent) == 1
+    level, title, lines, kwargs = sent[0]
+    assert level == "warning"
+    assert title == "Position sync ambiguity: Event B"
+    assert kwargs["dedupe_key"] == "position_sync:event-456:1:NO"
+    assert kwargs["cooldown_seconds"] == 900.0
+    assert any("positions_api_omitted_side" in line for line in lines)
+    assert any("risk-reducing sells remain allowed" in line for line in lines)
 
 
 def test_capital_pool_logs_use_explicit_terms(caplog):

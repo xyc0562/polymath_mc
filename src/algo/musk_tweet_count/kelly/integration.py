@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Tuple
 
@@ -34,6 +35,20 @@ from .market_aware import compute_market_aware_blend
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PositionSyncWarningContext:
+    """Warning context when positions API omits a still-live position side."""
+
+    bin_index: int
+    side: str
+    token_id: str
+    local_shares: float
+    verified_balance_shares: Optional[float]
+    missing_since: float
+    missing_count: int
+    reason: str
 
 
 class KellyTradingBot:
@@ -120,6 +135,7 @@ class KellyTradingBot:
 
         # Lock for thread-safe tick execution
         self._tick_lock = asyncio.Lock()
+        self.on_position_sync_warning: Optional[Callable[[PositionSyncWarningContext], None]] = None
 
     async def setup(
         self,
@@ -555,6 +571,55 @@ class KellyTradingBot:
         async with self._tick_lock:
             return await self.kelly_executor.enforce_integrity_deadline()
 
+    def get_position_sync_summary(self) -> Dict:
+        """Summarize side-local positions API ambiguities currently being retained."""
+        summary = {
+            "warning_count": 0,
+            "warnings": [],
+        }
+        if not self.portfolio:
+            return summary
+
+        now_ts = time.time()
+        for bin_idx, pos in sorted(self.portfolio.positions.items()):
+            if pos.yes_api_missing_unverified and pos.yes_shares > 0.01:
+                summary["warnings"].append(
+                    {
+                        "bin_index": bin_idx,
+                        "side": "YES",
+                        "shares": pos.yes_shares,
+                        "missing_since": (
+                            datetime.fromtimestamp(pos.yes_api_missing_since, timezone.utc).isoformat()
+                            if pos.yes_api_missing_since > 0 else None
+                        ),
+                        "age_seconds": (
+                            max(0.0, now_ts - pos.yes_api_missing_since)
+                            if pos.yes_api_missing_since > 0 else None
+                        ),
+                        "missing_count": pos.yes_api_missing_count,
+                    }
+                )
+            if pos.no_api_missing_unverified and pos.no_shares > 0.01:
+                summary["warnings"].append(
+                    {
+                        "bin_index": bin_idx,
+                        "side": "NO",
+                        "shares": pos.no_shares,
+                        "missing_since": (
+                            datetime.fromtimestamp(pos.no_api_missing_since, timezone.utc).isoformat()
+                            if pos.no_api_missing_since > 0 else None
+                        ),
+                        "age_seconds": (
+                            max(0.0, now_ts - pos.no_api_missing_since)
+                            if pos.no_api_missing_since > 0 else None
+                        ),
+                        "missing_count": pos.no_api_missing_count,
+                    }
+                )
+
+        summary["warning_count"] = len(summary["warnings"])
+        return summary
+
     def get_status(self) -> Dict:
         """
         Get full bot status including pending orders.
@@ -581,6 +646,10 @@ class KellyTradingBot:
                 "count": 0,
                 "collateral": 0.0,
             },
+            "position_sync": {
+                "warning_count": 0,
+                "warnings": [],
+            },
             "user_stream": {
                 "connected": False,
                 "pending_tracked": 0,
@@ -591,6 +660,7 @@ class KellyTradingBot:
             status["pending_orders"]["count"] = self.kelly_executor.get_pending_count()
             status["pending_orders"]["collateral"] = self.kelly_executor.get_pending_collateral()
             status["integrity"] = self.kelly_executor.get_integrity_summary()
+        status["position_sync"] = self.get_position_sync_summary()
 
         if self.user_stream:
             status["user_stream"]["connected"] = self.user_stream._ws is not None
@@ -696,6 +766,43 @@ class KellyTradingBot:
             logger.warning(f"[{self.event_name}] Failed to fetch USDC balance: {e}")
             return 0.0
 
+    @staticmethod
+    def _parse_conditional_balance_shares(balance_info: dict) -> Optional[float]:
+        """Parse conditional token balance from get_balance_allowance response."""
+        if not isinstance(balance_info, dict):
+            return None
+        raw_balance = balance_info.get("balance")
+        try:
+            return float(raw_balance) / 1e6
+        except (TypeError, ValueError):
+            return None
+
+    def _fetch_conditional_balance_shares(self, token_id: str, refresh: bool = True) -> Optional[float]:
+        """Fetch conditional token balance for a specific YES/NO token."""
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            )
+            if refresh:
+                try:
+                    self.clob_client.update_balance_allowance(params)
+                except Exception as e:
+                    logger.debug(
+                        f"[{self.event_name}] Conditional balance refresh failed for token "
+                        f"{token_id[:16]}...: {e}"
+                    )
+            balance_info = self.clob_client.get_balance_allowance(params)
+            return self._parse_conditional_balance_shares(balance_info)
+        except Exception as e:
+            logger.warning(
+                f"[{self.event_name}] Failed to fetch conditional balance for token "
+                f"{token_id[:16]}...: {e}"
+            )
+            return None
+
     def _side_attr_names(self, is_no: bool) -> Tuple[str, str, str, str, str]:
         """Return attribute names and log label for a position side."""
         if is_no:
@@ -713,6 +820,57 @@ class KellyTradingBot:
             "yes_unpriced_reserve",
             "YES",
         )
+
+    def _side_missing_attr_names(self, is_no: bool) -> Tuple[str, str, str]:
+        """Return api-missing verification attribute names for one side."""
+        if is_no:
+            return (
+                "no_api_missing_unverified",
+                "no_api_missing_since",
+                "no_api_missing_count",
+            )
+        return (
+            "yes_api_missing_unverified",
+            "yes_api_missing_since",
+            "yes_api_missing_count",
+        )
+
+    def _get_side_missing_state(self, pos, is_no: bool) -> Tuple[bool, float, int]:
+        """Read api-missing verification state for one side."""
+        active_attr, since_attr, count_attr = self._side_missing_attr_names(is_no)
+        return (
+            bool(getattr(pos, active_attr)),
+            float(getattr(pos, since_attr)),
+            int(getattr(pos, count_attr)),
+        )
+
+    def _set_side_missing_state(
+        self,
+        pos,
+        *,
+        is_no: bool,
+        active: bool,
+        now_ts: Optional[float] = None,
+    ) -> Tuple[bool, float, int]:
+        """Write api-missing verification state for one side."""
+        active_attr, since_attr, count_attr = self._side_missing_attr_names(is_no)
+        previous_active = bool(getattr(pos, active_attr))
+        previous_since = float(getattr(pos, since_attr))
+        previous_count = int(getattr(pos, count_attr))
+        if active:
+            if now_ts is None:
+                now_ts = time.time()
+            since = previous_since if previous_active and previous_since > 0 else now_ts
+            count = previous_count + 1 if previous_active else 1
+            setattr(pos, active_attr, True)
+            setattr(pos, since_attr, since)
+            setattr(pos, count_attr, count)
+            return True, since, count
+
+        setattr(pos, active_attr, False)
+        setattr(pos, since_attr, 0.0)
+        setattr(pos, count_attr, 0)
+        return False, 0.0, 0
 
     def _get_side_state(self, pos, is_no: bool) -> Tuple[float, float, float, float]:
         """Read total shares, avg cost, unresolved shares, and unresolved reserve."""
@@ -751,6 +909,8 @@ class KellyTradingBot:
         setattr(pos, avg_attr, avg_cost)
         setattr(pos, unpriced_attr, unpriced_shares)
         setattr(pos, reserve_attr, unpriced_reserve)
+        if shares <= 0.01:
+            self._set_side_missing_state(pos, is_no=is_no, active=False)
         pos.recompute_collateral_used()
 
     def _preserve_local_side_state(
@@ -808,6 +968,151 @@ class KellyTradingBot:
             unpriced_reserve=remaining_reserve,
         )
         return "local_preserve_reduction"
+
+    def _sync_position_side_from_balance(
+        self,
+        *,
+        pos,
+        is_no: bool,
+        verified_shares: float,
+    ) -> str:
+        """
+        Apply a conditional-balance verified share count while preserving local pricing.
+
+        Positive balance means the side still exists even if the positions API omitted it.
+        We preserve existing cost basis and only mark extra shares as unresolved if the
+        verified balance is somehow larger than our local position.
+        """
+        current_shares, current_avg_cost, current_unpriced, current_reserve = self._get_side_state(pos, is_no)
+        epsilon = 0.01
+        verified_shares = max(0.0, verified_shares)
+
+        if verified_shares <= epsilon:
+            self._set_side_state(pos, is_no=is_no, shares=0.0, avg_cost=0.0)
+            return "verified_zero"
+
+        if verified_shares <= current_shares + epsilon:
+            return self._preserve_local_side_state(pos, is_no=is_no, api_shares=verified_shares)
+
+        delta = verified_shares - current_shares
+        self._set_side_state(
+            pos,
+            is_no=is_no,
+            shares=verified_shares,
+            avg_cost=current_avg_cost,
+            unpriced_shares=current_unpriced + delta,
+            unpriced_reserve=current_reserve + delta,
+        )
+        return "balance_increase_unpriced"
+
+    def _handle_missing_api_side(
+        self,
+        *,
+        pos,
+        bin_idx: int,
+        is_no: bool,
+        token_id: Optional[str],
+    ) -> str:
+        """
+        Handle a side that is absent from the positions API but still exists locally.
+
+        We do not clear immediately. First verify with conditional token balance; only
+        a verified zero clears the side. Otherwise keep the side locally so conflicting
+        opposite-side trades stay blocked while still permitting risk-reducing sells.
+        """
+        shares_attr, avg_attr, unpriced_attr, reserve_attr, side_label = self._side_attr_names(is_no)
+        local_shares = getattr(pos, shares_attr)
+        local_avg_cost = getattr(pos, avg_attr)
+        local_unpriced = getattr(pos, unpriced_attr)
+        local_reserve = getattr(pos, reserve_attr)
+        was_missing, missing_since, missing_count = self._get_side_missing_state(pos, is_no)
+        now_ts = time.time()
+
+        verified_balance = None
+        if token_id:
+            verified_balance = self._fetch_conditional_balance_shares(token_id=token_id, refresh=True)
+
+        if verified_balance is not None and verified_balance <= 0.01:
+            logger.warning(
+                f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
+                f"and conditional balance verified zero; clearing {local_shares:.2f} -> 0"
+            )
+            self._set_side_state(pos, is_no=is_no, shares=0.0, avg_cost=0.0)
+            if was_missing:
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing-side ambiguity cleared "
+                    f"(verified zero balance after {missing_count} missing snapshots)"
+                )
+            self._set_side_missing_state(pos, is_no=is_no, active=False)
+            return "verified_zero"
+
+        if verified_balance is not None and verified_balance > 0.01:
+            resolve_source = self._sync_position_side_from_balance(
+                pos=pos,
+                is_no=is_no,
+                verified_shares=verified_balance,
+            )
+            _, missing_since, missing_count = self._set_side_missing_state(
+                pos,
+                is_no=is_no,
+                active=True,
+                now_ts=now_ts,
+            )
+            logger.warning(
+                f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
+                f"but conditional balance still shows {verified_balance:.2f} shares; preserving local side "
+                f"(source={resolve_source}, avg=${getattr(pos, avg_attr):.4f}, unpriced={getattr(pos, unpriced_attr):.2f}sh/${getattr(pos, reserve_attr):.2f})"
+            )
+            if self.on_position_sync_warning and not was_missing:
+                try:
+                    self.on_position_sync_warning(
+                        PositionSyncWarningContext(
+                            bin_index=bin_idx,
+                            side=side_label,
+                            token_id=token_id or "",
+                            local_shares=getattr(pos, shares_attr),
+                            verified_balance_shares=verified_balance,
+                            missing_since=missing_since,
+                            missing_count=missing_count,
+                            reason="positions_api_omitted_side_but_balance_positive",
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        f"[{self.event_name}] Failed to emit position sync warning callback for bin {bin_idx} {side_label}"
+                    )
+            return "verified_positive"
+
+        _, missing_since, missing_count = self._set_side_missing_state(
+            pos,
+            is_no=is_no,
+            active=True,
+            now_ts=now_ts,
+        )
+        logger.warning(
+            f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
+            f"but conditional balance could not be verified; retaining local side {local_shares:.2f} @ ${local_avg_cost:.4f} "
+            f"(unpriced={local_unpriced:.2f}sh/${local_reserve:.2f}, missing_count={missing_count})"
+        )
+        if self.on_position_sync_warning and not was_missing:
+            try:
+                self.on_position_sync_warning(
+                    PositionSyncWarningContext(
+                        bin_index=bin_idx,
+                        side=side_label,
+                        token_id=token_id or "",
+                        local_shares=local_shares,
+                        verified_balance_shares=None,
+                        missing_since=missing_since,
+                        missing_count=missing_count,
+                        reason="positions_api_omitted_side_balance_unavailable",
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    f"[{self.event_name}] Failed to emit position sync warning callback for bin {bin_idx} {side_label}"
+                )
+        return "balance_unknown"
 
     def _sync_position_side_from_api(
         self,
@@ -949,6 +1254,7 @@ class KellyTradingBot:
             local_reserve = getattr(pos, reserve_attr)
             was_uncertain = local_unpriced > 0.01
             previous_resolve_source = None
+            was_missing_unverified, _, _ = self._get_side_missing_state(pos, is_no)
 
             # Update to API value if different
             if abs(api_shares - local_shares) > 0.01 or api_avg_price > 0 or api_value > 0:
@@ -996,34 +1302,38 @@ class KellyTradingBot:
                         f"[{self.event_name}] API sync: bin {bin_idx} {side_label} unresolved increment adjusted "
                         f"{local_unpriced:.2f}sh/${local_reserve:.2f} -> {current_unpriced:.2f}sh/${current_reserve:.2f}"
                     )
+            if was_missing_unverified:
+                self._set_side_missing_state(pos, is_no=is_no, active=False)
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing-side ambiguity cleared "
+                    "(positions API reports the side again)"
+                )
 
             synced_positions[bin_idx] = api_shares
 
-        # Second, clear positions that API doesn't report (they were sold/closed)
+        # Second, verify positions that API doesn't report before clearing them.
         for bin_idx in tracked_bins:
             pos = self.portfolio.positions.get(bin_idx)
             if not pos:
                 continue
 
-            # Check YES position - if API doesn't have it and we do, clear it
+            # Check YES position - if API doesn't have it and we do, verify before clearing
             if pos.yes_shares > 0.01 and (bin_idx, False) not in api_bin_positions:
-                logger.info(f"[{self.event_name}] API sync: bin {bin_idx} YES cleared {pos.yes_shares:.2f} -> 0 (position closed)")
-                had_unpriced = pos.has_yes_unpriced_increment
-                self._set_side_state(pos, is_no=False, shares=0.0, avg_cost=0.0)
-                if had_unpriced:
-                    logger.info(
-                        f"[{self.event_name}] API sync: bin {bin_idx} YES cost basis uncertainty cleared (position closed)"
-                    )
+                self._handle_missing_api_side(
+                    pos=pos,
+                    bin_idx=bin_idx,
+                    is_no=False,
+                    token_id=self.bin_token_ids.get(bin_idx),
+                )
 
-            # Check NO position - if API doesn't have it and we do, clear it
+            # Check NO position - if API doesn't have it and we do, verify before clearing
             if pos.no_shares > 0.01 and (bin_idx, True) not in api_bin_positions:
-                logger.info(f"[{self.event_name}] API sync: bin {bin_idx} NO cleared {pos.no_shares:.2f} -> 0 (position closed)")
-                had_unpriced = pos.has_no_unpriced_increment
-                self._set_side_state(pos, is_no=True, shares=0.0, avg_cost=0.0)
-                if had_unpriced:
-                    logger.info(
-                        f"[{self.event_name}] API sync: bin {bin_idx} NO cost basis uncertainty cleared (position closed)"
-                    )
+                self._handle_missing_api_side(
+                    pos=pos,
+                    bin_idx=bin_idx,
+                    is_no=True,
+                    token_id=self.bin_no_token_ids.get(bin_idx),
+                )
 
         # IMPORTANT: Use event capital budget (c_event_max), NOT wallet USDC balance
         # In multi-event scenarios, each event has its own capital allocation.

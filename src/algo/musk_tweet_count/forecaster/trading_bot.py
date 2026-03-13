@@ -1477,5 +1477,6 @@ class GASKellyTradingBot:
             summary["pending_orders"] = kelly_status.get("pending_orders", {})
             summary["user_stream"] = kelly_status.get("user_stream", {})
             summary["integrity"] = kelly_status.get("integrity", {})
+            summary["position_sync"] = kelly_status.get("position_sync", {})
 
         return summary
