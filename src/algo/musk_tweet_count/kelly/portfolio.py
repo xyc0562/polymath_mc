@@ -39,6 +39,14 @@ class BinPosition:
     yes_avg_cost: float = 0.0
     no_avg_cost: float = 0.0
 
+    # Shares whose acquisition cost is not yet priceable from API/local fills.
+    yes_unpriced_shares: float = 0.0
+    no_unpriced_shares: float = 0.0
+
+    # Conservative collateral reserve for unresolved shares.
+    yes_unpriced_reserve: float = 0.0
+    no_unpriced_reserve: float = 0.0
+
     # Collateral tied up in positions
     collateral_used: float = 0.0
 
@@ -58,7 +66,67 @@ class BinPosition:
     @property
     def total_investment(self) -> float:
         """Total invested in this bin."""
-        return (self.yes_shares * self.yes_avg_cost) + (self.no_shares * self.no_avg_cost)
+        return (
+            (self.priced_yes_shares * self.yes_avg_cost)
+            + (self.priced_no_shares * self.no_avg_cost)
+            + self.yes_unpriced_reserve
+            + self.no_unpriced_reserve
+        )
+
+    @property
+    def priced_yes_shares(self) -> float:
+        """YES shares with resolved cost basis."""
+        return max(0.0, self.yes_shares - self.yes_unpriced_shares)
+
+    @property
+    def priced_no_shares(self) -> float:
+        """NO shares with resolved cost basis."""
+        return max(0.0, self.no_shares - self.no_unpriced_shares)
+
+    @property
+    def has_yes_unpriced_increment(self) -> bool:
+        """Whether this bin has unresolved YES shares."""
+        return self.yes_unpriced_shares > 0.01
+
+    @property
+    def has_no_unpriced_increment(self) -> bool:
+        """Whether this bin has unresolved NO shares."""
+        return self.no_unpriced_shares > 0.01
+
+    def recompute_collateral_used(self) -> None:
+        """Recompute collateral from priced cost basis plus unresolved reserve."""
+        self.collateral_used = (
+            self.priced_yes_shares * self.yes_avg_cost
+            + self.priced_no_shares * self.no_avg_cost
+            + self.yes_unpriced_reserve
+            + self.no_unpriced_reserve
+        )
+
+    def _consume_unpriced_yes(self, shares: float) -> tuple[float, float]:
+        """Consume unresolved YES shares first and return (shares, reserve)."""
+        if shares <= 0 or self.yes_unpriced_shares <= 0:
+            return 0.0, 0.0
+
+        take = min(shares, self.yes_unpriced_shares)
+        reserve_before = self.yes_unpriced_reserve
+        unpriced_before = self.yes_unpriced_shares
+        reserve_released = reserve_before * (take / unpriced_before) if unpriced_before > 0 else 0.0
+        self.yes_unpriced_shares = max(0.0, self.yes_unpriced_shares - take)
+        self.yes_unpriced_reserve = max(0.0, self.yes_unpriced_reserve - reserve_released)
+        return take, reserve_released
+
+    def _consume_unpriced_no(self, shares: float) -> tuple[float, float]:
+        """Consume unresolved NO shares first and return (shares, reserve)."""
+        if shares <= 0 or self.no_unpriced_shares <= 0:
+            return 0.0, 0.0
+
+        take = min(shares, self.no_unpriced_shares)
+        reserve_before = self.no_unpriced_reserve
+        unpriced_before = self.no_unpriced_shares
+        reserve_released = reserve_before * (take / unpriced_before) if unpriced_before > 0 else 0.0
+        self.no_unpriced_shares = max(0.0, self.no_unpriced_shares - take)
+        self.no_unpriced_reserve = max(0.0, self.no_unpriced_reserve - reserve_released)
+        return take, reserve_released
 
     def add_yes(self, shares: float, price: float) -> None:
         """Add YES shares at a price."""
@@ -66,14 +134,15 @@ class BinPosition:
             return
 
         # Update average cost basis
-        total_shares = self.yes_shares + shares
-        if total_shares > 0:
+        priced_shares = self.priced_yes_shares
+        total_priced_shares = priced_shares + shares
+        if total_priced_shares > 0:
             self.yes_avg_cost = (
-                (self.yes_shares * self.yes_avg_cost) + (shares * price)
-            ) / total_shares
+                (priced_shares * self.yes_avg_cost) + (shares * price)
+            ) / total_priced_shares
 
-        self.yes_shares = total_shares
-        self.collateral_used += shares * price
+        self.yes_shares += shares
+        self.recompute_collateral_used()
 
     def remove_yes(self, shares: float, price: float) -> float:
         """
@@ -86,12 +155,21 @@ class BinPosition:
             return 0.0
 
         # Calculate P&L
-        cost_basis = shares * self.yes_avg_cost
+        unresolved_removed, unresolved_released = self._consume_unpriced_yes(shares)
+        priced_shares = max(0.0, shares - unresolved_removed)
+        cost_basis = unresolved_released + (priced_shares * self.yes_avg_cost)
         proceeds = shares * price
         pnl = proceeds - cost_basis
 
-        self.yes_shares -= shares
-        self.collateral_used -= cost_basis
+        self.yes_shares = max(0.0, self.yes_shares - shares)
+        if self.priced_yes_shares <= 0.01:
+            self.yes_avg_cost = 0.0
+        if self.yes_shares <= 0.01:
+            self.yes_shares = 0.0
+            self.yes_unpriced_shares = 0.0
+            self.yes_unpriced_reserve = 0.0
+            self.yes_avg_cost = 0.0
+        self.recompute_collateral_used()
         self.realized_pnl += pnl
 
         return pnl
@@ -101,14 +179,15 @@ class BinPosition:
         if shares <= 0:
             return
 
-        total_shares = self.no_shares + shares
-        if total_shares > 0:
+        priced_shares = self.priced_no_shares
+        total_priced_shares = priced_shares + shares
+        if total_priced_shares > 0:
             self.no_avg_cost = (
-                (self.no_shares * self.no_avg_cost) + (shares * price)
-            ) / total_shares
+                (priced_shares * self.no_avg_cost) + (shares * price)
+            ) / total_priced_shares
 
-        self.no_shares = total_shares
-        self.collateral_used += shares * price
+        self.no_shares += shares
+        self.recompute_collateral_used()
 
     def remove_no(self, shares: float, price: float) -> float:
         """
@@ -120,12 +199,21 @@ class BinPosition:
         if shares <= 0:
             return 0.0
 
-        cost_basis = shares * self.no_avg_cost
+        unresolved_removed, unresolved_released = self._consume_unpriced_no(shares)
+        priced_shares = max(0.0, shares - unresolved_removed)
+        cost_basis = unresolved_released + (priced_shares * self.no_avg_cost)
         proceeds = shares * price
         pnl = proceeds - cost_basis
 
-        self.no_shares -= shares
-        self.collateral_used -= cost_basis
+        self.no_shares = max(0.0, self.no_shares - shares)
+        if self.priced_no_shares <= 0.01:
+            self.no_avg_cost = 0.0
+        if self.no_shares <= 0.01:
+            self.no_shares = 0.0
+            self.no_unpriced_shares = 0.0
+            self.no_unpriced_reserve = 0.0
+            self.no_avg_cost = 0.0
+        self.recompute_collateral_used()
         self.realized_pnl += pnl
 
         return pnl
@@ -393,6 +481,10 @@ class Portfolio:
                 no_shares=pos.no_shares,
                 yes_avg_cost=pos.yes_avg_cost,
                 no_avg_cost=pos.no_avg_cost,
+                yes_unpriced_shares=pos.yes_unpriced_shares,
+                no_unpriced_shares=pos.no_unpriced_shares,
+                yes_unpriced_reserve=pos.yes_unpriced_reserve,
+                no_unpriced_reserve=pos.no_unpriced_reserve,
                 collateral_used=pos.collateral_used,
                 realized_pnl=pos.realized_pnl,
             )

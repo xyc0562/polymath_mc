@@ -1769,6 +1769,48 @@ class KellyExecutor:
         self._prune_recent_tracking(now)
         return True
 
+    def get_overlay_price_hint_for_api_increase(
+        self,
+        *,
+        bin_index: int,
+        is_no: bool,
+        share_increase: float,
+    ) -> tuple[float, float]:
+        """
+        Estimate pricing for an API-reported share increase from residual overlay.
+
+        Returns a tuple of (priced_shares, weighted_avg_price) without mutating
+        overlay reconciliation state.
+        """
+        remaining = max(0.0, share_increase)
+        if remaining <= self._overlay_size_epsilon:
+            return 0.0, 0.0
+
+        expected_action = TradeAction.BUY_NO if is_no else TradeAction.BUY_YES
+        priced_shares = 0.0
+        priced_notional = 0.0
+
+        for fragment in self._overlay_ledger:
+            if fragment.remaining_size <= self._overlay_size_epsilon:
+                continue
+            if fragment.bin_index != bin_index or fragment.action != expected_action:
+                continue
+
+            take = min(fragment.remaining_size, remaining)
+            if take <= self._overlay_size_epsilon:
+                continue
+
+            priced_shares += take
+            priced_notional += take * fragment.price
+            remaining -= take
+            if remaining <= self._overlay_size_epsilon:
+                break
+
+        if priced_shares <= self._overlay_size_epsilon:
+            return 0.0, 0.0
+
+        return priced_shares, priced_notional / priced_shares
+
     def _mark_order_confirmed(
         self,
         order_id: str,

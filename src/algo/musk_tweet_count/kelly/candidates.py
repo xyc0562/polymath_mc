@@ -599,6 +599,9 @@ def _generate_buy_yes_candidate(
 
     # Check collateral limits (rough check — exact sizing done later)
     position = portfolio.get_position(bin_index)
+    if position and position.has_yes_unpriced_increment:
+        reject("cost basis unresolved for existing YES increment; waiting for priced API sync")
+        return None
     current_bin_collateral = position.collateral_used if position else 0.0
     total_collateral = portfolio.total_collateral_used
 
@@ -849,6 +852,9 @@ def _generate_buy_no_candidate(
 
     # Check collateral limits (rough check — exact sizing done later)
     position = portfolio.get_position(bin_index)
+    if position and position.has_no_unpriced_increment:
+        reject("cost basis unresolved for existing NO increment; waiting for priced API sync")
+        return None
     current_bin_collateral = position.collateral_used if position else 0.0
     total_collateral = portfolio.total_collateral_used
 

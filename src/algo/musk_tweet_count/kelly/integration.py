@@ -696,6 +696,186 @@ class KellyTradingBot:
             logger.warning(f"[{self.event_name}] Failed to fetch USDC balance: {e}")
             return 0.0
 
+    def _side_attr_names(self, is_no: bool) -> Tuple[str, str, str, str, str]:
+        """Return attribute names and log label for a position side."""
+        if is_no:
+            return (
+                "no_shares",
+                "no_avg_cost",
+                "no_unpriced_shares",
+                "no_unpriced_reserve",
+                "NO",
+            )
+        return (
+            "yes_shares",
+            "yes_avg_cost",
+            "yes_unpriced_shares",
+            "yes_unpriced_reserve",
+            "YES",
+        )
+
+    def _get_side_state(self, pos, is_no: bool) -> Tuple[float, float, float, float]:
+        """Read total shares, avg cost, unresolved shares, and unresolved reserve."""
+        shares_attr, avg_attr, unpriced_attr, reserve_attr, _ = self._side_attr_names(is_no)
+        return (
+            getattr(pos, shares_attr),
+            getattr(pos, avg_attr),
+            getattr(pos, unpriced_attr),
+            getattr(pos, reserve_attr),
+        )
+
+    def _set_side_state(
+        self,
+        pos,
+        *,
+        is_no: bool,
+        shares: float,
+        avg_cost: float,
+        unpriced_shares: float = 0.0,
+        unpriced_reserve: float = 0.0,
+    ) -> None:
+        """Write side-local pricing state and refresh collateral."""
+        shares_attr, avg_attr, unpriced_attr, reserve_attr, _ = self._side_attr_names(is_no)
+
+        shares = max(0.0, shares)
+        unpriced_shares = min(max(0.0, unpriced_shares), shares)
+        unpriced_reserve = max(0.0, unpriced_reserve)
+        if unpriced_shares <= 0.01:
+            unpriced_shares = 0.0
+            unpriced_reserve = 0.0
+        priced_shares = max(0.0, shares - unpriced_shares)
+        if priced_shares <= 0.01:
+            avg_cost = 0.0
+
+        setattr(pos, shares_attr, shares)
+        setattr(pos, avg_attr, avg_cost)
+        setattr(pos, unpriced_attr, unpriced_shares)
+        setattr(pos, reserve_attr, unpriced_reserve)
+        pos.recompute_collateral_used()
+
+    def _preserve_local_side_state(
+        self,
+        pos,
+        *,
+        is_no: bool,
+        api_shares: float,
+    ) -> str:
+        """
+        Preserve local side pricing when API shares are unchanged or reduced.
+
+        Unresolved shares are consumed first so same-side add blocks clear as
+        soon as the ambiguous increment shrinks away.
+        """
+        current_shares, current_avg_cost, current_unpriced, current_reserve = self._get_side_state(pos, is_no)
+        epsilon = 0.01
+        api_shares = max(0.0, api_shares)
+
+        if api_shares <= epsilon:
+            self._set_side_state(pos, is_no=is_no, shares=0.0, avg_cost=0.0)
+            return "position_closed"
+
+        if api_shares >= current_shares - epsilon:
+            self._set_side_state(
+                pos,
+                is_no=is_no,
+                shares=api_shares,
+                avg_cost=current_avg_cost,
+                unpriced_shares=current_unpriced,
+                unpriced_reserve=current_reserve,
+            )
+            return "local_preserve"
+
+        reduction = current_shares - api_shares
+        unpriced_removed = min(reduction, current_unpriced)
+        reserve_removed = (
+            current_reserve * (unpriced_removed / current_unpriced)
+            if current_unpriced > epsilon
+            else 0.0
+        )
+        remaining_unpriced = max(0.0, current_unpriced - unpriced_removed)
+        remaining_reserve = max(0.0, current_reserve - reserve_removed)
+        priced_shares_before = max(0.0, current_shares - current_unpriced)
+        priced_removed = max(0.0, reduction - unpriced_removed)
+        priced_shares_after = max(0.0, priced_shares_before - priced_removed)
+        avg_cost = current_avg_cost if priced_shares_after > epsilon else 0.0
+
+        self._set_side_state(
+            pos,
+            is_no=is_no,
+            shares=api_shares,
+            avg_cost=avg_cost,
+            unpriced_shares=remaining_unpriced,
+            unpriced_reserve=remaining_reserve,
+        )
+        return "local_preserve_reduction"
+
+    def _sync_position_side_from_api(
+        self,
+        *,
+        pos,
+        bin_idx: int,
+        is_no: bool,
+        api_shares: float,
+        api_avg_price: float,
+        api_value: float,
+    ) -> str:
+        """Apply one API-reported side to local state and return the pricing source."""
+        current_shares, current_avg_cost, current_unpriced, current_reserve = self._get_side_state(pos, is_no)
+        epsilon = 0.01
+        api_shares = max(0.0, api_shares)
+
+        if api_avg_price > 0:
+            self._set_side_state(pos, is_no=is_no, shares=api_shares, avg_cost=api_avg_price)
+            return "avgPrice"
+
+        if api_value > 0 and api_shares > epsilon:
+            self._set_side_state(pos, is_no=is_no, shares=api_shares, avg_cost=api_value / api_shares)
+            return "initialValue"
+
+        delta = api_shares - current_shares
+        if delta <= epsilon:
+            return self._preserve_local_side_state(pos, is_no=is_no, api_shares=api_shares)
+
+        priced_delta_shares = 0.0
+        priced_delta_avg = 0.0
+        if self.kelly_executor is not None:
+            priced_delta_shares, priced_delta_avg = (
+                self.kelly_executor.get_overlay_price_hint_for_api_increase(
+                    bin_index=bin_idx,
+                    is_no=is_no,
+                    share_increase=delta,
+                )
+            )
+
+        priced_base_shares = max(0.0, current_shares - current_unpriced)
+        priced_base_notional = priced_base_shares * current_avg_cost
+        priced_delta_notional = priced_delta_shares * priced_delta_avg
+        total_priced_shares = priced_base_shares + priced_delta_shares
+        total_avg_cost = (
+            (priced_base_notional + priced_delta_notional) / total_priced_shares
+            if total_priced_shares > epsilon
+            else 0.0
+        )
+
+        unresolved_delta = max(0.0, delta - priced_delta_shares)
+        total_unpriced_shares = current_unpriced + unresolved_delta
+        total_unpriced_reserve = current_reserve + unresolved_delta
+
+        self._set_side_state(
+            pos,
+            is_no=is_no,
+            shares=api_shares,
+            avg_cost=total_avg_cost,
+            unpriced_shares=total_unpriced_shares,
+            unpriced_reserve=total_unpriced_reserve,
+        )
+
+        if priced_delta_shares > epsilon and unresolved_delta <= epsilon:
+            return "overlay"
+        if priced_delta_shares > epsilon:
+            return "overlay+unpriced_reserve"
+        return "unpriced_reserve"
+
     async def sync_positions_from_api(self, wallet_address: str) -> Tuple[float, Dict[int, float]]:
         """
         Sync portfolio state from Polymarket API.
@@ -757,27 +937,65 @@ class KellyTradingBot:
         for (bin_idx, is_no), pos_info in api_bin_positions.items():
             api_shares = pos_info["shares"]
             api_avg_price = pos_info["avg_price"]
+            api_value = pos_info["value"]
 
             yes_token = self.bin_token_ids.get(bin_idx)
             pos = self.portfolio.ensure_position(bin_idx, yes_token or "")
 
-            local_shares = pos.no_shares if is_no else pos.yes_shares
-            price_used = api_avg_price if api_avg_price > 0 else 0.5
+            shares_attr, avg_attr, unpriced_attr, reserve_attr, side_label = self._side_attr_names(is_no)
+            local_shares = getattr(pos, shares_attr)
+            local_avg_cost = getattr(pos, avg_attr)
+            local_unpriced = getattr(pos, unpriced_attr)
+            local_reserve = getattr(pos, reserve_attr)
+            was_uncertain = local_unpriced > 0.01
+            previous_resolve_source = None
 
             # Update to API value if different
-            if abs(api_shares - local_shares) > 0.01:
-                if is_no:
-                    pos.no_shares = api_shares
-                    pos.no_avg_cost = price_used
-                    # Recalculate collateral as sum of YES + NO collateral
-                    pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
-                    logger.info(f"[{self.event_name}] API sync: bin {bin_idx} NO updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
+            if abs(api_shares - local_shares) > 0.01 or api_avg_price > 0 or api_value > 0:
+                previous_resolve_source = self._sync_position_side_from_api(
+                    pos=pos,
+                    bin_idx=bin_idx,
+                    is_no=is_no,
+                    api_shares=api_shares,
+                    api_avg_price=api_avg_price,
+                    api_value=api_value,
+                )
+
+                resolved_avg = getattr(pos, avg_attr)
+                current_unpriced = getattr(pos, unpriced_attr)
+                current_reserve = getattr(pos, reserve_attr)
+                if current_unpriced > 0.01:
+                    logger.warning(
+                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
+                        f"{local_shares:.2f} -> {api_shares:.2f} with unresolved increment "
+                        f"{current_unpriced:.2f}sh reserve=${current_reserve:.2f} "
+                        f"(source={previous_resolve_source}, local_avg=${local_avg_cost:.4f})"
+                    )
                 else:
-                    pos.yes_shares = api_shares
-                    pos.yes_avg_cost = price_used
-                    # Recalculate collateral as sum of YES + NO collateral
-                    pos.collateral_used = (pos.yes_shares * pos.yes_avg_cost) + (pos.no_shares * pos.no_avg_cost)
-                    logger.info(f"[{self.event_name}] API sync: bin {bin_idx} YES updated {local_shares:.2f} -> {api_shares:.2f} @ ${price_used:.4f}")
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
+                        f"{local_shares:.2f} -> {api_shares:.2f} @ ${resolved_avg:.4f} "
+                        f"(source={previous_resolve_source})"
+                    )
+
+                if was_uncertain and current_unpriced <= 0.01:
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis uncertainty cleared "
+                        f"(source={previous_resolve_source})"
+                    )
+                elif not was_uncertain and current_unpriced > 0.01:
+                    logger.warning(
+                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis unresolved; "
+                        f"blocking same-side adds until a priced sync arrives"
+                    )
+                elif was_uncertain and current_unpriced > 0.01 and (
+                    abs(current_unpriced - local_unpriced) > 0.01
+                    or abs(current_reserve - local_reserve) > 0.01
+                ):
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} unresolved increment adjusted "
+                        f"{local_unpriced:.2f}sh/${local_reserve:.2f} -> {current_unpriced:.2f}sh/${current_reserve:.2f}"
+                    )
 
             synced_positions[bin_idx] = api_shares
 
@@ -790,18 +1008,22 @@ class KellyTradingBot:
             # Check YES position - if API doesn't have it and we do, clear it
             if pos.yes_shares > 0.01 and (bin_idx, False) not in api_bin_positions:
                 logger.info(f"[{self.event_name}] API sync: bin {bin_idx} YES cleared {pos.yes_shares:.2f} -> 0 (position closed)")
-                pos.yes_shares = 0
-                pos.yes_avg_cost = 0
-                # Recalculate collateral (only NO remains if any)
-                pos.collateral_used = pos.no_shares * pos.no_avg_cost
+                had_unpriced = pos.has_yes_unpriced_increment
+                self._set_side_state(pos, is_no=False, shares=0.0, avg_cost=0.0)
+                if had_unpriced:
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} YES cost basis uncertainty cleared (position closed)"
+                    )
 
             # Check NO position - if API doesn't have it and we do, clear it
             if pos.no_shares > 0.01 and (bin_idx, True) not in api_bin_positions:
                 logger.info(f"[{self.event_name}] API sync: bin {bin_idx} NO cleared {pos.no_shares:.2f} -> 0 (position closed)")
-                pos.no_shares = 0
-                pos.no_avg_cost = 0
-                # Recalculate collateral (only YES remains if any)
-                pos.collateral_used = pos.yes_shares * pos.yes_avg_cost
+                had_unpriced = pos.has_no_unpriced_increment
+                self._set_side_state(pos, is_no=True, shares=0.0, avg_cost=0.0)
+                if had_unpriced:
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} NO cost basis uncertainty cleared (position closed)"
+                    )
 
         # IMPORTANT: Use event capital budget (c_event_max), NOT wallet USDC balance
         # In multi-event scenarios, each event has its own capital allocation.
