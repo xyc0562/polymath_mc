@@ -669,8 +669,11 @@ class KellyTradingBot:
             return positions
 
         except Exception as e:
-            logger.warning(f"[{self.event_name}] Failed to fetch positions from API: {e}", exc_info=True)
-            return {}
+            logger.warning(
+                f"[{self.event_name}] Failed to fetch positions from API: {e}",
+                exc_info=True,
+            )
+            raise
 
     async def fetch_usdc_balance(self) -> float:
         """
@@ -716,7 +719,8 @@ class KellyTradingBot:
         if not self._setup_complete:
             raise RuntimeError("Bot must be setup before syncing positions")
 
-        # Fetch current state from API
+        # Fetch current state from API. If the positions endpoint fails, abort
+        # the sync entirely and preserve the last authoritative local snapshot.
         api_positions = await self.fetch_positions_from_api(wallet_address)
         usdc_balance = await self.fetch_usdc_balance()
 

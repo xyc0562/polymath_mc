@@ -131,6 +131,16 @@ class RateLimitConfig:
     # ordinary API propagation lag to resolve naturally.
     overlay_reconciliation_grace_seconds: float = 90.0
 
+    # When the residual overlay for a bin/side is within this fraction of the
+    # current API-reported position, trust the API as "close enough" and clear
+    # the residual instead of letting tiny drifts age into an integrity freeze.
+    overlay_reconciliation_api_tolerance_fraction: float = 0.05
+
+    # Safety cap for the API-relative overlay tolerance. This keeps the
+    # tolerance focused on tiny propagation/rounding drifts instead of masking
+    # large stale-position mismatches on bigger inventory.
+    overlay_reconciliation_api_tolerance_max_shares: float = 1.0
+
     # Hard deadline for an event integrity freeze. Once exceeded, the executor
     # drops any residual overlay, trusts the latest API snapshot, logs a
     # critical recovery event, and resumes trading from API state.

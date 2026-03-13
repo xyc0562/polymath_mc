@@ -1480,6 +1480,99 @@ class KellyExecutor:
         self._prune_overlay_ledger()
         return consumed
 
+    def _overlay_api_tolerance_shares(self, api_shares: float) -> float:
+        """Convert the configured API-relative tolerance into shares."""
+        fraction = max(
+            0.0,
+            self.config.rate_limit.overlay_reconciliation_api_tolerance_fraction,
+        )
+        max_shares = max(
+            self._overlay_size_epsilon,
+            self.config.rate_limit.overlay_reconciliation_api_tolerance_max_shares,
+        )
+        reference = max(abs(api_shares), 1.0)
+        return max(self._overlay_size_epsilon, min(reference * fraction, max_shares))
+
+    def _clear_overlay_with_api_tolerance(
+        self,
+        current_snapshot: Portfolio,
+    ) -> None:
+        """
+        Clear tiny residual overlay fragments that are close to API truth.
+
+        This handles the case where the API reports a position that is very
+        close to the locally expected post-fill state, but not exact, leaving a
+        small same-direction residual that would otherwise age into a freeze.
+        """
+        if not self._overlay_ledger:
+            return
+
+        touched_slots = {
+            (fragment.bin_index, fragment.position_kind)
+            for fragment in self._overlay_ledger
+            if fragment.remaining_size > self._overlay_size_epsilon
+        }
+
+        for bin_index, position_kind in touched_slots:
+            buy_total = sum(
+                fragment.remaining_size
+                for fragment in self._overlay_ledger
+                if fragment.bin_index == bin_index
+                and fragment.position_kind == position_kind
+                and fragment.is_buy
+            )
+            sell_total = sum(
+                fragment.remaining_size
+                for fragment in self._overlay_ledger
+                if fragment.bin_index == bin_index
+                and fragment.position_kind == position_kind
+                and not fragment.is_buy
+            )
+
+            # Do not net opposite residuals away here. This pass is only for
+            # same-direction "API is close enough" cleanup.
+            if (
+                buy_total > self._overlay_size_epsilon
+                and sell_total > self._overlay_size_epsilon
+            ):
+                continue
+
+            residual = buy_total - sell_total
+            if abs(residual) <= self._overlay_size_epsilon:
+                continue
+
+            api_position = current_snapshot.get_position(bin_index)
+            if api_position is None:
+                api_shares = 0.0
+            elif position_kind == "YES":
+                api_shares = api_position.yes_shares
+            else:
+                api_shares = api_position.no_shares
+            tolerance = self._overlay_api_tolerance_shares(api_shares)
+            if abs(residual) > tolerance:
+                continue
+
+            direction = "buy" if residual > 0 else "sell"
+            for fragment in self._overlay_ledger:
+                if fragment.bin_index != bin_index:
+                    continue
+                if fragment.position_kind != position_kind:
+                    continue
+                if direction == "buy" and not fragment.is_buy:
+                    continue
+                if direction == "sell" and fragment.is_buy:
+                    continue
+                fragment.remaining_size = 0.0
+
+            logger.info(
+                f"[{self.event_name}][INTEGRITY] Cleared residual overlay within API tolerance: "
+                f"bin={bin_index} {position_kind} residual={residual:+.2f} shares "
+                f"api={api_shares:.2f} tol={tolerance:.2f} "
+                f"(fraction={self.config.rate_limit.overlay_reconciliation_api_tolerance_fraction:.3f})"
+            )
+
+        self._prune_overlay_ledger()
+
     def _reconcile_overlay_against_api(
         self,
         previous_snapshot: Optional[Portfolio],
@@ -1547,6 +1640,7 @@ class KellyExecutor:
                     f"accepting remainder as authoritative API move"
                 )
 
+        self._clear_overlay_with_api_tolerance(current_snapshot)
         self._prune_overlay_ledger()
         if not self._overlay_ledger and self._integrity_state.frozen:
             self._clear_integrity_freeze("overlay_reconciled")

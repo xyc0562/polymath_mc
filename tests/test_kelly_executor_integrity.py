@@ -2,6 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import pytest
+
 from src.algo.musk_tweet_count.kelly import candidates as candidates_module
 from src.algo.musk_tweet_count.kelly import executor as executor_module
 from src.algo.musk_tweet_count.kelly.candidates import TradeAction, TradeCandidate, generate_candidates
@@ -148,6 +150,105 @@ def test_unmatched_api_delta_is_accepted_without_freeze():
     assert integrity["unmatched_api_delta_count"] == 1
 
 
+def test_overlay_residual_within_api_tolerance_is_cleared(caplog):
+    executor = _make_executor(
+        capital=200.0,
+        rate_limit=RateLimitConfig(
+            overlay_reconciliation_api_tolerance_fraction=0.05,
+        ),
+    )
+    candidate = _make_candidate(size=20.0, price=0.25)
+    fill = _make_fill(size=20.0, price=0.25, match_id="match-tol")
+
+    executor._record_confirmed_fill(
+        fill_key="match-tol",
+        order_id=fill.order_id,
+        candidate=candidate,
+        token_id="yes-0",
+        fill_event=fill,
+        now=10.0,
+    )
+
+    previous_api = executor.api_base_portfolio._copy()
+    current_api = executor.api_base_portfolio._copy()
+    current_api.execute_buy_yes(0, 19.3, 0.25, "yes-0")
+
+    with caplog.at_level(logging.INFO):
+        executor._reconcile_overlay_against_api(previous_api, current_api)
+
+    integrity = executor.get_integrity_summary()
+    assert integrity["overlay_entries"] == 0
+    assert integrity["frozen"] is False
+    assert "Cleared residual overlay within API tolerance" in caplog.text
+
+
+def test_overlay_residual_above_api_tolerance_is_retained():
+    executor = _make_executor(
+        capital=200.0,
+        rate_limit=RateLimitConfig(
+            overlay_reconciliation_api_tolerance_fraction=0.05,
+        ),
+    )
+    candidate = _make_candidate(size=20.0, price=0.25)
+    fill = _make_fill(size=20.0, price=0.25, match_id="match-notol")
+
+    executor._record_confirmed_fill(
+        fill_key="match-notol",
+        order_id=fill.order_id,
+        candidate=candidate,
+        token_id="yes-0",
+        fill_event=fill,
+        now=10.0,
+    )
+
+    previous_api = executor.api_base_portfolio._copy()
+    current_api = executor.api_base_portfolio._copy()
+    current_api.execute_buy_yes(0, 18.0, 0.25, "yes-0")
+
+    executor._reconcile_overlay_against_api(previous_api, current_api)
+
+    integrity = executor.get_integrity_summary()
+    assert integrity["overlay_entries"] == 1
+    assert integrity["frozen"] is False
+
+
+def test_overlay_api_tolerance_is_capped_for_large_positions():
+    executor = _make_executor(
+        capital=1_000.0,
+        rate_limit=RateLimitConfig(
+            overlay_reconciliation_api_tolerance_fraction=0.05,
+            overlay_reconciliation_api_tolerance_max_shares=1.0,
+        ),
+    )
+    candidate = _make_candidate(size=20.0, price=0.25)
+    fill = _make_fill(size=20.0, price=0.25, match_id="match-cap")
+
+    executor._record_confirmed_fill(
+        fill_key="match-cap",
+        order_id=fill.order_id,
+        candidate=candidate,
+        token_id="yes-0",
+        fill_event=fill,
+        now=10.0,
+    )
+
+    executor.api_base_portfolio.execute_buy_yes(0, 480.0, 0.25, "yes-0")
+    executor.portfolio = executor.api_base_portfolio
+    previous_api = executor.api_base_portfolio._copy()
+    current_api = executor.api_base_portfolio._copy()
+    current_api.execute_buy_yes(0, 18.5, 0.25, "yes-0")
+    executor.api_base_portfolio = current_api
+    executor.portfolio = current_api
+
+    assert executor._overlay_api_tolerance_shares(498.5) == 1.0
+
+    executor._reconcile_overlay_against_api(previous_api, current_api)
+
+    integrity = executor.get_integrity_summary()
+    assert integrity["overlay_entries"] == 1
+    assert integrity["frozen"] is False
+
+
 def test_duplicate_confirmed_fill_with_conflicting_economics_freezes():
     executor = _make_executor()
     candidate = _make_candidate(size=10.0, price=0.2)
@@ -273,6 +374,48 @@ def test_kelly_bot_status_exposes_integrity_fields():
     assert status["integrity"]["overlay_entries"] == 3
     assert status["pending_orders"]["count"] == 2
     assert status["pending_orders"]["collateral"] == 12.5
+
+
+def test_sync_positions_api_failure_preserves_portfolio_state(monkeypatch):
+    bot = KellyTradingBot(
+        clob_client=object(),
+        config=KellyConfig(),
+        probability_model=lambda *_args: [1.0],
+        dry_run=False,
+        wallet_address="0xabc",
+        event_name="sync-failure",
+    )
+    bot._setup_complete = True
+    bot.bin_token_ids = {0: "yes-0"}
+    bot.bin_no_token_ids = {0: "no-0"}
+    bot.portfolio = Portfolio(
+        initial_capital=100.0,
+        capital=80.0,
+        num_bins=1,
+        probabilities=[1.0],
+    )
+    bot.portfolio.execute_buy_yes(0, 10.0, 0.2, "yes-0")
+
+    before = bot.portfolio._copy()
+
+    async def fail_fetch_positions(_wallet_address):
+        raise RuntimeError("408 Request Timeout")
+
+    async def fake_balance():
+        return 999.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fail_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_balance)
+
+    with pytest.raises(RuntimeError, match="408"):
+        asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.yes_shares == before.get_position(0).yes_shares
+    assert position.yes_avg_cost == before.get_position(0).yes_avg_cost
+    assert bot.portfolio.capital == before.capital
+    assert bot.portfolio.total_collateral_used == before.total_collateral_used
 
 
 def test_generate_candidates_logs_sell_candidates_in_priority_order(monkeypatch, caplog):
