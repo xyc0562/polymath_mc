@@ -21,13 +21,14 @@ import math
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
 
 from .config import KellyConfig
-from .orderbook import UnifiedOrderbook
+from .orderbook import OrderbookLevel, UnifiedOrderbook, compute_vwap
 from .orderbook import (
     compute_vwap_buy_no,
     compute_vwap_buy_yes,
@@ -60,6 +61,28 @@ def _round_price_to_tick(price: float, tick_size: str) -> float:
     """Round price the same way py-clob-client does for a given tick_size."""
     dp = len(tick_size.rstrip("0").split(".")[-1]) if "." in tick_size else 0
     return round(price * (10**dp)) / (10**dp)
+
+
+def _tick_decimals(tick_size: str) -> int:
+    """Return decimal precision implied by a tick size string."""
+    if "." not in tick_size:
+        return 0
+    return len(tick_size.rstrip("0").split(".")[-1])
+
+
+def _snap_price_to_tick(price: float, tick_size: str, mode: str) -> float:
+    """Snap a price to the tick grid without crossing the requested bound."""
+    tick = Decimal(str(tick_size))
+    value = Decimal(str(price))
+    units = value / tick
+    if mode == "floor":
+        snapped_units = units.to_integral_value(rounding=ROUND_FLOOR)
+    elif mode == "ceil":
+        snapped_units = units.to_integral_value(rounding=ROUND_CEILING)
+    else:
+        raise ValueError(f"Unsupported snap mode: {mode}")
+    snapped = snapped_units * tick
+    return float(snapped)
 
 
 def _fak_size_step(price: float, tick_size: str = None) -> int:
@@ -153,6 +176,21 @@ class TickResult:
     total_utility_gain: float
     executions: List[ExecutionResult] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+
+
+@dataclass
+class SubmissionResolution:
+    """Resolved live submission parameters for a single FAK order."""
+
+    requested_size: int
+    requested_limit_price: float
+    execution_bound_price: float
+    submitted_size: int
+    submitted_limit_price: float
+    submitted_vwap: float
+    submitted_worst_price: float
+    price_moved: bool
+    size_reduced: bool
 
 
 @dataclass
@@ -380,6 +418,13 @@ class OrderExecutor:
             )
         return diagnostics
 
+    def get_tick_size(self, token_id: str) -> str:
+        """Return the market tick size for a token, falling back safely."""
+        try:
+            return self.client.get_tick_size(token_id)
+        except Exception:
+            return "0.01"
+
     def place_limit_order(
         self,
         token_id: str,
@@ -545,10 +590,7 @@ class OrderExecutor:
         for order in orders:
             tid = order["token_id"]
             if tid not in tick_sizes:
-                try:
-                    tick_sizes[tid] = self.client.get_tick_size(tid)
-                except Exception:
-                    tick_sizes[tid] = "0.01"  # safe default
+                tick_sizes[tid] = self.get_tick_size(tid)
 
         for i, order in enumerate(orders):
             rounded_size = math.floor(order["size"])
@@ -607,7 +649,14 @@ class OrderExecutor:
                 rounded_price = _round_price_to_tick(price, ts) if ts else price
                 maker_amount = rounded_size * rounded_price
                 if _has_more_than_2dp(maker_amount):
-                    # Try nearby prices for a better step (FAK fills at best price anyway)
+                    if order.get("fak_resolved"):
+                        logger.warning(
+                            f"[{self.event_name}][BATCH] Pre-resolved BUY still violates 2dp maker_amount "
+                            f"(size={rounded_size}, price={price:.4f}, maker_amt=${maker_amount:.4f}), skipping order {i}"
+                        )
+                        continue
+
+                    # Backward-compatible fallback for callers that do not pre-resolve.
                     adj_price, adjusted_size = _best_fak_price(price, rounded_size, "BUY", tick_size=ts)
                     if adjusted_size < 1 or adjusted_size * adj_price < MIN_ORDER_VALUE_USD:
                         logger.warning(
@@ -629,6 +678,9 @@ class OrderExecutor:
                         )
                     rounded_size = adjusted_size
                     price = adj_price
+
+            order["price"] = price
+            order["size"] = rounded_size
 
             logger.info(
                 f"[{self.event_name}][BATCH ORDER {i}] {order['side']} "
@@ -1033,6 +1085,7 @@ class KellyExecutor:
             edge=candidate.edge,
             limit_price=candidate.limit_price,
             threshold_price=candidate.threshold_price,
+            execution_bound_price=candidate.execution_bound_price,
         )
 
     def _fresh_start_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
@@ -1105,6 +1158,208 @@ class KellyExecutor:
             return worst_price <= allowed_worst_price + eps
         return worst_price + eps >= allowed_worst_price
 
+    @staticmethod
+    def _trade_execution_bound(candidate: TradeCandidate) -> float:
+        """Return the active directional execution bound for a trade."""
+        if candidate.execution_bound_price > 0:
+            return candidate.execution_bound_price
+        if candidate.threshold_price > 0:
+            return candidate.threshold_price
+        return candidate.limit_price if candidate.limit_price > 0 else candidate.price
+
+    def _get_tick_size_for_token(self, token_id: str) -> str:
+        """Return tick size for a token without assuming a concrete executor implementation."""
+        if self.order_executor is not None:
+            getter = getattr(self.order_executor, "get_tick_size", None)
+            if callable(getter):
+                try:
+                    return getter(token_id)
+                except Exception:
+                    pass
+            client = getattr(self.order_executor, "client", None)
+            if client is not None and hasattr(client, "get_tick_size"):
+                try:
+                    return client.get_tick_size(token_id)
+                except Exception:
+                    pass
+        return "0.01"
+
+    @staticmethod
+    def _limit_orderbook_levels(
+        orderbook: UnifiedOrderbook,
+        action: TradeAction,
+        limit_price: float,
+    ) -> List[OrderbookLevel]:
+        """Return executable orderbook levels at a specific FAK limit price."""
+        eps = 1e-9
+        if action == TradeAction.BUY_YES:
+            return [
+                level for level in orderbook.yes_asks
+                if level.price <= limit_price + eps
+            ]
+        if action == TradeAction.SELL_YES:
+            return [
+                level for level in orderbook.yes_bids
+                if level.price + eps >= limit_price
+            ]
+        if action == TradeAction.BUY_NO:
+            return [
+                OrderbookLevel(price=1.0 - level.price, size=level.size)
+                for level in orderbook.yes_bids
+                if (1.0 - level.price) <= limit_price + eps
+            ]
+        if action == TradeAction.SELL_NO:
+            return [
+                OrderbookLevel(price=1.0 - level.price, size=level.size)
+                for level in orderbook.yes_asks
+                if (1.0 - level.price) + eps >= limit_price
+            ]
+        return []
+
+    @classmethod
+    def _evaluate_submission_at_limit(
+        cls,
+        orderbook: UnifiedOrderbook,
+        action: TradeAction,
+        limit_price: float,
+        requested_size: int,
+        tick_size: str,
+    ) -> Optional[tuple[int, float, float]]:
+        """Return executable (size, vwap, worst) for a specific limit price."""
+        if requested_size < 1:
+            return None
+
+        levels = cls._limit_orderbook_levels(orderbook, action, limit_price)
+        if not levels:
+            return None
+
+        visible_size = math.floor(sum(level.size for level in levels) + 1e-9)
+        if visible_size < 1:
+            return None
+
+        candidate_size = min(requested_size, visible_size)
+        if action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+            size_step = _fak_size_step(limit_price, tick_size)
+            if size_step > 1:
+                candidate_size = (candidate_size // size_step) * size_step
+            rounded_price = _round_price_to_tick(limit_price, tick_size)
+            if candidate_size < 1 or candidate_size * rounded_price + 1e-9 < MIN_ORDER_VALUE_USD:
+                return None
+        elif candidate_size < 1:
+            return None
+
+        vwap, filled, worst_price = compute_vwap(levels, float(candidate_size))
+        if filled + 1e-9 < candidate_size or worst_price <= 0:
+            return None
+
+        return int(candidate_size), vwap, worst_price
+
+    @staticmethod
+    def _enumerate_admissible_limit_prices(
+        action: TradeAction,
+        requested_limit_price: float,
+        execution_bound_price: float,
+        tick_size: str,
+    ) -> List[float]:
+        """Enumerate admissible limit prices on the token tick grid."""
+        tick = float(tick_size)
+        dp = _tick_decimals(tick_size)
+
+        if requested_limit_price <= 0 or execution_bound_price <= 0:
+            return []
+
+        if action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+            start = _snap_price_to_tick(requested_limit_price, tick_size, "ceil")
+            end = _snap_price_to_tick(execution_bound_price, tick_size, "floor")
+            if end <= 0 or end >= 1:
+                return []
+            if start > end + 1e-9:
+                return [round(end, dp)]
+            prices: List[float] = []
+            current = start
+            while current <= end + 1e-9:
+                prices.append(round(current, dp))
+                current += tick
+            return prices
+
+        start = _snap_price_to_tick(requested_limit_price, tick_size, "floor")
+        end = _snap_price_to_tick(execution_bound_price, tick_size, "ceil")
+        if end <= 0 or end >= 1:
+            return []
+        if start + 1e-9 < end:
+            return [round(end, dp)]
+        prices = []
+        current = start
+        while current + 1e-9 >= end:
+            prices.append(round(current, dp))
+            current -= tick
+        return prices
+
+    def _resolve_live_fak_submission(
+        self,
+        trade: TradeCandidate,
+        token_id: str,
+        orderbook: Optional[UnifiedOrderbook],
+        requested_size: float,
+        requested_limit_price: float,
+        execution_bound_price: float,
+    ) -> Optional[SubmissionResolution]:
+        """Resolve the final submitted live FAK order within the admissible price band."""
+        if orderbook is None:
+            return None
+
+        requested_int = max(0, math.floor(requested_size))
+        if requested_int < 1:
+            return None
+
+        tick_size = self._get_tick_size_for_token(token_id)
+        admissible_prices = self._enumerate_admissible_limit_prices(
+            trade.action,
+            requested_limit_price=requested_limit_price,
+            execution_bound_price=execution_bound_price,
+            tick_size=tick_size,
+        )
+        if not admissible_prices:
+            return None
+
+        requested_limit_price = float(requested_limit_price)
+        best_partial: Optional[SubmissionResolution] = None
+
+        for limit_price in admissible_prices:
+            evaluated = self._evaluate_submission_at_limit(
+                orderbook,
+                trade.action,
+                limit_price=limit_price,
+                requested_size=requested_int,
+                tick_size=tick_size,
+            )
+            if evaluated is None:
+                continue
+
+            submitted_size, submitted_vwap, submitted_worst = evaluated
+            resolution = SubmissionResolution(
+                requested_size=requested_int,
+                requested_limit_price=requested_limit_price,
+                execution_bound_price=execution_bound_price,
+                submitted_size=submitted_size,
+                submitted_limit_price=limit_price,
+                submitted_vwap=submitted_vwap,
+                submitted_worst_price=submitted_worst,
+                price_moved=abs(limit_price - requested_limit_price) > 1e-9,
+                size_reduced=submitted_size < requested_int,
+            )
+
+            if submitted_size >= requested_int:
+                return resolution
+
+            if (
+                best_partial is None
+                or submitted_size > best_partial.submitted_size
+            ):
+                best_partial = resolution
+
+        return best_partial
+
     def _apply_fresh_start_market_impact(
         self,
         trades: List[TradeCandidate],
@@ -1132,10 +1387,11 @@ class KellyExecutor:
                 continue
 
             threshold_price = trade.threshold_price
+            execution_bound_price = self._trade_execution_bound(trade)
             if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
-                allowed_worst_price = best_price + alpha * (threshold_price - best_price)
+                allowed_worst_price = best_price + alpha * (execution_bound_price - best_price)
             else:
-                allowed_worst_price = best_price - alpha * (best_price - threshold_price)
+                allowed_worst_price = best_price - alpha * (best_price - execution_bound_price)
 
             requested_size = max(0, math.floor(trade.size))
             if requested_size < 1:
@@ -1197,6 +1453,7 @@ class KellyExecutor:
             clipped_trade.size = float(best_valid_size)
             clipped_trade.price = best_valid_metrics[0]
             clipped_trade.limit_price = best_valid_metrics[2]
+            clipped_trade.execution_bound_price = allowed_worst_price
 
             if clipped_trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
                 maker_amount = clipped_trade.size * clipped_trade.limit_price
@@ -2023,18 +2280,24 @@ class KellyExecutor:
                         "side": side,
                         "price": fak_price,
                         "size": trade.size,
+                        "execution_bound_price": self._trade_execution_bound(trade),
                     })
                     trade_token_pairs.append((trade, token_id))
 
                 if not order_specs:
                     break
 
-                # Merge orders for same (token_id, side, price)
+                # Merge orders for same (token_id, side, price, execution_bound_price)
                 merged_specs = []
                 merged_trade_pairs = []
                 merge_key_to_idx = {}
                 for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
-                    key = (spec["token_id"], spec["side"], spec["price"])
+                    key = (
+                        spec["token_id"],
+                        spec["side"],
+                        spec["price"],
+                        spec["execution_bound_price"],
+                    )
                     if key in merge_key_to_idx:
                         idx = merge_key_to_idx[key]
                         merged_specs[idx]["size"] += spec["size"]
@@ -2044,12 +2307,55 @@ class KellyExecutor:
                         merged_specs.append(dict(spec))
                         merged_trade_pairs.append([(trade, token_id)])
 
-                order_specs = merged_specs
+                resolved_specs = []
                 trade_token_pairs = []
                 for spec, pairs in zip(merged_specs, merged_trade_pairs):
                     trade, token_id = pairs[0]
-                    trade.size = spec["size"]
+                    orderbook = orderbooks.get(trade.bin_index)
+                    resolution = self._resolve_live_fak_submission(
+                        trade,
+                        token_id=token_id,
+                        orderbook=orderbook,
+                        requested_size=spec["size"],
+                        requested_limit_price=spec["price"],
+                        execution_bound_price=spec["execution_bound_price"],
+                    )
+                    if resolution is None or resolution.submitted_size < 1:
+                        logger.info(
+                            f"[{self.event_name}] Skipped {trade.action.value} bin={trade.bin_index}: "
+                            f"requested={spec['size']:.2f}@{spec['price']:.4f} "
+                            f"bound={spec['execution_bound_price']:.4f} "
+                            f"reason=not_executable_within_band"
+                        )
+                        iter_results.append((trade, "SKIPPED: not_executable_within_band"))
+                        continue
+
+                    original_size = float(spec["size"])
+                    trade.size = float(resolution.submitted_size)
+                    trade.limit_price = resolution.submitted_limit_price
+                    trade.price = resolution.submitted_vwap
+                    trade.execution_bound_price = resolution.execution_bound_price
+                    if resolution.size_reduced and original_size > 0:
+                        trade.utility_gain *= trade.size / original_size
+
+                    logger.info(
+                        f"[{self.event_name}] Submission resolve {trade.action.value} bin={trade.bin_index}: "
+                        f"requested={resolution.requested_size} @ limit {resolution.requested_limit_price:.4f} "
+                        f"bound={resolution.execution_bound_price:.4f} -> "
+                        f"submitted={resolution.submitted_size} @ limit {resolution.submitted_limit_price:.4f} "
+                        f"vwap={resolution.submitted_vwap:.4f} worst={resolution.submitted_worst_price:.4f}"
+                    )
+
+                    submitted_spec = dict(spec)
+                    submitted_spec["price"] = resolution.submitted_limit_price
+                    submitted_spec["size"] = resolution.submitted_size
+                    submitted_spec["fak_resolved"] = True
+                    resolved_specs.append(submitted_spec)
                     trade_token_pairs.append((trade, token_id))
+
+                order_specs = resolved_specs
+                if not order_specs:
+                    break
 
                 # Batch submit
                 batch_response = self.order_executor.place_batch_orders(order_specs)
@@ -2899,9 +3205,23 @@ class KellyExecutor:
                         existing.threshold_price = min(existing.threshold_price, t.threshold_price)
                     else:
                         existing.threshold_price = max(existing.threshold_price, t.threshold_price)
+                    if existing.execution_bound_price > 0 and t.execution_bound_price > 0:
+                        existing.execution_bound_price = min(
+                            existing.execution_bound_price,
+                            t.execution_bound_price,
+                        )
+                    else:
+                        existing.execution_bound_price = max(
+                            existing.execution_bound_price,
+                            t.execution_bound_price,
+                        )
                 else:
                     existing.limit_price = min(existing.limit_price, t.limit_price) if existing.limit_price > 0 else t.limit_price
                     existing.threshold_price = max(existing.threshold_price, t.threshold_price)
+                    existing.execution_bound_price = max(
+                        existing.execution_bound_price,
+                        t.execution_bound_price,
+                    )
             else:
                 # Clone to avoid mutating the original
                 merged[key] = TradeCandidate(
@@ -2914,6 +3234,7 @@ class KellyExecutor:
                     edge=t.edge,
                     limit_price=t.limit_price,
                     threshold_price=t.threshold_price,
+                    execution_bound_price=t.execution_bound_price,
                 )
 
         return list(merged.values())
@@ -3294,7 +3615,8 @@ class KellyExecutor:
             f"[{self.event_name}][TRADE #{self._trade_count}] {now} | T-{hours_left:.1f}h | {action} bin={bin_idx} ({bin_range})"
         )
         logger.info(
-            f"  → {size:.1f} shares @ {price:.3f} = ${collateral:.2f} | "
+            f"  → {size:.1f} shares @ {price:.3f} (limit={candidate.limit_price:.3f}, "
+            f"bound={self._trade_execution_bound(candidate):.3f}) = ${collateral:.2f} | "
             f"model={model_prob:.1%} mkt={mkt_prob:.1%} edge={candidate.edge:+.1%} odds={odds:.1f}x"
         )
         logger.info(

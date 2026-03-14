@@ -60,6 +60,7 @@ def _make_trade(
     price: float,
     limit_price: float,
     threshold_price: float,
+    execution_bound_price: float | None = None,
 ) -> TradeCandidate:
     return TradeCandidate(
         bin_index=0,
@@ -71,6 +72,7 @@ def _make_trade(
         edge=0.05,
         limit_price=limit_price,
         threshold_price=threshold_price,
+        execution_bound_price=execution_bound_price if execution_bound_price is not None else threshold_price,
     )
 
 
@@ -108,6 +110,7 @@ def test_candidate_threshold_prices_cover_buy_and_sell_paths():
     )
     assert buy_yes is not None
     assert round(buy_yes.threshold_price, 4) == 0.28
+    assert round(buy_yes.execution_bound_price, 4) == 0.28
 
     buy_no_orderbook = _make_orderbook(
         yes_bids=[(0.40, 100)],
@@ -123,6 +126,7 @@ def test_candidate_threshold_prices_cover_buy_and_sell_paths():
     )
     assert buy_no is not None
     assert round(buy_no.threshold_price, 4) == 0.68
+    assert round(buy_no.execution_bound_price, 4) == 0.68
 
     sell_yes_portfolio = _make_portfolio(probabilities=[0.32, 0.68])
     sell_yes_portfolio.execute_buy_yes(0, 20.0, 0.20, "yes-0")
@@ -141,6 +145,7 @@ def test_candidate_threshold_prices_cover_buy_and_sell_paths():
     )
     assert sell_yes is not None
     assert round(sell_yes.threshold_price, 4) == 0.32
+    assert round(sell_yes.execution_bound_price, 4) == 0.32
 
     sell_no_portfolio = _make_portfolio(probabilities=[0.25, 0.75])
     sell_no_portfolio.execute_buy_no(0, 20.0, 0.60, "yes-0")
@@ -159,6 +164,7 @@ def test_candidate_threshold_prices_cover_buy_and_sell_paths():
     )
     assert sell_no is not None
     assert round(sell_no.threshold_price, 4) == 0.72
+    assert round(sell_no.execution_bound_price, 4) == 0.72
 
 
 def test_fresh_start_buy_throttle_blocks_large_low_price_walk():
@@ -181,6 +187,7 @@ def test_fresh_start_buy_throttle_blocks_large_low_price_walk():
     assert throttled[0].size == 100.0
     assert throttled[0].price == 0.01
     assert throttled[0].limit_price == 0.01
+    assert throttled[0].execution_bound_price == 0.0125
 
 
 def test_fresh_start_buy_throttle_allows_modest_mid_price_walk():
@@ -203,6 +210,7 @@ def test_fresh_start_buy_throttle_allows_modest_mid_price_walk():
     assert throttled[0].size == 20.0
     assert round(throttled[0].price, 4) == 0.505
     assert throttled[0].limit_price == 0.51
+    assert round(throttled[0].execution_bound_price, 4) == 0.51
 
 
 def test_fresh_start_sell_throttle_uses_sell_side_threshold():
@@ -225,6 +233,7 @@ def test_fresh_start_sell_throttle_uses_sell_side_threshold():
     assert throttled[0].size == 20.0
     assert round(throttled[0].price, 4) == 0.795
     assert throttled[0].limit_price == 0.79
+    assert round(throttled[0].execution_bound_price, 4) == 0.79
 
 
 def test_fresh_start_throttle_active_within_twenty_minutes_only():

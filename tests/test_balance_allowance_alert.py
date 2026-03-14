@@ -26,6 +26,7 @@ def test_balance_allowance_error_callback_includes_local_and_clob_context():
         reservation_price=0.39,
         edge=0.1282,
         limit_price=0.441,
+        execution_bound_price=0.441,
     )
 
     captured = []

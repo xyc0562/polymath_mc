@@ -102,6 +102,7 @@ class TradeCandidate:
     edge: float  # Edge = |market - reservation| / reservation
     limit_price: float = 0.0  # Worst orderbook level consumed (actual tick price for FAK)
     threshold_price: float = 0.0  # Worst economically acceptable execution price this tick
+    execution_bound_price: float = 0.0  # Directional live execution bound after guards/caps
 
     @property
     def cost(self) -> float:
@@ -666,6 +667,7 @@ def _generate_buy_yes_candidate(
         edge=actual_edge,
         limit_price=worst_price,
         threshold_price=compute_buy_threshold(reservation_price, config.edge_buffer),
+        execution_bound_price=threshold,
     )
 
 
@@ -804,6 +806,7 @@ def _generate_sell_yes_candidate(
         edge=actual_edge,
         limit_price=worst_price,
         threshold_price=threshold_price,
+        execution_bound_price=threshold_price,
     )
 
 
@@ -922,6 +925,7 @@ def _generate_buy_no_candidate(
         edge=actual_edge,
         limit_price=worst_price,
         threshold_price=1.0 - compute_buy_no_threshold(1.0 - reservation_price, config.edge_buffer),
+        execution_bound_price=1.0 - yes_threshold,
     )
 
 
@@ -1062,6 +1066,7 @@ def _generate_sell_no_candidate(
         edge=actual_edge,
         limit_price=worst_price,
         threshold_price=threshold_price,
+        execution_bound_price=threshold_price,
     )
 
 
