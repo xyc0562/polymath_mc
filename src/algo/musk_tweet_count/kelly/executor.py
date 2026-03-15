@@ -44,7 +44,7 @@ from .candidates import (
     MIN_ORDER_VALUE_USD,
 )
 from .websocket_client import OrderbookManager
-from .market_aware import compute_robust_kelly_fraction
+from .market_signals import compute_robust_kelly_fraction
 
 if TYPE_CHECKING:
     from .user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus

@@ -26,7 +26,7 @@ from .replay_seed import (
 from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, EventTradingRulesConfig
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import KellyExecutor, TickResult
-from ..kelly.market_aware import compute_market_aware_blend
+from ..kelly.market_signals import compute_market_consensus_blend
 from ..kelly.backtest_backend import (
     SimulationConfig,
     BacktestOrderbookProvider,
@@ -490,28 +490,29 @@ class UnifiedBacktestRunner:
             simulated_obs = self.price_provider.get_all_orderbooks(event, ts)
             orderbook_provider.update_from_simulated(simulated_obs, ts)
 
-            probabilities, blend_context = compute_market_aware_blend(
+            # Calculate hours to settlement before any quote-aware probability shaping.
+            hours_to_settlement = (settlement_dt - dt).total_seconds() / 3600.0
+
+            probabilities, blend_context = compute_market_consensus_blend(
                 probabilities=probabilities,
                 dead_bins=dead_bins,
                 orderbooks=simulated_obs,
-                market_config=self.config.trading.market_aware,
+                consensus_config=self.config.trading.market_consensus,
+                hours_remaining=hours_to_settlement,
             )
             if blend_context is not None:
                 logger.debug(
-                    "  Market-aware blend: lambda=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
-                    blend_context["blend"],
+                    "  Market consensus blend: alpha=%.3f coverage=%.2f avg_spread=%.3f gap=%.3f",
+                    blend_context["alpha"],
                     blend_context["coverage_ratio"],
                     blend_context["avg_spread"],
-                    blend_context["disagreement"],
+                    blend_context["gap"],
                 )
 
             # Update portfolio with new probabilities and dead bins
             portfolio.probabilities = probabilities
             portfolio.dead_bins = dead_bins
             portfolio.num_bins = num_bins
-
-            # Calculate hours to settlement
-            hours_to_settlement = (settlement_dt - dt).total_seconds() / 3600.0
 
             # Store context for verbose logging
             self._current_tick_context = {

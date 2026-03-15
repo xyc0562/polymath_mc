@@ -14,7 +14,7 @@ import logging
 import math
 
 from .config import KellyConfig, EdgeBufferConfig
-from .market_aware import compute_market_buy_guard
+from .market_signals import compute_market_buy_guard, compute_market_quote_context
 from .orderbook import (
     UnifiedOrderbook,
     compute_vwap_buy_yes,
@@ -344,6 +344,17 @@ def generate_candidates(
         orderbooks=orderbooks,
         guard_config=config.market_buy_guard,
     )
+    consensus_quote_context = compute_market_quote_context(
+        probabilities=portfolio.probabilities,
+        dead_bins=portfolio.dead_bins,
+        orderbooks=orderbooks,
+        market_config=config.market_consensus,
+    ) if config.market_consensus.enabled else None
+    trusted_consensus_bins = (
+        consensus_quote_context["trusted_bin_set"]
+        if consensus_quote_context is not None
+        else set()
+    )
     if buy_guard is not None:
         logger.debug(
             "Market buy guard active: widen=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
@@ -422,19 +433,29 @@ def generate_candidates(
             no_is_stranded = no_shares < MIN_ORDER_SIZE or no_value < MIN_ORDER_VALUE_USD
         if not has_no or no_is_stranded:
             if yes_liquidity_ok:
-                candidate = _generate_buy_yes_candidate(
-                    bin_index=bin_index,
-                    orderbook=orderbook,
-                    portfolio=portfolio,
-                    reservation_price=reservation_yes,
-                    config=config,
-                    hours_to_settlement=hours_to_settlement,
-                    buy_guard=buy_guard,
-                    verbose=verbose,
-                    rejection_reasons=rejection_reasons,
-                )
-                if candidate:
-                    candidates.append(candidate)
+                if (
+                    config.market_consensus.enabled
+                    and config.market_consensus.require_trusted_quote_for_buys
+                    and bin_index not in trusted_consensus_bins
+                ):
+                    if verbose:
+                        rejection_reasons.setdefault(bin_index, []).append(
+                            "BUY_YES: untrusted_quote_for_consensus"
+                        )
+                else:
+                    candidate = _generate_buy_yes_candidate(
+                        bin_index=bin_index,
+                        orderbook=orderbook,
+                        portfolio=portfolio,
+                        reservation_price=reservation_yes,
+                        config=config,
+                        hours_to_settlement=hours_to_settlement,
+                        buy_guard=buy_guard,
+                        verbose=verbose,
+                        rejection_reasons=rejection_reasons,
+                    )
+                    if candidate:
+                        candidates.append(candidate)
             elif verbose:
                 rejection_reasons.setdefault(bin_index, []).append(f"BUY_YES: {yes_reason}")
         elif verbose and has_no and not no_is_stranded:
@@ -475,19 +496,29 @@ def generate_candidates(
             yes_is_stranded = yes_shares < MIN_ORDER_SIZE or yes_value < MIN_ORDER_VALUE_USD
         if not has_yes or yes_is_stranded:
             if no_liquidity_ok:
-                candidate = _generate_buy_no_candidate(
-                    bin_index=bin_index,
-                    orderbook=orderbook,
-                    portfolio=portfolio,
-                    reservation_price=reservation_no,
-                    config=config,
-                    hours_to_settlement=hours_to_settlement,
-                    buy_guard=buy_guard,
-                    verbose=verbose,
-                    rejection_reasons=rejection_reasons,
-                )
-                if candidate:
-                    candidates.append(candidate)
+                if (
+                    config.market_consensus.enabled
+                    and config.market_consensus.require_trusted_quote_for_buys
+                    and bin_index not in trusted_consensus_bins
+                ):
+                    if verbose:
+                        rejection_reasons.setdefault(bin_index, []).append(
+                            "BUY_NO: untrusted_quote_for_consensus"
+                        )
+                else:
+                    candidate = _generate_buy_no_candidate(
+                        bin_index=bin_index,
+                        orderbook=orderbook,
+                        portfolio=portfolio,
+                        reservation_price=reservation_no,
+                        config=config,
+                        hours_to_settlement=hours_to_settlement,
+                        buy_guard=buy_guard,
+                        verbose=verbose,
+                        rejection_reasons=rejection_reasons,
+                    )
+                    if candidate:
+                        candidates.append(candidate)
             elif verbose:
                 rejection_reasons.setdefault(bin_index, []).append(f"BUY_NO: {no_reason}")
         elif verbose and has_yes and not yes_is_stranded:

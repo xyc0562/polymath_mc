@@ -149,30 +149,37 @@ class RateLimitConfig:
 
 
 @dataclass
-class MarketAwareConfig:
+class MarketConsensusConfig:
     """
-    Configuration for market-aware probability shrinkage.
+    Configuration for trusted-quote market consensus blending.
 
-    This is a small robust-Kelly layer that gently shrinks model probabilities
-    toward a market-implied distribution when quote coverage is good and the
-    model meaningfully disagrees with the market.
+    This is an optional probability-layer guardrail that blends only across
+    bins with strong two-sided quotes and can reject fresh BUY entries in bins
+    whose quotes are not trusted.
     """
 
-    # Enable market-aware shrinkage.
     enabled: bool = False
 
-    # Maximum blend weight toward market-implied probabilities.
-    max_blend: float = 0.15
+    # Time-based consensus damping.
+    time_enabled: bool = False
+    time_tau: float = 12.0
 
-    # Minimum fraction of live bins that must have two-sided quotes.
-    min_coverage_ratio: float = 0.50
+    # Gap-based consensus damping.
+    gap_enabled: bool = False
+    gap_scale: float = 0.5
+    gap_gamma: float = 1.5
+    gap_floor: float = 0.80
 
-    # If average mid spread exceeds this, disable the shrinkage.
+    # Global minimum model weight after combining alpha terms.
+    min_model_weight: float = 0.30
+
+    # Quote quality gates for the trusted-bin subset.
+    min_coverage_ratio: float = 0.85
     max_avg_spread: float = 0.06
+    max_bin_spread: float = 0.10
 
-    # Half-L1 disagreement scale at which the blend reaches max_blend.
-    # 0.5 * sum_i |p_model_i - p_mkt_i|
-    disagreement_scale: float = 0.20
+    # If enabled, new BUY entries must come from trusted bins.
+    require_trusted_quote_for_buys: bool = True
 
 
 @dataclass
@@ -180,7 +187,7 @@ class RobustKellyConfig:
     """
     Configuration for market-aware Kelly fraction haircuts.
 
-    Unlike market-aware probability shrinkage, this leaves the model
+    Unlike market consensus blending, this leaves the model
     probabilities unchanged and only reduces effective Kelly aggressiveness
     when the market strongly disagrees and quote quality is good enough
     to trust.
@@ -320,8 +327,8 @@ class KellyConfig:
     # Rate limiting
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
 
-    # Market-aware robust Kelly
-    market_aware: MarketAwareConfig = field(default_factory=MarketAwareConfig)
+    # Trusted-quote market consensus blending
+    market_consensus: MarketConsensusConfig = field(default_factory=MarketConsensusConfig)
 
     # Market-aware Kelly fraction haircuting
     robust_kelly: RobustKellyConfig = field(default_factory=RobustKellyConfig)
@@ -339,7 +346,9 @@ class KellyConfig:
         data.pop("adaptive_delta", None)  # Legacy field, ignored
         collateral_data = data.pop("collateral", {})
         rate_limit_data = data.pop("rate_limit", {})
-        market_aware_data = data.pop("market_aware", {})
+        if "market_aware" in data:
+            raise ValueError("market_aware config is no longer supported; use market_consensus")
+        market_consensus_data = data.pop("market_consensus", {})
         robust_kelly_data = data.pop("robust_kelly", {})
         market_buy_guard_data = data.pop("market_buy_guard", {})
 
@@ -364,7 +373,7 @@ class KellyConfig:
             market_impact=MarketImpactConfig(**market_impact_data),
             collateral=CollateralConfig(**collateral_data),
             rate_limit=RateLimitConfig(**rate_limit_data),
-            market_aware=MarketAwareConfig(**market_aware_data),
+            market_consensus=MarketConsensusConfig(**market_consensus_data),
             robust_kelly=RobustKellyConfig(**robust_kelly_data),
             market_buy_guard=MarketBuyGuardConfig(**market_buy_guard_data),
             **data,

@@ -52,7 +52,7 @@ from src.algo.musk_tweet_count.kelly.config import (
     CollateralConfig,
     EventTradingRulesConfig,
     MarketImpactConfig,
-    MarketAwareConfig,
+    MarketConsensusConfig,
     RobustKellyConfig,
     MarketBuyGuardConfig,
 )
@@ -61,6 +61,36 @@ from src.algo.musk_tweet_count.notifications import SlackNotifier
 
 logger = logging.getLogger(__name__)
 CONTRACT_UTILS = ContractDayUtils()
+
+
+def _resolve_consensus_mode(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> tuple[bool, bool]:
+    """Resolve consensus mode presets against explicit legacy flags."""
+    mode_to_flags = {
+        "off": (False, False),
+        "time_only": (True, False),
+        "gap_only": (False, True),
+        "time_gap": (True, True),
+    }
+    mode_time, mode_gap = mode_to_flags[args.consensus_mode]
+    flag_time = bool(args.consensus_time)
+    flag_gap = bool(args.consensus_gap)
+
+    if args.consensus_mode != "off":
+        if flag_time != mode_time and flag_time:
+            parser.error(
+                f"--consensus-mode {args.consensus_mode} conflicts with --consensus-time"
+            )
+        if flag_gap != mode_gap and flag_gap:
+            parser.error(
+                f"--consensus-mode {args.consensus_mode} conflicts with --consensus-gap"
+            )
+        args.consensus_time = mode_time
+        args.consensus_gap = mode_gap
+
+    return bool(args.consensus_time), bool(args.consensus_gap)
 
 
 def log_config_summary(
@@ -903,37 +933,85 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--market-aware",
+        "--consensus-time",
         action="store_true",
-        help="Shrink Kelly probabilities slightly toward market-implied mids when quote quality is good.",
+        help="Enable time-based trusted-quote consensus blending near settlement.",
     )
 
     parser.add_argument(
-        "--market-aware-max-blend",
-        type=float,
-        default=MarketAwareConfig.max_blend,
-        help=f"Maximum market-aware shrinkage weight. Default: {MarketAwareConfig.max_blend}.",
+        "--consensus-mode",
+        type=str,
+        choices=["off", "time_only", "gap_only", "time_gap"],
+        default="off",
+        help="Consensus preset mode. 'time_only' enables the recommended time-based blend without gap-based damping.",
     )
 
     parser.add_argument(
-        "--market-aware-min-coverage",
-        type=float,
-        default=MarketAwareConfig.min_coverage_ratio,
-        help=f"Minimum live-bin quote coverage for market-aware shrinkage. Default: {MarketAwareConfig.min_coverage_ratio}.",
+        "--consensus-gap",
+        action="store_true",
+        help="Enable gap-based trusted-quote consensus blending on large model-market disagreement.",
     )
 
     parser.add_argument(
-        "--market-aware-max-avg-spread",
+        "--consensus-time-tau",
         type=float,
-        default=MarketAwareConfig.max_avg_spread,
-        help=f"Maximum average YES mid spread to allow market-aware shrinkage. Default: {MarketAwareConfig.max_avg_spread}.",
+        default=MarketConsensusConfig.time_tau,
+        help=f"Time constant in hours for time-based consensus alpha. Default: {MarketConsensusConfig.time_tau}.",
     )
 
     parser.add_argument(
-        "--market-aware-disagreement-scale",
+        "--consensus-gap-scale",
         type=float,
-        default=MarketAwareConfig.disagreement_scale,
-        help=f"Half-L1 model-vs-market disagreement scale for full shrinkage. Default: {MarketAwareConfig.disagreement_scale}.",
+        default=MarketConsensusConfig.gap_scale,
+        help=f"Half-L1 disagreement scale for gap-based consensus alpha. Default: {MarketConsensusConfig.gap_scale}.",
+    )
+
+    parser.add_argument(
+        "--consensus-gap-gamma",
+        type=float,
+        default=MarketConsensusConfig.gap_gamma,
+        help=f"Curvature for gap-based consensus alpha. Default: {MarketConsensusConfig.gap_gamma}.",
+    )
+
+    parser.add_argument(
+        "--consensus-gap-floor",
+        type=float,
+        default=MarketConsensusConfig.gap_floor,
+        help=f"Minimum gap-based model weight before the combined floor. Default: {MarketConsensusConfig.gap_floor}.",
+    )
+
+    parser.add_argument(
+        "--consensus-min-model-weight",
+        type=float,
+        default=MarketConsensusConfig.min_model_weight,
+        help=f"Global minimum model weight after consensus blending. Default: {MarketConsensusConfig.min_model_weight}.",
+    )
+
+    parser.add_argument(
+        "--consensus-min-coverage",
+        type=float,
+        default=MarketConsensusConfig.min_coverage_ratio,
+        help=f"Minimum live-bin trusted-quote coverage for consensus blending. Default: {MarketConsensusConfig.min_coverage_ratio}.",
+    )
+
+    parser.add_argument(
+        "--consensus-max-avg-spread",
+        type=float,
+        default=MarketConsensusConfig.max_avg_spread,
+        help=f"Maximum average YES spread across trusted bins for consensus blending. Default: {MarketConsensusConfig.max_avg_spread}.",
+    )
+
+    parser.add_argument(
+        "--consensus-max-bin-spread",
+        type=float,
+        default=MarketConsensusConfig.max_bin_spread,
+        help=f"Maximum YES spread for a bin to count as trusted by consensus. Default: {MarketConsensusConfig.max_bin_spread}.",
+    )
+
+    parser.add_argument(
+        "--consensus-allow-untrusted-buys",
+        action="store_true",
+        help="Allow fresh BUY entries in bins without trusted quotes even when consensus mode is enabled.",
     )
 
     parser.add_argument(
@@ -1016,7 +1094,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="List all active Musk tweet events with IDs and exit",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    _resolve_consensus_mode(parser, args)
+    return args
 
 
 async def main() -> None:
@@ -1117,12 +1197,19 @@ async def main() -> None:
         edge_buffer=edge_buffer_config,
         market_impact=market_impact_config,
         collateral=collateral_config,
-        market_aware=MarketAwareConfig(
-            enabled=args.market_aware,
-            max_blend=args.market_aware_max_blend,
-            min_coverage_ratio=args.market_aware_min_coverage,
-            max_avg_spread=args.market_aware_max_avg_spread,
-            disagreement_scale=args.market_aware_disagreement_scale,
+        market_consensus=MarketConsensusConfig(
+            enabled=args.consensus_time or args.consensus_gap,
+            time_enabled=args.consensus_time,
+            time_tau=args.consensus_time_tau,
+            gap_enabled=args.consensus_gap,
+            gap_scale=args.consensus_gap_scale,
+            gap_gamma=args.consensus_gap_gamma,
+            gap_floor=args.consensus_gap_floor,
+            min_model_weight=args.consensus_min_model_weight,
+            min_coverage_ratio=args.consensus_min_coverage,
+            max_avg_spread=args.consensus_max_avg_spread,
+            max_bin_spread=args.consensus_max_bin_spread,
+            require_trusted_quote_for_buys=not args.consensus_allow_untrusted_buys,
         ),
         robust_kelly=RobustKellyConfig(
             enabled=args.robust_kelly,
@@ -1165,13 +1252,20 @@ async def main() -> None:
             args.bootstrap_full_hours,
             args.bootstrap_max_blend,
         )
-    if args.market_aware:
+    if args.consensus_time or args.consensus_gap:
         logger.info(
-            "Market-aware robust Kelly: enabled (max_blend=%.2f, min_coverage=%.2f, max_avg_spread=%.3f, disagreement_scale=%.2f)",
-            args.market_aware_max_blend,
-            args.market_aware_min_coverage,
-            args.market_aware_max_avg_spread,
-            args.market_aware_disagreement_scale,
+            "Market consensus: enabled (time=%s tau=%.1fh, gap=%s scale=%.2f gamma=%.2f floor=%.2f, min_model_weight=%.2f, min_coverage=%.2f, max_avg_spread=%.3f, max_bin_spread=%.3f, require_trusted_buys=%s)",
+            args.consensus_time,
+            args.consensus_time_tau,
+            args.consensus_gap,
+            args.consensus_gap_scale,
+            args.consensus_gap_gamma,
+            args.consensus_gap_floor,
+            args.consensus_min_model_weight,
+            args.consensus_min_coverage,
+            args.consensus_max_avg_spread,
+            args.consensus_max_bin_spread,
+            not args.consensus_allow_untrusted_buys,
         )
     if args.robust_kelly:
         logger.info(

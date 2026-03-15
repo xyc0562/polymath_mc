@@ -31,7 +31,7 @@ from .candidates import TradeCandidate
 from .executor import KellyExecutor, OrderExecutor, ExecutionResult, TickResult
 from .websocket_client import OrderbookManager, OrderbookWebSocket, WebSocketConfig
 from .kelly_math import identify_dead_bins, renormalize_probabilities
-from .market_aware import compute_market_aware_blend
+from .market_signals import compute_market_consensus_blend
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
 
 logger = logging.getLogger(__name__)
@@ -363,20 +363,21 @@ class KellyTradingBot:
                 probabilities = [p / total for p in probabilities]
         self._ema_probabilities = probabilities
 
-        probabilities, blend_context = compute_market_aware_blend(
+        probabilities, blend_context = compute_market_consensus_blend(
             probabilities=probabilities,
             dead_bins=dead_bins,
             orderbooks=orderbooks,
-            market_config=self.config.market_aware,
+            consensus_config=self.config.market_consensus,
+            hours_remaining=hours_remaining,
         )
         if blend_context is not None:
             logger.debug(
-                "[%s] Market-aware blend applied: lambda=%.3f coverage=%.2f avg_spread=%.3f disagreement=%.3f",
+                "[%s] Market consensus blend applied: alpha=%.3f coverage=%.2f avg_spread=%.3f gap=%.3f",
                 self.event_name,
-                blend_context["blend"],
+                blend_context["alpha"],
                 blend_context["coverage_ratio"],
                 blend_context["avg_spread"],
-                blend_context["disagreement"],
+                blend_context["gap"],
             )
 
         # Update portfolio
