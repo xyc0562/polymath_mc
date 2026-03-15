@@ -131,12 +131,16 @@ def extract_seed_state_from_log(
             content = _strip_log_prefix(raw_line)
 
             capital_match = capital_re.search(content)
-            if capital_match and capital_match.group("event") == event_name:
+            if capital_match and _normalize_event_name(capital_match.group("event")) == _normalize_event_name(event_name):
                 available_capital = float(capital_match.group("available"))
                 event_budget = float(capital_match.group("budget"))
                 continue
 
-            if f"[{event_name}][KELLY]" in content and "Synced from API" in content:
+            if (
+                "Synced from API" in content
+                and (matched_event := _extract_bracket_event_name(content))
+                and _normalize_event_name(matched_event) == _normalize_event_name(event_name)
+            ):
                 capture_positions = True
                 continue
 
@@ -227,3 +231,22 @@ def _position_from_log_snapshot(
 
     logger.debug("Ignoring empty seeded position for bin %s in %s", bin_index, event_name)
     return ReplaySeedPosition()
+
+
+def _extract_bracket_event_name(content: str) -> Optional[str]:
+    """Extract the leading [event] name from a structured log line."""
+    match = re.match(r"\[(?P<event>.+?)\]", content)
+    if match:
+        return match.group("event")
+    return None
+
+
+def _normalize_event_name(name: str) -> str:
+    """Normalize event labels like 'Mar 06 - Mar 13' and 'Mar 6 - Mar 13'."""
+
+    def _depad(match: re.Match[str]) -> str:
+        return str(int(match.group(0)))
+
+    normalized = re.sub(r"\b0\d\b", _depad, name)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()

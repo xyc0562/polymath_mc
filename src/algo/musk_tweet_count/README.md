@@ -487,6 +487,50 @@ For encrypted keys, password comes from:
 
 ---
 
+## Shadow Replay Diagnostics
+
+When production and backtest disagree, use the shadow replay tool in
+`src.algo.musk_tweet_count.backtest.shadow_compare` to compare a live log snapshot
+against a seeded replay tick.
+
+Use `compare` mode to inspect one snapshot:
+
+```bash
+python -m src.algo.musk_tweet_count.backtest.shadow_compare \
+  --mode compare \
+  --event 2026-03-13_Mar_6_-_Mar_13 \
+  --seed-from-log data/dumps/new_idea.log \
+  --seed-log-ts 2026-03-13T03:01:03Z \
+  --capital 1000 \
+  --projection asymmetric \
+  --intraday-mode bucket \
+  --historical-bootstrap
+```
+
+Use `sweep` mode to scan a window and flag the first point where replay can still
+trade while production is already blocked:
+
+```bash
+python -m src.algo.musk_tweet_count.backtest.shadow_compare \
+  --mode sweep \
+  --event 2026-03-13_Mar_6_-_Mar_13 \
+  --seed-from-log data/dumps/new_idea.log \
+  --sweep-start-ts 2026-03-13T03:00:00Z \
+  --sweep-end-ts 2026-03-13T15:16:03Z \
+  --sweep-min-gap-seconds 1800 \
+  --capital 1000 \
+  --projection asymmetric \
+  --intraday-mode bucket \
+  --historical-bootstrap
+```
+
+The tool automatically:
+1. matches zero-padded and non-zero-padded event labels
+2. follows the short delay between the forecast header and the synced Kelly block
+3. seeds replay from the production portfolio snapshot before running the next replay tick
+
+---
+
 ## Troubleshooting
 
 ### "No private key found"
