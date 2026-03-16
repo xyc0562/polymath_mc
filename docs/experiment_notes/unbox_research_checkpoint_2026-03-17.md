@@ -78,3 +78,24 @@ Delta:
 - Goal:
   - identify whether late relaxation adds a new low-quality near-settlement unbox
   - or changes the path indirectly by enabling later same-bin flips that alter subsequent inventory
+
+### Ongoing follow-up: `Mar 5 - Mar 7`
+- Current finding after direct log comparison:
+  - the previous `multi-bin` focus log had one accepted unbox on bin `4` at about `T-8.6h`
+  - the current rerun with `late relaxation disabled` still finishes at `+$15,376.08`, `64` trades, matching the current late-relax result exactly
+  - therefore the regression is **not** caused by the late-relax window itself
+  - the current late-relax log and the current no-late rerun have identical trade lines for this event
+- Practical implication:
+  - the earlier attribution to late relaxation was too strong
+  - the current code path has diverged from the older focused `multi-bin` run for some other reason
+- Evidence from logs:
+  - old focused multi-bin:
+    - `data/dumps/unbox_multibin_focus/2026-03-07_Mar_5_-_Mar_7.multibin.log`
+    - `+$16,204.93`, `57` trades
+    - one accepted unbox on bin `4`
+  - current code, no late relaxation:
+    - `data/dumps/unbox_time_focus/2026-03-07_Mar_5_-_Mar_7.multibin_recheck.log`
+    - `+$15,376.08`, `64` trades
+    - no accepted unboxes
+- Working hypothesis:
+  - the event path is diverging much earlier than the late-relax window, likely through ordinary trade sizing/selection sensitivity rather than the late unbox floor itself
