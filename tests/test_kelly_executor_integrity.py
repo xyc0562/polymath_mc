@@ -741,6 +741,140 @@ def test_sync_positions_uses_initial_value_for_missing_avg_price_and_blocks_cap_
     assert optimal_size < 2.0
 
 
+def test_find_optimal_size_on_buy_reprices_and_limits_by_capital(monkeypatch):
+    executor = _make_executor(capital=10.0, probabilities=[1.0])
+    candidate = _make_candidate(
+        action=TradeAction.BUY_YES,
+        size=100.0,
+        price=0.20,
+        bin_index=0,
+        utility_gain=0.02,
+        reservation_price=0.30,
+    )
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_asks=[(0.20, 10.0), (0.80, 100.0)],
+        )
+    }
+
+    def fake_check_overshoots(portfolio, candidate, test_size, orderbooks, hours_to_settlement, tick_config):
+        del hours_to_settlement
+        sized_candidate = executor._reprice_candidate_size(candidate, orderbooks, test_size)
+        return sized_candidate is None or not executor._repriced_buy_is_feasible(
+            portfolio,
+            sized_candidate,
+            tick_config,
+        )
+
+    monkeypatch.setattr(executor, "_check_overshoots_on", fake_check_overshoots)
+
+    optimal_size = executor._find_optimal_size_on(
+        executor.portfolio,
+        candidate,
+        orderbooks,
+        12.0,
+        executor.config,
+    )
+
+    sized_candidate = executor._reprice_candidate_size(candidate, orderbooks, optimal_size)
+    too_large_candidate = executor._reprice_candidate_size(candidate, orderbooks, optimal_size + 1.0)
+
+    assert optimal_size == pytest.approx(20.0)
+    assert sized_candidate is not None
+    assert sized_candidate.price == pytest.approx(0.50)
+    assert sized_candidate.size == pytest.approx(20.0)
+    assert sized_candidate.price * sized_candidate.size == pytest.approx(10.0)
+    assert too_large_candidate is not None
+    assert executor._repriced_buy_is_feasible(
+        executor.portfolio,
+        too_large_candidate,
+        executor.config,
+    ) is False
+
+
+def test_find_optimal_size_on_sell_chooses_interior_peak(monkeypatch):
+    executor = _make_executor(capital=100.0, probabilities=[1.0])
+    executor.portfolio.execute_buy_yes(0, 10.0, 0.25, "yes-0")
+    candidate = _make_candidate(
+        action=TradeAction.SELL_YES,
+        size=10.0,
+        price=0.85,
+        bin_index=0,
+        utility_gain=0.02,
+        reservation_price=0.70,
+    )
+    orderbooks = {0: _make_orderbook(bin_index=0, yes_bids=[(0.85, 20.0)])}
+
+    monkeypatch.setattr(executor, "_check_overshoots_on", lambda *args, **kwargs: False)
+
+    def fake_simulate_trade(portfolio, sized_candidate):
+        after = portfolio._copy()
+        after._mock_size = sized_candidate.size
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 16.0 - (after._mock_size - 4.0) ** 2,
+    )
+
+    optimal_size = executor._find_optimal_size_on(
+        executor.portfolio,
+        candidate,
+        orderbooks,
+        12.0,
+        executor.config,
+    )
+
+    assert optimal_size == pytest.approx(4.0)
+
+
+def test_find_optimal_size_on_sell_respects_anti_cycling_cap(monkeypatch):
+    executor = _make_executor(capital=100.0, probabilities=[1.0])
+    executor.portfolio.execute_buy_yes(0, 10.0, 0.25, "yes-0")
+    candidate = _make_candidate(
+        action=TradeAction.SELL_YES,
+        size=10.0,
+        price=0.85,
+        bin_index=0,
+        utility_gain=0.02,
+        reservation_price=0.70,
+    )
+    orderbooks = {0: _make_orderbook(bin_index=0, yes_bids=[(0.85, 20.0)])}
+
+    monkeypatch.setattr(
+        executor,
+        "_check_overshoots_on",
+        lambda portfolio, candidate, test_size, orderbooks, hours_to_settlement, tick_config: (
+            test_size > 6.0
+        ),
+    )
+
+    def fake_simulate_trade(portfolio, sized_candidate):
+        after = portfolio._copy()
+        after._mock_size = sized_candidate.size
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 25.0 - (after._mock_size - 8.0) ** 2,
+    )
+
+    optimal_size = executor._find_optimal_size_on(
+        executor.portfolio,
+        candidate,
+        orderbooks,
+        12.0,
+        executor.config,
+    )
+
+    assert optimal_size == pytest.approx(6.0)
+
+
 @pytest.mark.parametrize(
     ("is_no", "token_id", "shares", "price"),
     [
@@ -1180,11 +1314,16 @@ def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monk
         "_compute_portfolio_utility_gain",
         lambda before, after, config: {0: 0.005, 1: 0.020, 2: 0.030}[after._mock_candidate_bin],
     )
+    orderbooks = {
+        0: _make_orderbook(bin_index=0, yes_bids=[(0.72, 200.0)], yes_asks=[(0.74, 200.0)]),
+        1: _make_orderbook(bin_index=1, yes_bids=[(0.68, 200.0)], yes_asks=[(0.70, 200.0)]),
+        2: _make_orderbook(bin_index=2, yes_bids=[(0.08, 200.0)], yes_asks=[(0.10, 200.0)]),
+    }
 
     with caplog.at_level(logging.INFO):
         planned = executor._compute_optimal_trades(
             executor.portfolio,
-            {},
+            orderbooks,
             hours_to_settlement=12.0,
             verbose=True,
         )
@@ -1240,10 +1379,14 @@ def test_compute_optimal_trades_skips_sell_with_size_below_one(monkeypatch):
         "_compute_portfolio_utility_gain",
         lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
     )
+    orderbooks = {
+        0: _make_orderbook(bin_index=0, yes_bids=[(0.50, 100.0)], yes_asks=[(0.52, 100.0)]),
+        1: _make_orderbook(bin_index=1, yes_bids=[(0.55, 100.0)], yes_asks=[(0.57, 100.0)]),
+    }
 
     planned = executor._compute_optimal_trades(
         executor.portfolio,
-        {},
+        orderbooks,
         hours_to_settlement=12.0,
         verbose=False,
     )
@@ -1297,10 +1440,14 @@ def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monke
         "_compute_portfolio_utility_gain",
         lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
     )
+    orderbooks = {
+        0: _make_orderbook(bin_index=0, yes_bids=[(0.40, 100.0)], yes_asks=[(0.42, 100.0)]),
+        1: _make_orderbook(bin_index=1, yes_bids=[(0.41, 100.0)], yes_asks=[(0.43, 100.0)]),
+    }
 
     planned = executor._compute_optimal_trades(
         executor.portfolio,
-        {},
+        orderbooks,
         hours_to_settlement=12.0,
         verbose=False,
     )
@@ -1308,6 +1455,65 @@ def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monke
     assert len(planned) == 1
     assert planned[0].action == TradeAction.SELL_YES
     assert planned[0].bin_index == 1
+
+
+def test_compute_optimal_trades_uses_repriced_candidate_for_final_utility(monkeypatch):
+    executor = _make_executor(probabilities=[1.0])
+    candidate = _make_candidate(
+        action=TradeAction.BUY_YES,
+        bin_index=0,
+        size=20.0,
+        price=0.10,
+        utility_gain=0.020,
+        reservation_price=0.20,
+        threshold_price=0.20,
+    )
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.08, 100.0)],
+            yes_asks=[(0.10, 10.0), (0.50, 10.0)],
+        )
+    }
+    call_count = {"n": 0}
+
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, verbose
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return [candidate]
+        return []
+
+    monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
+    monkeypatch.setattr(
+        executor,
+        "_find_optimal_size_on",
+        lambda portfolio, candidate, orderbooks, hours, tick_config=None: 20.0,
+    )
+
+    def fake_simulate_trade(portfolio, sized_candidate):
+        after = portfolio._copy()
+        after._mock_price = sized_candidate.price
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        candidates_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 0.020 if after._mock_price > 0.25 else -0.010,
+    )
+
+    planned = executor._compute_optimal_trades(
+        executor.portfolio,
+        orderbooks,
+        hours_to_settlement=12.0,
+        verbose=False,
+    )
+
+    assert len(planned) == 1
+    assert planned[0].size == pytest.approx(20.0)
+    assert planned[0].price == pytest.approx(0.30)
+    assert planned[0].utility_gain == pytest.approx(0.020)
 
 
 def test_run_tick_does_not_rebuy_when_api_is_stale_after_confirmed_fill():

@@ -2649,90 +2649,111 @@ class KellyExecutor:
         Returns:
             Optimal chunk size in shares
         """
-        full_size = candidate.size
-        price = candidate.price
-        is_buy = candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)
-
-        # Clamp full_size to what's actually available
-        if is_buy:
-            if price > 0:
-                max_buy_shares = portfolio.available_capital / price
-                full_size = min(full_size, max_buy_shares)
-        else:
-            position = portfolio.get_position(candidate.bin_index)
-            if position:
-                if candidate.action == TradeAction.SELL_YES:
-                    full_size = min(full_size, position.yes_shares)
-                elif candidate.action == TradeAction.SELL_NO:
-                    full_size = min(full_size, position.no_shares)
-
-        # Compute minimum tradeable size
-        if is_buy:
-            # FAK orders require maker_amount (size * price) >= $1.00
-            if price > 0:
-                min_size = max(1.0, math.ceil(MIN_ORDER_VALUE_USD / price))
-            else:
-                return 0.0
-        else:
-            # For sells/exits, minimum is 1 share
-            min_size = 1.0
-
-        # If full_size is at or below minimum, just use it
-        if full_size <= min_size:
-            return full_size
-
-        # Quick check: does full chunk overshoot?
-        if not self._check_overshoots(
+        return self._find_optimal_size_on(
             portfolio,
             candidate,
-            full_size,
             orderbooks,
             hours_to_settlement,
-            tick_config
-        ):
-            return full_size
-
-        br = self._bin_range(candidate.bin_index)
-        bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
-        logger.info(
-            f"[{self.event_name}] Full chunk ({full_size:.0f} shares) overshoots for "
-            f"{candidate.action.value} {bin_info}, binary searching..."
+            tick_config,
+            max_iterations=max_iterations,
         )
 
-        # Binary search: find largest size that doesn't overshoot
-        lo = min_size
-        hi = full_size
-        best_valid = min_size  # Fallback: use minimum even if it overshoots
+    def _reprice_candidate_size(
+        self,
+        candidate: TradeCandidate,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        target_size: float,
+    ) -> Optional[TradeCandidate]:
+        """Reprice a sized candidate from live orderbook depth."""
+        if target_size <= 0:
+            return None
 
-        for i in range(max_iterations):
-            mid = (lo + hi) / 2.0
+        orderbook = orderbooks.get(candidate.bin_index)
+        if orderbook is None:
+            return None
 
-            # Converged (less than 1 share difference)
-            if hi - lo < 1.0:
-                break
+        if candidate.action == TradeAction.BUY_YES:
+            vwap, filled, worst_price = compute_vwap_buy_yes(orderbook, target_size)
+        elif candidate.action == TradeAction.SELL_YES:
+            vwap, filled, worst_price = compute_vwap_sell_yes(orderbook, target_size)
+        elif candidate.action == TradeAction.BUY_NO:
+            vwap, filled, worst_price = compute_vwap_buy_no(orderbook, target_size)
+        elif candidate.action == TradeAction.SELL_NO:
+            vwap, filled, worst_price = compute_vwap_sell_no(orderbook, target_size)
+        else:
+            return None
 
-            if self._check_overshoots(
-                portfolio,
-                candidate,
-                mid,
-                orderbooks,
-                hours_to_settlement,
-                tick_config,
-            ):
-                hi = mid
-            else:
-                best_valid = mid
-                lo = mid
+        if filled <= 0 or vwap <= 0:
+            return None
 
-        # Floor to integer shares
-        optimal = max(1.0, math.floor(best_valid))
-
-        logger.info(
-            f"[{self.event_name}] Optimal size: {optimal:.0f} shares "
-            f"(full was {full_size:.0f}, {optimal / full_size:.0%} of chunk)"
+        return replace(
+            candidate,
+            size=filled,
+            price=vwap,
+            limit_price=worst_price,
         )
 
-        return optimal
+    def _repriced_buy_is_feasible(
+        self,
+        portfolio: Portfolio,
+        sized_candidate: TradeCandidate,
+        tick_config: KellyConfig,
+    ) -> bool:
+        """Validate repriced BUY candidate against capital and bin-collateral limits."""
+        if sized_candidate.action not in (TradeAction.BUY_YES, TradeAction.BUY_NO):
+            return True
+
+        if sized_candidate.size < 1.0:
+            return False
+
+        cost = sized_candidate.size * sized_candidate.price
+        if cost < MIN_ORDER_VALUE_USD:
+            return False
+
+        if cost > portfolio.available_capital + 1e-9:
+            return False
+
+        position = portfolio.get_position(sized_candidate.bin_index)
+        current_bin_collateral = position.collateral_used if position else 0.0
+        c_bin_max = tick_config.collateral.c_bin_max
+        if c_bin_max > 0 and current_bin_collateral + cost > c_bin_max + 1e-9:
+            return False
+
+        return True
+
+    def _find_peak_utility_sell_size(
+        self,
+        portfolio: Portfolio,
+        candidate: TradeCandidate,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        sell_cap: float,
+        tick_config: KellyConfig,
+    ) -> float:
+        """Find the best positive-utility sell size within the no-reentry cap."""
+        from .candidates import _compute_portfolio_utility_gain
+
+        max_size = int(math.floor(sell_cap))
+        if max_size < 1:
+            return 0.0
+
+        best_size = 0.0
+        best_util = 0.0
+
+        for size in range(1, max_size + 1):
+            sized_candidate = self._reprice_candidate_size(candidate, orderbooks, float(size))
+            if sized_candidate is None or sized_candidate.size < 1.0:
+                continue
+
+            hyp_after = self._simulate_trade(portfolio, sized_candidate)
+            utility = _compute_portfolio_utility_gain(portfolio, hyp_after, tick_config)
+            if utility > best_util + 1e-12:
+                best_util = utility
+                best_size = float(size)
+
+        if best_util <= 0.0:
+            return 0.0
+
+        return best_size
 
     def _check_overshoots(
         self,
@@ -2754,19 +2775,13 @@ class KellyExecutor:
         """
         action = candidate.action
         bin_index = candidate.bin_index
-        price = candidate.price
+        sized_candidate = self._reprice_candidate_size(candidate, orderbooks, test_size)
+        if sized_candidate is None:
+            return True
+        if not self._repriced_buy_is_feasible(portfolio, sized_candidate, tick_config):
+            return True
 
-        # Simulate the fill
-        if action == TradeAction.BUY_YES:
-            hyp = portfolio.simulate_buy_yes(bin_index, test_size, price)
-        elif action == TradeAction.BUY_NO:
-            hyp = portfolio.simulate_buy_no(bin_index, test_size, price)
-        elif action == TradeAction.SELL_YES:
-            hyp = portfolio.simulate_sell_yes(bin_index, test_size, price)
-        elif action == TradeAction.SELL_NO:
-            hyp = portfolio.simulate_sell_no(bin_index, test_size, price)
-        else:
-            return False
+        hyp = self._simulate_trade(portfolio, sized_candidate)
 
         # Preserve external capital limit
         hyp.external_capital_limit = portfolio.external_capital_limit
@@ -2829,19 +2844,14 @@ class KellyExecutor:
         """
         action = candidate.action
         bin_index = candidate.bin_index
-        price = candidate.price
+        sized_candidate = self._reprice_candidate_size(candidate, orderbooks, test_size)
+        if sized_candidate is None:
+            return True
+        if not self._repriced_buy_is_feasible(portfolio, sized_candidate, tick_config):
+            return True
 
         # Simulate the fill on the given portfolio (returns a new copy)
-        if action == TradeAction.BUY_YES:
-            hyp = portfolio.simulate_buy_yes(bin_index, test_size, price)
-        elif action == TradeAction.BUY_NO:
-            hyp = portfolio.simulate_buy_no(bin_index, test_size, price)
-        elif action == TradeAction.SELL_YES:
-            hyp = portfolio.simulate_sell_yes(bin_index, test_size, price)
-        elif action == TradeAction.SELL_NO:
-            hyp = portfolio.simulate_sell_no(bin_index, test_size, price)
-        else:
-            return False
+        hyp = self._simulate_trade(portfolio, sized_candidate)
 
         # Preserve external capital limit
         hyp.external_capital_limit = portfolio.external_capital_limit
@@ -2910,7 +2920,7 @@ class KellyExecutor:
             # Upper bound: c_bin_max worth of shares, minus existing position in this bin
             position = portfolio.get_position(candidate.bin_index)
             existing_collateral = position.collateral_used if position else 0.0
-            remaining_bin_budget = max(0.0, self.config.collateral.c_bin_max - existing_collateral)
+            remaining_bin_budget = max(0.0, tick_config.collateral.c_bin_max - existing_collateral)
 
             if price > 0:
                 full_size = remaining_bin_budget / price
@@ -2945,13 +2955,73 @@ class KellyExecutor:
             min_size = 1.0
 
         if full_size <= min_size:
-            return full_size if full_size >= 1.0 else 0.0
+            sized_candidate = self._reprice_candidate_size(candidate, orderbooks, full_size)
+            if sized_candidate is None:
+                return 0.0
+            if not self._repriced_buy_is_feasible(portfolio, sized_candidate, tick_config):
+                return 0.0
+            return sized_candidate.size if sized_candidate.size >= 1.0 else 0.0
+
+        if not is_buy:
+            if not self._check_overshoots_on(
+                portfolio, candidate, full_size, orderbooks, hours_to_settlement, tick_config
+            ):
+                sell_cap = full_size
+            else:
+                lo = min_size
+                hi = full_size
+                for _ in range(max_iterations):
+                    if hi - lo < 1.0:
+                        break
+                    mid = (lo + hi) / 2.0
+                    if self._check_overshoots_on(
+                        portfolio, candidate, mid, orderbooks, hours_to_settlement, tick_config
+                    ):
+                        hi = mid
+                    else:
+                        lo = mid
+
+                sell_cap = 0.0
+                floor_lo = max(1, int(math.floor(lo)) - 1)
+                ceil_hi = min(int(math.floor(full_size)), int(math.ceil(hi)) + 1)
+                for size in range(ceil_hi, floor_lo - 1, -1):
+                    if not self._check_overshoots_on(
+                        portfolio,
+                        candidate,
+                        float(size),
+                        orderbooks,
+                        hours_to_settlement,
+                        tick_config,
+                    ):
+                        sell_cap = float(size)
+                        break
+
+            optimal = self._find_peak_utility_sell_size(
+                portfolio,
+                candidate,
+                orderbooks,
+                sell_cap,
+                tick_config,
+            )
+
+            br = self._bin_range(candidate.bin_index)
+            bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
+            logger.debug(
+                f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
+                f"{optimal:.0f} shares (sell cap {sell_cap:.0f}, max was {full_size:.0f})"
+            )
+            return optimal
 
         # Quick check: does full chunk overshoot?
         if not self._check_overshoots_on(
             portfolio, candidate, full_size, orderbooks, hours_to_settlement, tick_config
         ):
-            return full_size
+            sized_candidate = self._reprice_candidate_size(candidate, orderbooks, full_size)
+            if sized_candidate is None:
+                return 0.0
+            if not self._repriced_buy_is_feasible(portfolio, sized_candidate, tick_config):
+                return 0.0
+            return sized_candidate.size
 
         br = self._bin_range(candidate.bin_index)
         bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
@@ -2964,7 +3034,7 @@ class KellyExecutor:
         # Binary search: find largest size that doesn't overshoot
         lo = min_size
         hi = full_size
-        best_valid = min_size  # Fallback
+        best_valid = 0.0
 
         for _ in range(max_iterations):
             if hi - lo < 1.0:
@@ -2978,7 +3048,20 @@ class KellyExecutor:
                 best_valid = mid
                 lo = mid
 
-        optimal = max(1.0, math.floor(best_valid))
+        optimal = 0.0
+        floor_lo = max(1, int(math.floor(lo)) - 1)
+        ceil_hi = min(int(math.floor(full_size)), int(math.ceil(hi)) + 1)
+        for size in range(ceil_hi, floor_lo - 1, -1):
+            if not self._check_overshoots_on(
+                portfolio,
+                candidate,
+                float(size),
+                orderbooks,
+                hours_to_settlement,
+                tick_config,
+            ):
+                optimal = float(size)
+                break
 
         logger.debug(
             f"[{self.event_name}] Optimal size for {candidate.action.value} {bin_info}: "
@@ -3098,7 +3181,7 @@ class KellyExecutor:
                     continue
 
                 optimal_size = self._find_optimal_size_on(
-                    hyp, candidate, orderbooks, hours_to_settlement, self.config
+                    hyp, candidate, orderbooks, hours_to_settlement, tick_config
                 )
 
                 if optimal_size < 1.0:
@@ -3117,7 +3200,37 @@ class KellyExecutor:
                     )
                     continue
 
-                sized_candidate = replace(candidate, size=optimal_size)
+                sized_candidate = self._reprice_candidate_size(candidate, orderbooks, optimal_size)
+                if sized_candidate is None or sized_candidate.size < 1.0:
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            candidate,
+                            "repricing_failed",
+                            (
+                                f"optimal_size={optimal_size:.2f} "
+                                f"screen_util={candidate.utility_gain:.6f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+                if not self._repriced_buy_is_feasible(hyp, sized_candidate, tick_config):
+                    rejected.append(
+                        self._log_optimizer_rejection(
+                            sim_iter,
+                            sized_candidate,
+                            "repriced_size_infeasible",
+                            (
+                                f"size={sized_candidate.size:.0f} "
+                                f"price={sized_candidate.price:.4f} "
+                                f"screen_util={candidate.utility_gain:.6f}"
+                            ),
+                            verbose=verbose,
+                        )
+                    )
+                    continue
+
                 hyp_after = self._simulate_trade(hyp, sized_candidate)
                 from .candidates import _compute_portfolio_utility_gain
 
@@ -3135,7 +3248,8 @@ class KellyExecutor:
                                 f"screen_util={candidate.utility_gain:.6f} "
                                 f"sized_util={actual_utility:.6f} "
                                 f"min_util={min_util:.6f} "
-                                f"size={optimal_size:.0f} price={candidate.price:.4f}"
+                                f"size={sized_candidate.size:.0f} "
+                                f"price={sized_candidate.price:.4f}"
                             ),
                             verbose=verbose,
                         )
