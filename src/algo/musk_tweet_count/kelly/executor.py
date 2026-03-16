@@ -37,14 +37,23 @@ from .orderbook import (
 )
 from .portfolio import Portfolio
 from .candidates import (
+    BoxedBinContext,
     TradeCandidate,
     TradeAction,
+    _compute_portfolio_utility_gain,
+    _generate_buy_no_candidate,
+    _generate_buy_yes_candidate,
+    detect_same_bin_unbox_contexts,
     generate_candidates,
     MIN_ORDER_SIZE,
     MIN_ORDER_VALUE_USD,
 )
 from .websocket_client import OrderbookManager
-from .market_signals import compute_robust_kelly_fraction
+from .market_signals import (
+    compute_market_buy_guard,
+    compute_market_quote_context,
+    compute_robust_kelly_fraction,
+)
 
 if TYPE_CHECKING:
     from .user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
@@ -176,6 +185,24 @@ class TickResult:
     total_utility_gain: float
     executions: List[ExecutionResult] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+
+
+@dataclass
+class UnboxRotationCandidate:
+    """Paired same-bin rotation that unblocks a late-stage boxed position."""
+
+    event_key: str
+    bin_idx: int
+    held_side: str
+    target_side: str
+    sell_trade: TradeCandidate
+    buy_trade: TradeCandidate
+    sell_size: float
+    buy_size: float
+    sell_vwap: float
+    buy_vwap: float
+    gross_package_utility: float
+    package_utility: float
 
 
 @dataclass
@@ -933,6 +960,14 @@ class KellyExecutor:
         self._recent_tracking_cap = 10_000
         self._overlay_size_epsilon = 0.01
 
+        # Runtime-only late-stage boxed-bin unbox state.
+        self._unbox_blocked_ticks: Dict[int, int] = {}
+        self._unbox_last_executed_at: Dict[int, float] = {}
+        self._unbox_execution_counts: Dict[int, int] = {}
+        self._unbox_selected_counts: Dict[int, int] = {}
+        self._unbox_cycle_id: int = 0
+        self._unbox_cycle_noted: bool = False
+
     def _check_rate_limit(self) -> bool:
         """
         Check if we're within rate limits.
@@ -1003,6 +1038,120 @@ class KellyExecutor:
         bin_info = f"bin={bin_index} ({br})" if br else f"bin={bin_index}"
         logger.info(
             f"[{self.event_name}] FAK order failed for {bin_info}, cooldown for {cooldown:.0f}s"
+        )
+
+    def _begin_unbox_cycle(self) -> None:
+        """Start a new blocked-bin observation cycle for this optimization tick."""
+        self._unbox_cycle_id += 1
+        self._unbox_cycle_noted = False
+
+    def _note_boxed_bins(
+        self,
+        contexts: List[BoxedBinContext],
+        *,
+        verbose: bool = False,
+    ) -> None:
+        """Update consecutive boxed-tick counts once per optimization tick."""
+        if self._unbox_cycle_noted:
+            return
+
+        boxed_bins = {ctx.bin_index for ctx in contexts}
+        for bin_index in list(self._unbox_blocked_ticks.keys()):
+            if bin_index not in boxed_bins:
+                self._unbox_blocked_ticks[bin_index] = 0
+
+        for ctx in contexts:
+            previous = self._unbox_blocked_ticks.get(ctx.bin_index, 0)
+            current = previous + 1
+            self._unbox_blocked_ticks[ctx.bin_index] = current
+            if previous == 0:
+                br = self._bin_range(ctx.bin_index)
+                bin_info = f"bin={ctx.bin_index} ({br})" if br else f"bin={ctx.bin_index}"
+                msg = (
+                    f"[{self.event_name}][UNBOX] Boxed {bin_info}: "
+                    f"held={ctx.held_side} target={ctx.target_side} "
+                    f"sell_reason={ctx.sell_block_reason} "
+                    f"buy_liq={ctx.opposite_buy_liquidity_ok}"
+                )
+                logger.info(msg)
+
+        self._unbox_cycle_noted = True
+
+    def _get_unbox_cooldown_remaining(self, bin_index: int, now: Optional[float] = None) -> Optional[float]:
+        """Return remaining unbox cooldown for a bin, or None if inactive."""
+        last = self._unbox_last_executed_at.get(bin_index)
+        if last is None:
+            return None
+        current = now if now is not None else time.time()
+        remaining = self.config.unbox_bin_cooldown_seconds - (current - last)
+        if remaining > 0:
+            return remaining
+        del self._unbox_last_executed_at[bin_index]
+        return None
+
+    def _record_unbox_execution(self, bin_index: int, now: Optional[float] = None) -> None:
+        """Start cooldown and reset blocked count after an unbox sell is submitted."""
+        self._unbox_last_executed_at[bin_index] = now if now is not None else time.time()
+        self._unbox_blocked_ticks[bin_index] = 0
+        self._unbox_execution_counts[bin_index] = self._unbox_execution_counts.get(bin_index, 0) + 1
+
+    def _record_unbox_selection(self, bin_index: int) -> None:
+        """Track accepted unbox rotations so later low-utility flips face a higher bar."""
+        self._unbox_selected_counts[bin_index] = self._unbox_selected_counts.get(bin_index, 0) + 1
+
+    def _revert_unbox_selection(self, bin_index: int) -> None:
+        """Undo one tentative unbox selection when the sell leg never submits."""
+        current = self._unbox_selected_counts.get(bin_index, 0)
+        if current <= 1:
+            self._unbox_selected_counts.pop(bin_index, None)
+        else:
+            self._unbox_selected_counts[bin_index] = current - 1
+
+    def _get_unbox_required_min_utility(
+        self,
+        bin_index: int,
+        tick_config: KellyConfig,
+        hours_to_settlement: float,
+    ) -> tuple[float, int, int, float]:
+        """Return the effective net-utility floor for an unbox on this bin."""
+        prior_unboxes = self._unbox_execution_counts.get(bin_index, 0)
+        relax_window = max(0.0, tick_config.unbox_late_relax_start_hours_to_settlement)
+        if relax_window > 0 and tick_config.unbox_late_net_utility_relax > 0:
+            clamped_hours = min(max(hours_to_settlement, 0.0), relax_window)
+            relax_progress = 1.0 - (clamped_hours / relax_window)
+            time_relaxation = relax_progress * tick_config.unbox_late_net_utility_relax
+        else:
+            time_relaxation = 0.0
+        effective_base_min = max(0.0, tick_config.unbox_min_net_utility - time_relaxation)
+        repeat_uplift = min(
+            prior_unboxes * tick_config.unbox_repeat_net_utility_step,
+            tick_config.unbox_repeat_net_utility_cap,
+        )
+        prior_distinct_bins = len(
+            {
+                idx
+                for idx, count in self._unbox_execution_counts.items()
+                if count > 0
+            }
+            | {
+                idx
+                for idx, count in self._unbox_selected_counts.items()
+                if count > 0
+            }
+        )
+        multi_bin_steps = max(
+            0,
+            prior_distinct_bins - tick_config.unbox_multi_bin_start_count + 1,
+        )
+        multi_bin_uplift = min(
+            multi_bin_steps * tick_config.unbox_multi_bin_net_utility_step,
+            tick_config.unbox_multi_bin_net_utility_cap,
+        )
+        return (
+            effective_base_min + repeat_uplift + multi_bin_uplift,
+            prior_unboxes,
+            prior_distinct_bins,
+            effective_base_min,
         )
 
     def _is_sell_balance_error(self, error_msg: str) -> bool:
@@ -1086,6 +1235,10 @@ class KellyExecutor:
             limit_price=candidate.limit_price,
             threshold_price=candidate.threshold_price,
             execution_bound_price=candidate.execution_bound_price,
+            is_unbox=candidate.is_unbox,
+            unbox_role=candidate.unbox_role,
+            unbox_pair_id=candidate.unbox_pair_id,
+            unbox_package_utility=candidate.unbox_package_utility,
         )
 
     def _fresh_start_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
@@ -2085,6 +2238,175 @@ class KellyExecutor:
         if candidate.action in (TradeAction.BUY_YES, TradeAction.BUY_NO):
             self._warm_balance_cache(token_id)
 
+    async def _execute_live_trade_sequence(
+        self,
+        planned_trades: List[TradeCandidate],
+        orderbooks: Dict[int, UnifiedOrderbook],
+        effective_portfolio: Portfolio,
+        tick_result: TickResult,
+        iter_results: list[tuple[TradeCandidate, str]],
+        start_time: float,
+        rate_config,
+    ) -> tuple[int, bool]:
+        """Execute live trades one by one, preserving unbox sell-then-buy order."""
+        num_submitted = 0
+        saw_sell_balance_error = False
+
+        for trade in planned_trades:
+            token_id = self._get_token_id_for_action(trade)
+            if not token_id:
+                continue
+
+            side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+            requested_limit = trade.limit_price if trade.limit_price > 0 else trade.price
+            resolution = self._resolve_live_fak_submission(
+                trade,
+                token_id=token_id,
+                orderbook=orderbooks.get(trade.bin_index),
+                requested_size=trade.size,
+                requested_limit_price=requested_limit,
+                execution_bound_price=self._trade_execution_bound(trade),
+            )
+            if resolution is None or resolution.submitted_size < 1:
+                logger.info(
+                    f"[{self.event_name}] Skipped {trade.action.value} bin={trade.bin_index}: "
+                    f"requested={trade.size:.2f}@{requested_limit:.4f} "
+                    f"bound={self._trade_execution_bound(trade):.4f} "
+                    f"reason=not_executable_within_band"
+                )
+                iter_results.append((trade, "SKIPPED: not_executable_within_band"))
+                if trade.is_unbox and trade.unbox_role == "SELL":
+                    self._revert_unbox_selection(trade.bin_index)
+                    break
+                continue
+
+            original_size = float(trade.size)
+            trade.size = float(resolution.submitted_size)
+            trade.limit_price = resolution.submitted_limit_price
+            trade.price = resolution.submitted_vwap
+            trade.execution_bound_price = resolution.execution_bound_price
+            if resolution.size_reduced and original_size > 0:
+                trade.utility_gain *= trade.size / original_size
+
+            logger.info(
+                f"[{self.event_name}] Submission resolve {trade.action.value} bin={trade.bin_index}: "
+                f"requested={resolution.requested_size} @ limit {resolution.requested_limit_price:.4f} "
+                f"bound={resolution.execution_bound_price:.4f} -> "
+                f"submitted={resolution.submitted_size} @ limit {resolution.submitted_limit_price:.4f} "
+                f"vwap={resolution.submitted_vwap:.4f} worst={resolution.submitted_worst_price:.4f}"
+            )
+
+            response = self.order_executor.place_batch_orders([
+                {
+                    "token_id": token_id,
+                    "side": side,
+                    "price": resolution.submitted_limit_price,
+                    "size": resolution.submitted_size,
+                    "execution_bound_price": resolution.execution_bound_price,
+                    "fak_resolved": True,
+                }
+            ])
+            resp = response[0] if response else {}
+            oid = resp.get("orderID")
+            if oid == "":
+                oid = None
+            order_id = oid
+            error_msg = resp.get("errorMsg", "")
+
+            if not order_id and error_msg:
+                self._record_fak_failure(trade.bin_index)
+                if self._is_sell_balance_error(error_msg):
+                    diagnostics = None
+                    if trade.action in (TradeAction.SELL_YES, TradeAction.SELL_NO):
+                        diagnostics = self.order_executor.log_sell_balance_diagnostics(
+                            token_id=token_id,
+                            requested_size=trade.size,
+                        )
+                        saw_sell_balance_error = True
+                    self._emit_balance_allowance_error(
+                        candidate=trade,
+                        token_id=token_id,
+                        error_msg=error_msg,
+                        diagnostics=diagnostics,
+                    )
+
+            if order_id:
+                tracked_trade = self._clone_candidate(trade)
+                self._pending_orders[order_id] = (tracked_trade, token_id)
+                self._remember_order_context(order_id, tracked_trade, token_id)
+                confirm_event = asyncio.Event()
+                self._confirmation_events[order_id] = confirm_event
+
+                if self.user_stream:
+                    from .user_stream import PendingOrder
+                    pending = PendingOrder(
+                        order_id=order_id,
+                        token_id=token_id,
+                        side=side,
+                        price=trade.price,
+                        size=trade.size,
+                        bin_index=trade.bin_index,
+                        condition_id=token_id,
+                    )
+                    asyncio.create_task(self.user_stream.add_pending_order(pending))
+
+                self._log_trade_placed(
+                    tracked_trade,
+                    token_id,
+                    order_id,
+                    portfolio=effective_portfolio,
+                )
+                self._record_order()
+                num_submitted += 1
+                iter_results.append((trade, "SUBMITTED"))
+
+                result = ExecutionResult(
+                    success=True,
+                    candidate=trade,
+                    order_id=order_id,
+                    is_pending=True,
+                )
+            else:
+                iter_results.append((trade, f"FAILED: {error_msg}"))
+                result = ExecutionResult(
+                    success=False,
+                    candidate=trade,
+                    error=error_msg or "No order_id in batch response",
+                    is_pending=False,
+                )
+
+            tick_result.executions.append(result)
+            if result.success:
+                tick_result.num_executed += 1
+                tick_result.total_utility_gain += trade.utility_gain
+                if trade.is_unbox and trade.unbox_role == "SELL":
+                    self._record_unbox_execution(trade.bin_index)
+
+            if self.on_trade:
+                self.on_trade(result)
+
+            if not result.success and trade.is_unbox and trade.unbox_role == "SELL":
+                self._revert_unbox_selection(trade.bin_index)
+                break
+
+            if result.success and self._confirmation_events:
+                remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
+                if remaining_timeout > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_all_confirmations(),
+                            timeout=remaining_timeout,
+                        )
+                        iter_results[-1] = (trade, "CONFIRMED")
+                    except asyncio.TimeoutError:
+                        iter_results[-1] = (trade, "TIMEOUT")
+                        self._confirmation_events.clear()
+                        break
+                else:
+                    break
+
+        return num_submitted, saw_sell_balance_error
+
     async def run_tick(
         self,
         hours_to_settlement: float,
@@ -2114,6 +2436,7 @@ class KellyExecutor:
             num_executed=0,
             total_utility_gain=0.0,
         )
+        self._begin_unbox_cycle()
 
         # Check T_stop
         if hours_to_settlement <= self.config.t_stop_hours:
@@ -2201,12 +2524,18 @@ class KellyExecutor:
                     t.bin_index for t in planned_trades
                     if t.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
                 }
+                unbox_sell_pairs = {
+                    (t.bin_index, t.unbox_pair_id)
+                    for t in planned_trades
+                    if t.is_unbox and t.unbox_role == "SELL"
+                }
                 if sell_bins:
                     before = len(planned_trades)
                     planned_trades = [
                         t for t in planned_trades
                         if t.action not in (TradeAction.BUY_YES, TradeAction.BUY_NO)
                         or t.bin_index not in sell_bins
+                        or (t.is_unbox and (t.bin_index, t.unbox_pair_id) in unbox_sell_pairs)
                     ]
                     dropped = before - len(planned_trades)
                     if dropped:
@@ -2262,190 +2591,206 @@ class KellyExecutor:
                     tick_result.total_utility_gain += trade.utility_gain
                     iter_results.append((trade, "OK (dry)"))
 
+                    if trade.is_unbox and trade.unbox_role == "SELL":
+                        self._record_unbox_execution(trade.bin_index)
+
                     if self.on_trade:
                         self.on_trade(result)
             else:
-                # Build and submit batch
-                order_specs = []
-                trade_token_pairs = []
-                for trade in planned_trades:
-                    token_id = self._get_token_id_for_action(trade)
-                    if not token_id:
-                        continue
-
-                    side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
-                    fak_price = trade.limit_price if trade.limit_price > 0 else trade.price
-                    order_specs.append({
-                        "token_id": token_id,
-                        "side": side,
-                        "price": fak_price,
-                        "size": trade.size,
-                        "execution_bound_price": self._trade_execution_bound(trade),
-                    })
-                    trade_token_pairs.append((trade, token_id))
-
-                if not order_specs:
-                    break
-
-                # Merge orders for same (token_id, side, price, execution_bound_price)
-                merged_specs = []
-                merged_trade_pairs = []
-                merge_key_to_idx = {}
-                for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
-                    key = (
-                        spec["token_id"],
-                        spec["side"],
-                        spec["price"],
-                        spec["execution_bound_price"],
-                    )
-                    if key in merge_key_to_idx:
-                        idx = merge_key_to_idx[key]
-                        merged_specs[idx]["size"] += spec["size"]
-                        merged_trade_pairs[idx].append((trade, token_id))
-                    else:
-                        merge_key_to_idx[key] = len(merged_specs)
-                        merged_specs.append(dict(spec))
-                        merged_trade_pairs.append([(trade, token_id)])
-
-                resolved_specs = []
-                trade_token_pairs = []
-                for spec, pairs in zip(merged_specs, merged_trade_pairs):
-                    trade, token_id = pairs[0]
-                    orderbook = orderbooks.get(trade.bin_index)
-                    resolution = self._resolve_live_fak_submission(
-                        trade,
-                        token_id=token_id,
-                        orderbook=orderbook,
-                        requested_size=spec["size"],
-                        requested_limit_price=spec["price"],
-                        execution_bound_price=spec["execution_bound_price"],
-                    )
-                    if resolution is None or resolution.submitted_size < 1:
-                        logger.info(
-                            f"[{self.event_name}] Skipped {trade.action.value} bin={trade.bin_index}: "
-                            f"requested={spec['size']:.2f}@{spec['price']:.4f} "
-                            f"bound={spec['execution_bound_price']:.4f} "
-                            f"reason=not_executable_within_band"
-                        )
-                        iter_results.append((trade, "SKIPPED: not_executable_within_band"))
-                        continue
-
-                    original_size = float(spec["size"])
-                    trade.size = float(resolution.submitted_size)
-                    trade.limit_price = resolution.submitted_limit_price
-                    trade.price = resolution.submitted_vwap
-                    trade.execution_bound_price = resolution.execution_bound_price
-                    if resolution.size_reduced and original_size > 0:
-                        trade.utility_gain *= trade.size / original_size
-
-                    logger.info(
-                        f"[{self.event_name}] Submission resolve {trade.action.value} bin={trade.bin_index}: "
-                        f"requested={resolution.requested_size} @ limit {resolution.requested_limit_price:.4f} "
-                        f"bound={resolution.execution_bound_price:.4f} -> "
-                        f"submitted={resolution.submitted_size} @ limit {resolution.submitted_limit_price:.4f} "
-                        f"vwap={resolution.submitted_vwap:.4f} worst={resolution.submitted_worst_price:.4f}"
-                    )
-
-                    submitted_spec = dict(spec)
-                    submitted_spec["price"] = resolution.submitted_limit_price
-                    submitted_spec["size"] = resolution.submitted_size
-                    submitted_spec["fak_resolved"] = True
-                    resolved_specs.append(submitted_spec)
-                    trade_token_pairs.append((trade, token_id))
-
-                order_specs = resolved_specs
-                if not order_specs:
-                    break
-
-                # Batch submit
-                batch_response = self.order_executor.place_batch_orders(order_specs)
-
-                # Process batch response
                 saw_sell_balance_error = False
-                for i, (trade, token_id) in enumerate(trade_token_pairs):
-                    resp = batch_response[i] if i < len(batch_response) else {}
-                    if resp.get("_skipped"):
-                        iter_results.append((trade, "SKIPPED"))
-                        continue
+                has_unbox_trade = any(t.is_unbox for t in planned_trades)
 
-                    oid = resp.get("orderID")
-                    if oid == "":
-                        oid = None
-                    order_id = oid
-                    error_msg = resp.get("errorMsg", "")
+                if has_unbox_trade:
+                    num_submitted_this_iter, saw_sell_balance_error = await self._execute_live_trade_sequence(
+                        planned_trades=planned_trades,
+                        orderbooks=orderbooks,
+                        effective_portfolio=effective_portfolio,
+                        tick_result=tick_result,
+                        iter_results=iter_results,
+                        start_time=start_time,
+                        rate_config=rate_config,
+                    )
+                else:
+                    # Build and submit batch
+                    order_specs = []
+                    trade_token_pairs = []
+                    for trade in planned_trades:
+                        token_id = self._get_token_id_for_action(trade)
+                        if not token_id:
+                            continue
 
-                    if not order_id and error_msg:
-                        self._record_fak_failure(trade.bin_index)
-                        if self._is_sell_balance_error(error_msg):
-                            diagnostics = None
-                            if trade.action in (
-                                TradeAction.SELL_YES,
-                                TradeAction.SELL_NO,
-                            ):
-                                diagnostics = self.order_executor.log_sell_balance_diagnostics(
+                        side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
+                        fak_price = trade.limit_price if trade.limit_price > 0 else trade.price
+                        order_specs.append({
+                            "token_id": token_id,
+                            "side": side,
+                            "price": fak_price,
+                            "size": trade.size,
+                            "execution_bound_price": self._trade_execution_bound(trade),
+                        })
+                        trade_token_pairs.append((trade, token_id))
+
+                    if not order_specs:
+                        break
+
+                    # Merge orders for same (token_id, side, price, execution_bound_price)
+                    merged_specs = []
+                    merged_trade_pairs = []
+                    merge_key_to_idx = {}
+                    for spec, (trade, token_id) in zip(order_specs, trade_token_pairs):
+                        key = (
+                            spec["token_id"],
+                            spec["side"],
+                            spec["price"],
+                            spec["execution_bound_price"],
+                        )
+                        if key in merge_key_to_idx:
+                            idx = merge_key_to_idx[key]
+                            merged_specs[idx]["size"] += spec["size"]
+                            merged_trade_pairs[idx].append((trade, token_id))
+                        else:
+                            merge_key_to_idx[key] = len(merged_specs)
+                            merged_specs.append(dict(spec))
+                            merged_trade_pairs.append([(trade, token_id)])
+
+                    resolved_specs = []
+                    trade_token_pairs = []
+                    for spec, pairs in zip(merged_specs, merged_trade_pairs):
+                        trade, token_id = pairs[0]
+                        orderbook = orderbooks.get(trade.bin_index)
+                        resolution = self._resolve_live_fak_submission(
+                            trade,
+                            token_id=token_id,
+                            orderbook=orderbook,
+                            requested_size=spec["size"],
+                            requested_limit_price=spec["price"],
+                            execution_bound_price=spec["execution_bound_price"],
+                        )
+                        if resolution is None or resolution.submitted_size < 1:
+                            logger.info(
+                                f"[{self.event_name}] Skipped {trade.action.value} bin={trade.bin_index}: "
+                                f"requested={spec['size']:.2f}@{spec['price']:.4f} "
+                                f"bound={spec['execution_bound_price']:.4f} "
+                                f"reason=not_executable_within_band"
+                            )
+                            iter_results.append((trade, "SKIPPED: not_executable_within_band"))
+                            continue
+
+                        original_size = float(spec["size"])
+                        trade.size = float(resolution.submitted_size)
+                        trade.limit_price = resolution.submitted_limit_price
+                        trade.price = resolution.submitted_vwap
+                        trade.execution_bound_price = resolution.execution_bound_price
+                        if resolution.size_reduced and original_size > 0:
+                            trade.utility_gain *= trade.size / original_size
+
+                        logger.info(
+                            f"[{self.event_name}] Submission resolve {trade.action.value} bin={trade.bin_index}: "
+                            f"requested={resolution.requested_size} @ limit {resolution.requested_limit_price:.4f} "
+                            f"bound={resolution.execution_bound_price:.4f} -> "
+                            f"submitted={resolution.submitted_size} @ limit {resolution.submitted_limit_price:.4f} "
+                            f"vwap={resolution.submitted_vwap:.4f} worst={resolution.submitted_worst_price:.4f}"
+                        )
+
+                        submitted_spec = dict(spec)
+                        submitted_spec["price"] = resolution.submitted_limit_price
+                        submitted_spec["size"] = resolution.submitted_size
+                        submitted_spec["fak_resolved"] = True
+                        resolved_specs.append(submitted_spec)
+                        trade_token_pairs.append((trade, token_id))
+
+                    order_specs = resolved_specs
+                    if not order_specs:
+                        break
+
+                    # Batch submit
+                    batch_response = self.order_executor.place_batch_orders(order_specs)
+
+                    # Process batch response
+                    for i, (trade, token_id) in enumerate(trade_token_pairs):
+                        resp = batch_response[i] if i < len(batch_response) else {}
+                        if resp.get("_skipped"):
+                            iter_results.append((trade, "SKIPPED"))
+                            continue
+
+                        oid = resp.get("orderID")
+                        if oid == "":
+                            oid = None
+                        order_id = oid
+                        error_msg = resp.get("errorMsg", "")
+
+                        if not order_id and error_msg:
+                            self._record_fak_failure(trade.bin_index)
+                            if self._is_sell_balance_error(error_msg):
+                                diagnostics = None
+                                if trade.action in (
+                                    TradeAction.SELL_YES,
+                                    TradeAction.SELL_NO,
+                                ):
+                                    diagnostics = self.order_executor.log_sell_balance_diagnostics(
+                                        token_id=token_id,
+                                        requested_size=trade.size,
+                                    )
+                                    saw_sell_balance_error = True
+                                self._emit_balance_allowance_error(
+                                    candidate=trade,
                                     token_id=token_id,
-                                    requested_size=trade.size,
+                                    error_msg=error_msg,
+                                    diagnostics=diagnostics,
                                 )
-                                saw_sell_balance_error = True
-                            self._emit_balance_allowance_error(
+
+                        if order_id:
+                            tracked_trade = self._clone_candidate(trade)
+                            self._pending_orders[order_id] = (tracked_trade, token_id)
+                            self._remember_order_context(order_id, tracked_trade, token_id)
+                            confirm_event = asyncio.Event()
+                            self._confirmation_events[order_id] = confirm_event
+
+                            if self.user_stream:
+                                from .user_stream import PendingOrder
+                                pending = PendingOrder(
+                                    order_id=order_id,
+                                    token_id=token_id,
+                                    side="BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
+                                    price=trade.price,
+                                    size=trade.size,
+                                    bin_index=trade.bin_index,
+                                    condition_id=token_id,  # Token uniquely identifies the market condition
+                                )
+                                asyncio.create_task(self.user_stream.add_pending_order(pending))
+
+                            self._log_trade_placed(
+                                tracked_trade,
+                                token_id,
+                                order_id,
+                                portfolio=effective_portfolio,
+                            )
+                            self._record_order()
+                            num_submitted_this_iter += 1
+                            iter_results.append((trade, "SUBMITTED"))
+
+                            result = ExecutionResult(
+                                success=True,
                                 candidate=trade,
-                                token_id=token_id,
-                                error_msg=error_msg,
-                                diagnostics=diagnostics,
-                            )
-
-                    if order_id:
-                        tracked_trade = self._clone_candidate(trade)
-                        self._pending_orders[order_id] = (tracked_trade, token_id)
-                        self._remember_order_context(order_id, tracked_trade, token_id)
-                        confirm_event = asyncio.Event()
-                        self._confirmation_events[order_id] = confirm_event
-
-                        if self.user_stream:
-                            from .user_stream import PendingOrder
-                            pending = PendingOrder(
                                 order_id=order_id,
-                                token_id=token_id,
-                                side="BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL",
-                                price=trade.price,
-                                size=trade.size,
-                                bin_index=trade.bin_index,
-                                condition_id=token_id,  # Token uniquely identifies the market condition
+                                is_pending=True,
                             )
-                            asyncio.create_task(self.user_stream.add_pending_order(pending))
+                        else:
+                            iter_results.append((trade, f"FAILED: {error_msg}"))
+                            result = ExecutionResult(
+                                success=False,
+                                candidate=trade,
+                                error=error_msg or "No order_id in batch response",
+                                is_pending=False,
+                            )
 
-                        self._log_trade_placed(
-                            tracked_trade,
-                            token_id,
-                            order_id,
-                            portfolio=effective_portfolio,
-                        )
-                        self._record_order()
-                        num_submitted_this_iter += 1
-                        iter_results.append((trade, "SUBMITTED"))
+                        tick_result.executions.append(result)
+                        if result.success:
+                            tick_result.num_executed += 1
+                            tick_result.total_utility_gain += trade.utility_gain
 
-                        result = ExecutionResult(
-                            success=True,
-                            candidate=trade,
-                            order_id=order_id,
-                            is_pending=True,
-                        )
-                    else:
-                        iter_results.append((trade, f"FAILED: {error_msg}"))
-                        result = ExecutionResult(
-                            success=False,
-                            candidate=trade,
-                            error=error_msg or "No order_id in batch response",
-                            is_pending=False,
-                        )
-
-                    tick_result.executions.append(result)
-                    if result.success:
-                        tick_result.num_executed += 1
-                        tick_result.total_utility_gain += trade.utility_gain
-
-                    if self.on_trade:
-                        self.on_trade(result)
+                        if self.on_trade:
+                            self.on_trade(result)
 
                 if saw_sell_balance_error and self.sync_portfolio:
                     try:
@@ -2459,7 +2804,7 @@ class KellyExecutor:
                         )
 
                 # Wait for CONFIRMED on all orders from this iteration (or tick timeout)
-                if self._confirmation_events:
+                if self._confirmation_events and not has_unbox_trade:
                     remaining_timeout = rate_config.tick_timeout_seconds - (time.time() - start_time)
                     if remaining_timeout > 0:
                         try:
@@ -2528,6 +2873,7 @@ class KellyExecutor:
             num_executed=0,
             total_utility_gain=0.0,
         )
+        self._begin_unbox_cycle()
 
         # Check T_stop
         if hours_to_settlement <= self.config.t_stop_hours:
@@ -3086,6 +3432,287 @@ class KellyExecutor:
             return self.config, context
         return replace(self.config, kelly_fraction=effective_fraction), context
 
+    def _log_unbox_message(
+        self,
+        bin_index: int,
+        reason: str,
+        details: str = "",
+        *,
+        verbose: bool,
+        force_info: bool = False,
+    ) -> None:
+        """Log a structured unbox diagnostic line."""
+        br = self._bin_range(bin_index)
+        bin_info = f"bin={bin_index} ({br})" if br else f"bin={bin_index}"
+        message = f"[{self.event_name}][UNBOX] {bin_info}: {reason}"
+        if details:
+            message = f"{message} | {details}"
+        if force_info or verbose:
+            logger.info(message)
+        else:
+            logger.debug(message)
+
+    def _select_unbox_rotation(
+        self,
+        portfolio: Portfolio,
+        orderbooks: Dict[int, UnifiedOrderbook],
+        tick_config: KellyConfig,
+        hours_to_settlement: float,
+        boxed_contexts: List[BoxedBinContext],
+        sized_sell_reject_bins: set[int],
+        *,
+        sim_iter: int,
+        verbose: bool,
+    ) -> Optional[UnboxRotationCandidate]:
+        """Return the best same-bin boxed rotation if one clears the tighter unbox gates."""
+        if not tick_config.use_unbox_rotations or not boxed_contexts:
+            return None
+
+        if hours_to_settlement > tick_config.unbox_start_hours_to_settlement:
+            for ctx in boxed_contexts:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject too_early",
+                    f"hours_to_settlement={hours_to_settlement:.1f} > {tick_config.unbox_start_hours_to_settlement:.1f}",
+                    verbose=verbose,
+                )
+            return None
+
+        buy_guard = compute_market_buy_guard(
+            probabilities=portfolio.probabilities,
+            dead_bins=portfolio.dead_bins,
+            orderbooks=orderbooks,
+            guard_config=tick_config.market_buy_guard,
+        )
+        consensus_quote_context = (
+            compute_market_quote_context(
+                probabilities=portfolio.probabilities,
+                dead_bins=portfolio.dead_bins,
+                orderbooks=orderbooks,
+                market_config=tick_config.market_consensus,
+            )
+            if tick_config.market_consensus.enabled
+            else None
+        )
+        trusted_consensus_bins = (
+            consensus_quote_context["trusted_bin_set"]
+            if consensus_quote_context is not None
+            else set()
+        )
+
+        best_rotation: Optional[UnboxRotationCandidate] = None
+        best_net_utility = float("-inf")
+
+        for ctx in boxed_contexts:
+            blocked_ticks = self._unbox_blocked_ticks.get(ctx.bin_index, 0)
+            if blocked_ticks < tick_config.unbox_min_blocked_ticks:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject blocked_ticks_below_min",
+                    f"blocked_ticks={blocked_ticks} < {tick_config.unbox_min_blocked_ticks}",
+                    verbose=verbose,
+                )
+                continue
+
+            required_min_utility, prior_unboxes, prior_distinct_bins, effective_base_min = self._get_unbox_required_min_utility(
+                ctx.bin_index,
+                tick_config,
+                hours_to_settlement,
+            )
+
+            cooldown_remaining = self._get_unbox_cooldown_remaining(ctx.bin_index)
+            if cooldown_remaining is not None:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject cooldown_active",
+                    f"remaining={cooldown_remaining:.1f}s",
+                    verbose=verbose,
+                )
+                continue
+
+            if not ctx.opposite_buy_liquidity_ok:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject one_sided_or_no_depth",
+                    f"buy_reason={ctx.opposite_buy_liquidity_reason}",
+                    verbose=verbose,
+                )
+                continue
+
+            if ctx.sell_candidate is None:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject one_sided_or_no_depth",
+                    f"sell_reason={ctx.sell_block_reason}",
+                    verbose=verbose,
+                )
+                continue
+
+            sell_reason_ok = ctx.sell_block_reason == "sell_friction" or ctx.bin_index in sized_sell_reject_bins
+            if not sell_reason_ok:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject not_blocked_by_sell_friction_or_sized_min",
+                    f"sell_reason={ctx.sell_block_reason}",
+                    verbose=verbose,
+                )
+                continue
+
+            if (
+                tick_config.market_consensus.enabled
+                and tick_config.market_consensus.require_trusted_quote_for_buys
+                and ctx.bin_index not in trusted_consensus_bins
+            ):
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject untrusted_quote_for_consensus",
+                    "",
+                    verbose=verbose,
+                )
+                continue
+
+            after_sell = self._simulate_trade(portfolio, ctx.sell_candidate)
+            yes_prices, no_prices = after_sell.get_reservation_prices(
+                tick_config.w_floor,
+                tick_config.kelly_fraction,
+            )
+
+            if ctx.buy_action == TradeAction.BUY_YES:
+                buy_candidate = _generate_buy_yes_candidate(
+                    bin_index=ctx.bin_index,
+                    orderbook=orderbooks[ctx.bin_index],
+                    portfolio=after_sell,
+                    reservation_price=yes_prices[ctx.bin_index],
+                    config=tick_config,
+                    hours_to_settlement=hours_to_settlement,
+                    buy_guard=buy_guard,
+                    verbose=False,
+                    rejection_reasons=None,
+                )
+            else:
+                buy_candidate = _generate_buy_no_candidate(
+                    bin_index=ctx.bin_index,
+                    orderbook=orderbooks[ctx.bin_index],
+                    portfolio=after_sell,
+                    reservation_price=no_prices[ctx.bin_index],
+                    config=tick_config,
+                    hours_to_settlement=hours_to_settlement,
+                    buy_guard=buy_guard,
+                    verbose=False,
+                    rejection_reasons=None,
+                )
+
+            if buy_candidate is None:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject no_opposite_buy_candidate",
+                    "",
+                    verbose=verbose,
+                )
+                continue
+
+            optimal_buy_size = self._find_optimal_size_on(
+                after_sell,
+                buy_candidate,
+                orderbooks,
+                hours_to_settlement,
+                tick_config,
+            )
+            if optimal_buy_size < 1.0:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject buy_optimal_size_below_min",
+                    f"size={optimal_buy_size:.2f}",
+                    verbose=verbose,
+                )
+                continue
+
+            sized_buy = replace(buy_candidate, size=optimal_buy_size)
+            after_buy = self._simulate_trade(after_sell, sized_buy)
+            sell_utility = _compute_portfolio_utility_gain(portfolio, after_sell, tick_config)
+            buy_utility = _compute_portfolio_utility_gain(after_sell, after_buy, tick_config)
+            gross_package_utility = _compute_portfolio_utility_gain(portfolio, after_buy, tick_config)
+            net_package_utility = gross_package_utility - tick_config.unbox_turnover_penalty
+
+            if net_package_utility < required_min_utility:
+                self._log_unbox_message(
+                    ctx.bin_index,
+                    "reject net_package_utility_below_min",
+                    (
+                        f"gross={gross_package_utility:.6f} "
+                        f"net={net_package_utility:.6f} "
+                        f"min={required_min_utility:.6f} "
+                        f"base={effective_base_min:.6f} "
+                        f"hours={hours_to_settlement:.2f} "
+                        f"prior_unboxes={prior_unboxes} "
+                        f"prior_distinct_bins={prior_distinct_bins}"
+                    ),
+                    verbose=verbose,
+                )
+                continue
+
+            pair_id = f"{ctx.bin_index}:{ctx.held_side}->{ctx.target_side}:{sim_iter}"
+            sell_trade = replace(
+                ctx.sell_candidate,
+                utility_gain=sell_utility,
+                is_unbox=True,
+                unbox_role="SELL",
+                unbox_pair_id=pair_id,
+                unbox_package_utility=net_package_utility,
+            )
+            buy_trade = replace(
+                sized_buy,
+                utility_gain=buy_utility,
+                is_unbox=True,
+                unbox_role="BUY",
+                unbox_pair_id=pair_id,
+                unbox_package_utility=net_package_utility,
+            )
+            rotation = UnboxRotationCandidate(
+                event_key=self.event_name,
+                bin_idx=ctx.bin_index,
+                held_side=ctx.held_side,
+                target_side=ctx.target_side,
+                sell_trade=sell_trade,
+                buy_trade=buy_trade,
+                sell_size=sell_trade.size,
+                buy_size=buy_trade.size,
+                sell_vwap=sell_trade.price,
+                buy_vwap=buy_trade.price,
+                gross_package_utility=gross_package_utility,
+                package_utility=net_package_utility,
+            )
+            if net_package_utility > best_net_utility:
+                best_rotation = rotation
+                best_net_utility = net_package_utility
+
+        if best_rotation is not None:
+            effective_min_utility, prior_unboxes, prior_distinct_bins, effective_base_min = self._get_unbox_required_min_utility(
+                best_rotation.bin_idx,
+                tick_config,
+                hours_to_settlement,
+            )
+            self._log_unbox_message(
+                best_rotation.bin_idx,
+                "accept",
+                (
+                    f"SELL_{best_rotation.held_side}={best_rotation.sell_size:.0f} @ {best_rotation.sell_vwap:.4f} "
+                    f"then BUY_{best_rotation.target_side}={best_rotation.buy_size:.0f} @ {best_rotation.buy_vwap:.4f} "
+                    f"gross={best_rotation.gross_package_utility:.6f} "
+                    f"net={best_rotation.package_utility:.6f} "
+                    f"min={effective_min_utility:.6f} "
+                    f"base={effective_base_min:.6f} "
+                    f"hours={hours_to_settlement:.2f} "
+                    f"prior_unboxes={prior_unboxes} "
+                    f"prior_distinct_bins={prior_distinct_bins}"
+                ),
+                verbose=verbose,
+                force_info=True,
+            )
+            self._record_unbox_selection(best_rotation.bin_idx)
+
+        return best_rotation
+
     def _compute_optimal_trades(
         self,
         portfolio: Portfolio,
@@ -3139,11 +3766,25 @@ class KellyExecutor:
 
             if not candidates:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
-                break
+                candidates = []
 
             selected: Optional[TradeCandidate] = None
             selected_after: Optional[Portfolio] = None
             rejected: List[str] = []
+            sized_sell_reject_bins: set[int] = set()
+            boxed_contexts: List[BoxedBinContext] = []
+
+            if tick_config.use_unbox_rotations:
+                boxed_contexts = detect_same_bin_unbox_contexts(
+                    portfolio=hyp,
+                    orderbooks=orderbooks,
+                    config=tick_config,
+                )
+                if sim_iter == 0:
+                    self._note_boxed_bins(
+                        boxed_contexts,
+                        verbose=verbose,
+                    )
 
             # Scan candidates in returned priority order. Invalid earlier candidates
             # should not block later candidates from the same simulation iteration.
@@ -3232,13 +3873,14 @@ class KellyExecutor:
                     continue
 
                 hyp_after = self._simulate_trade(hyp, sized_candidate)
-                from .candidates import _compute_portfolio_utility_gain
 
                 actual_utility = _compute_portfolio_utility_gain(hyp, hyp_after, tick_config)
 
                 is_sell = sized_candidate.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
                 min_util = tick_config.min_sell_utility if is_sell else tick_config.min_buy_utility
                 if actual_utility < min_util:
+                    if is_sell:
+                        sized_sell_reject_bins.add(candidate.bin_index)
                     rejected.append(
                         self._log_optimizer_rejection(
                             sim_iter,
@@ -3262,6 +3904,26 @@ class KellyExecutor:
                 break
 
             if selected is None or selected_after is None:
+                rotation = self._select_unbox_rotation(
+                    portfolio=hyp,
+                    orderbooks=orderbooks,
+                    tick_config=tick_config,
+                    hours_to_settlement=hours_to_settlement,
+                    boxed_contexts=boxed_contexts,
+                    sized_sell_reject_bins=sized_sell_reject_bins,
+                    sim_iter=sim_iter,
+                    verbose=verbose,
+                )
+                if rotation is not None:
+                    planned_trades.extend([rotation.sell_trade, rotation.buy_trade])
+                    hyp = self._simulate_trade(hyp, rotation.sell_trade)
+                    hyp = self._simulate_trade(hyp, rotation.buy_trade)
+                    logger.info(
+                        f"[{self.event_name}][SIM iter={sim_iter}] UNBOX bin={rotation.bin_idx} "
+                        f"SELL_{rotation.held_side} -> BUY_{rotation.target_side} "
+                        f"net_util={rotation.package_utility:.6f}"
+                    )
+                    continue
                 if rejected:
                     self._log_optimizer_exhausted(sim_iter, rejected, verbose=verbose)
                 break
@@ -3303,7 +3965,7 @@ class KellyExecutor:
         merged: OrderedDict[tuple, TradeCandidate] = OrderedDict()
 
         for t in trades:
-            key = (t.bin_index, t.action)
+            key = (t.bin_index, t.action, t.unbox_pair_id)
             if key in merged:
                 existing = merged[key]
                 # VWAP: weighted average price
@@ -3336,6 +3998,13 @@ class KellyExecutor:
                         existing.execution_bound_price,
                         t.execution_bound_price,
                     )
+                existing.is_unbox = existing.is_unbox or t.is_unbox
+                existing.unbox_role = existing.unbox_role or t.unbox_role
+                existing.unbox_pair_id = existing.unbox_pair_id or t.unbox_pair_id
+                existing.unbox_package_utility = max(
+                    existing.unbox_package_utility,
+                    t.unbox_package_utility,
+                )
             else:
                 # Clone to avoid mutating the original
                 merged[key] = TradeCandidate(
@@ -3349,6 +4018,10 @@ class KellyExecutor:
                     limit_price=t.limit_price,
                     threshold_price=t.threshold_price,
                     execution_bound_price=t.execution_bound_price,
+                    is_unbox=t.is_unbox,
+                    unbox_role=t.unbox_role,
+                    unbox_pair_id=t.unbox_pair_id,
+                    unbox_package_utility=t.unbox_package_utility,
                 )
 
         return list(merged.values())
@@ -3607,7 +4280,8 @@ class KellyExecutor:
         """Format a candidate label with action and bin range for logs."""
         br = self._bin_range(candidate.bin_index)
         bin_info = f"bin={candidate.bin_index} ({br})" if br else f"bin={candidate.bin_index}"
-        return f"{candidate.action.value} {bin_info}"
+        prefix = "[UNBOX] " if candidate.is_unbox else ""
+        return f"{prefix}{candidate.action.value} {bin_info}"
 
     def _log_optimizer_rejection(
         self,

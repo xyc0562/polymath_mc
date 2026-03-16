@@ -103,6 +103,10 @@ class TradeCandidate:
     limit_price: float = 0.0  # Worst orderbook level consumed (actual tick price for FAK)
     threshold_price: float = 0.0  # Worst economically acceptable execution price this tick
     execution_bound_price: float = 0.0  # Directional live execution bound after guards/caps
+    is_unbox: bool = False  # True when produced by the boxed-bin rotation path
+    unbox_role: str = ""  # "SELL" or "BUY" inside an unbox pair
+    unbox_pair_id: str = ""  # Stable ID to keep a sell+buy pair together in live execution
+    unbox_package_utility: float = 0.0  # Net package utility after turnover penalty
 
     @property
     def cost(self) -> float:
@@ -111,6 +115,21 @@ class TradeCandidate:
             return self.size * self.price
         else:
             return -self.size * self.price  # Negative = proceeds
+
+
+@dataclass
+class BoxedBinContext:
+    """Structured same-bin boxed inventory state for late unbox rotations."""
+
+    bin_index: int
+    held_side: str
+    target_side: str
+    sell_action: TradeAction
+    buy_action: TradeAction
+    sell_candidate: Optional[TradeCandidate]
+    sell_block_reason: str
+    opposite_buy_liquidity_ok: bool
+    opposite_buy_liquidity_reason: str
 
 
 def get_friction(fair_value: float, config: EdgeBufferConfig) -> float:
@@ -301,6 +320,197 @@ def should_trade(
         no_threshold = 1.0 - yes_threshold if yes_threshold > 0 else 1.0
         actual_edge = (market_price - reservation_price) / reservation_price if reservation_price > 0 else 0.0
         return market_price >= no_threshold, actual_edge
+
+
+def _is_yes_position_stranded(position, orderbook: UnifiedOrderbook) -> bool:
+    """Return True when an existing YES position is too small to block a flip."""
+    if not position or not position.has_yes_position:
+        return False
+    best_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else 0.0
+    value = position.yes_shares * best_bid
+    return position.yes_shares < MIN_ORDER_SIZE or value < MIN_ORDER_VALUE_USD
+
+
+def _is_no_position_stranded(position, orderbook: UnifiedOrderbook) -> bool:
+    """Return True when an existing NO position is too small to block a flip."""
+    if not position or not position.has_no_position:
+        return False
+    no_sell_price = 1.0 - orderbook.yes_asks[0].price if orderbook.yes_asks else 0.0
+    value = position.no_shares * no_sell_price
+    return position.no_shares < MIN_ORDER_SIZE or value < MIN_ORDER_VALUE_USD
+
+
+def _build_full_exit_sell_candidate(
+    *,
+    bin_index: int,
+    orderbook: UnifiedOrderbook,
+    portfolio: Portfolio,
+    action: TradeAction,
+    reservation_price: float,
+    model_probability: float,
+    config: KellyConfig,
+    kelly_only_exit: bool,
+) -> tuple[Optional[TradeCandidate], str]:
+    """Build a full-position sell trade and a structured block reason."""
+    position = portfolio.get_position(bin_index)
+    if not position:
+        return None, "no_position"
+
+    if action == TradeAction.SELL_YES:
+        size = position.yes_shares
+        if size <= 0:
+            return None, "no_position"
+        depth_shares = get_available_depth(orderbook, "SELL_YES")
+        if depth_shares + 1e-9 < size:
+            return None, "no_depth"
+        best_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else None
+        if not best_bid or best_bid <= 0:
+            return None, "no_price"
+        vwap, filled, worst_price = compute_vwap_sell_yes(orderbook, size)
+        simulate_sell = portfolio.simulate_sell_yes
+    else:
+        size = position.no_shares
+        if size <= 0:
+            return None, "no_position"
+        depth_shares = get_available_depth(orderbook, "SELL_NO")
+        if depth_shares + 1e-9 < size:
+            return None, "no_depth"
+        best_yes_ask = orderbook.yes_asks[0].price if orderbook.yes_asks else None
+        if not best_yes_ask or best_yes_ask <= 0:
+            return None, "no_price"
+        vwap, filled, worst_price = compute_vwap_sell_no(orderbook, size)
+        simulate_sell = portfolio.simulate_sell_no
+
+    if filled + 1e-9 < size or filled <= 0 or vwap <= 0:
+        return None, "no_depth"
+
+    sell_friction = config.edge_buffer.sell_friction
+    block_reason = "eligible"
+    if sell_friction > 0 and vwap < reservation_price + sell_friction:
+        block_reason = "sell_friction"
+
+    exit_threshold = min(model_probability, reservation_price)
+    threshold_price = reservation_price + sell_friction
+    if not kelly_only_exit:
+        threshold_price = max(threshold_price, exit_threshold)
+        if block_reason == "eligible" and vwap < exit_threshold:
+            block_reason = "below_exit_threshold"
+
+    actual_edge = (vwap - exit_threshold) / exit_threshold if exit_threshold > 0 else 0.0
+    after = simulate_sell(bin_index, filled, vwap)
+    utility_gain = _compute_portfolio_utility_gain(portfolio, after, config)
+    if block_reason == "eligible" and utility_gain <= 0:
+        block_reason = "non_positive_utility"
+
+    candidate = TradeCandidate(
+        bin_index=bin_index,
+        action=action,
+        size=filled,
+        price=vwap,
+        utility_gain=utility_gain,
+        reservation_price=exit_threshold,
+        edge=actual_edge,
+        limit_price=worst_price,
+        threshold_price=threshold_price,
+        execution_bound_price=threshold_price,
+    )
+    return candidate, block_reason
+
+
+def detect_same_bin_unbox_contexts(
+    portfolio: Portfolio,
+    orderbooks: dict[int, UnifiedOrderbook],
+    config: KellyConfig,
+) -> List[BoxedBinContext]:
+    """Detect same-bin boxed inventory states that may be candidates for late unboxing."""
+    contexts: List[BoxedBinContext] = []
+    yes_prices, no_prices = portfolio.get_reservation_prices(config.w_floor, config.kelly_fraction)
+
+    for bin_index in range(portfolio.num_bins):
+        if bin_index in portfolio.dead_bins:
+            continue
+
+        orderbook = orderbooks.get(bin_index)
+        if orderbook is None:
+            continue
+
+        position = portfolio.get_position(bin_index)
+        if position is None:
+            continue
+
+        if position.has_no_position and not _is_no_position_stranded(position, orderbook):
+            buy_liquidity_ok, buy_liquidity_reason = check_orderbook_liquidity(
+                orderbook,
+                config.edge_buffer,
+                "YES",
+            )
+            if buy_liquidity_ok:
+                depth = get_available_depth(orderbook, "BUY_YES")
+                best_ask = orderbook.yes_asks[0].price if orderbook.yes_asks else None
+                if depth <= 0 or not best_ask or best_ask <= 0:
+                    buy_liquidity_ok = False
+                    buy_liquidity_reason = "no depth"
+            sell_candidate, sell_block_reason = _build_full_exit_sell_candidate(
+                bin_index=bin_index,
+                orderbook=orderbook,
+                portfolio=portfolio,
+                action=TradeAction.SELL_NO,
+                reservation_price=no_prices[bin_index],
+                model_probability=1.0 - portfolio.probabilities[bin_index],
+                config=config,
+                kelly_only_exit=config.kelly_only_exit,
+            )
+            contexts.append(
+                BoxedBinContext(
+                    bin_index=bin_index,
+                    held_side="NO",
+                    target_side="YES",
+                    sell_action=TradeAction.SELL_NO,
+                    buy_action=TradeAction.BUY_YES,
+                    sell_candidate=sell_candidate,
+                    sell_block_reason=sell_block_reason,
+                    opposite_buy_liquidity_ok=buy_liquidity_ok,
+                    opposite_buy_liquidity_reason=buy_liquidity_reason,
+                )
+            )
+
+        if position.has_yes_position and not _is_yes_position_stranded(position, orderbook):
+            buy_liquidity_ok, buy_liquidity_reason = check_orderbook_liquidity(
+                orderbook,
+                config.edge_buffer,
+                "NO",
+            )
+            if buy_liquidity_ok:
+                depth = get_available_depth(orderbook, "BUY_NO")
+                best_yes_bid = orderbook.yes_bids[0].price if orderbook.yes_bids else None
+                if depth <= 0 or not best_yes_bid or best_yes_bid <= 0:
+                    buy_liquidity_ok = False
+                    buy_liquidity_reason = "no depth"
+            sell_candidate, sell_block_reason = _build_full_exit_sell_candidate(
+                bin_index=bin_index,
+                orderbook=orderbook,
+                portfolio=portfolio,
+                action=TradeAction.SELL_YES,
+                reservation_price=yes_prices[bin_index],
+                model_probability=portfolio.probabilities[bin_index],
+                config=config,
+                kelly_only_exit=config.kelly_only_exit,
+            )
+            contexts.append(
+                BoxedBinContext(
+                    bin_index=bin_index,
+                    held_side="YES",
+                    target_side="NO",
+                    sell_action=TradeAction.SELL_YES,
+                    buy_action=TradeAction.BUY_NO,
+                    sell_candidate=sell_candidate,
+                    sell_block_reason=sell_block_reason,
+                    opposite_buy_liquidity_ok=buy_liquidity_ok,
+                    opposite_buy_liquidity_reason=buy_liquidity_reason,
+                )
+            )
+
+    return contexts
 
 
 def generate_candidates(

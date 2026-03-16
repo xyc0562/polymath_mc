@@ -466,6 +466,7 @@ def _run_single_replay_tick(
         trade_executor=trade_executor,
         token_ids=token_ids,
         on_trade=lambda result: runner._record_trade(result),
+        event_name=event.short_name,
     )
 
     sampled_timestamps = runner._sample_timestamps(

@@ -341,6 +341,21 @@ class KellyConfig:
     # Market-aware buy guardrail
     market_buy_guard: MarketBuyGuardConfig = field(default_factory=MarketBuyGuardConfig)
 
+    # Late-stage same-bin rotation path for boxed inventory.
+    use_unbox_rotations: bool = False
+    unbox_start_hours_to_settlement: float = 24.0
+    unbox_min_blocked_ticks: int = 3
+    unbox_min_net_utility: float = 0.012
+    unbox_late_relax_start_hours_to_settlement: float = 3.0
+    unbox_late_net_utility_relax: float = 0.002
+    unbox_repeat_net_utility_step: float = 0.003
+    unbox_repeat_net_utility_cap: float = 0.006
+    unbox_multi_bin_start_count: int = 2
+    unbox_multi_bin_net_utility_step: float = 0.002
+    unbox_multi_bin_net_utility_cap: float = 0.004
+    unbox_turnover_penalty: float = 0.002
+    unbox_bin_cooldown_seconds: int = 3600
+
     @classmethod
     def from_dict(cls, data: dict) -> "KellyConfig":
         """Create config from dictionary (e.g., from YAML)."""

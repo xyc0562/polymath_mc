@@ -322,6 +322,7 @@ class UnifiedBacktestRunner:
             trade_executor=trade_executor,
             token_ids=token_ids,
             on_trade=lambda r: self._record_trade(r),
+            event_name=event.short_name,
         )
 
         # Reset trade history and verbose flags
@@ -501,13 +502,21 @@ class UnifiedBacktestRunner:
                 hours_remaining=hours_to_settlement,
             )
             if blend_context is not None:
-                logger.debug(
-                    "  Market consensus blend: alpha=%.3f coverage=%.2f avg_spread=%.3f gap=%.3f",
-                    blend_context["alpha"],
-                    blend_context["coverage_ratio"],
-                    blend_context["avg_spread"],
-                    blend_context["gap"],
-                )
+                if "alpha" in blend_context:
+                    logger.debug(
+                        "  Market consensus blend: alpha=%.3f coverage=%.2f avg_spread=%.3f gap=%.3f",
+                        blend_context.get("alpha", 1.0),
+                        blend_context.get("coverage_ratio", 0.0),
+                        blend_context.get("avg_spread", 0.0),
+                        blend_context.get("gap", 0.0),
+                    )
+                else:
+                    logger.debug(
+                        "  Market consensus blend skipped: reason=%s coverage=%.2f avg_spread=%.3f",
+                        blend_context.get("skipped", "unknown"),
+                        blend_context.get("coverage_ratio", 0.0),
+                        blend_context.get("avg_spread", 0.0),
+                    )
 
             # Update portfolio with new probabilities and dead bins
             portfolio.probabilities = probabilities

@@ -1,14 +1,21 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 import pytest
 
 from src.algo.musk_tweet_count.kelly import candidates as candidates_module
 from src.algo.musk_tweet_count.kelly import executor as executor_module
-from src.algo.musk_tweet_count.kelly.candidates import TradeAction, TradeCandidate, generate_candidates
+from src.algo.musk_tweet_count.kelly.candidates import (
+    BoxedBinContext,
+    TradeAction,
+    TradeCandidate,
+    detect_same_bin_unbox_contexts,
+    generate_candidates,
+)
 from src.algo.musk_tweet_count.kelly.config import KellyConfig, RateLimitConfig
-from src.algo.musk_tweet_count.kelly.executor import KellyExecutor
+from src.algo.musk_tweet_count.kelly.executor import KellyExecutor, UnboxRotationCandidate
 from src.algo.musk_tweet_count.kelly.integration import KellyTradingBot
 from src.algo.musk_tweet_count.kelly.orderbook import OrderbookLevel, UnifiedOrderbook
 from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
@@ -1610,6 +1617,74 @@ def test_generate_candidates_logs_sell_candidates_in_priority_order(monkeypatch,
     assert "Bin 0 SELL_YES" in caplog.text
 
 
+def test_detect_same_bin_unbox_contexts_finds_no_position_blocking_yes():
+    portfolio = Portfolio(
+        initial_capital=200.0,
+        capital=120.0,
+        num_bins=2,
+        probabilities=[0.15, 0.85],
+    )
+    portfolio.execute_buy_no(0, 40.0, 0.82, "yes-0")
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.43, 200.0)],
+            yes_asks=[(0.45, 200.0)],
+        )
+    }
+
+    contexts = detect_same_bin_unbox_contexts(
+        portfolio=portfolio,
+        orderbooks=orderbooks,
+        config=KellyConfig(),
+    )
+
+    assert len(contexts) == 1
+    ctx = contexts[0]
+    assert ctx.bin_index == 0
+    assert ctx.held_side == "NO"
+    assert ctx.target_side == "YES"
+    assert ctx.sell_action == TradeAction.SELL_NO
+    assert ctx.buy_action == TradeAction.BUY_YES
+    assert ctx.sell_block_reason == "sell_friction"
+    assert ctx.opposite_buy_liquidity_ok is True
+    assert ctx.sell_candidate is not None
+
+
+def test_detect_same_bin_unbox_contexts_finds_yes_position_blocking_no():
+    portfolio = Portfolio(
+        initial_capital=200.0,
+        capital=120.0,
+        num_bins=2,
+        probabilities=[0.85, 0.15],
+    )
+    portfolio.execute_buy_yes(0, 40.0, 0.82, "yes-0")
+    orderbooks = {
+        0: _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.55, 200.0)],
+            yes_asks=[(0.57, 200.0)],
+        )
+    }
+
+    contexts = detect_same_bin_unbox_contexts(
+        portfolio=portfolio,
+        orderbooks=orderbooks,
+        config=KellyConfig(),
+    )
+
+    assert len(contexts) == 1
+    ctx = contexts[0]
+    assert ctx.bin_index == 0
+    assert ctx.held_side == "YES"
+    assert ctx.target_side == "NO"
+    assert ctx.sell_action == TradeAction.SELL_YES
+    assert ctx.buy_action == TradeAction.BUY_NO
+    assert ctx.sell_block_reason == "sell_friction"
+    assert ctx.opposite_buy_liquidity_ok is True
+    assert ctx.sell_candidate is not None
+
+
 def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monkeypatch, caplog):
     executor = _make_executor(probabilities=[0.2, 0.3, 0.5])
     candidates = [
@@ -1662,7 +1737,7 @@ def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monk
 
     monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
     monkeypatch.setattr(
-        candidates_module,
+        executor_module,
         "_compute_portfolio_utility_gain",
         lambda before, after, config: {0: 0.005, 1: 0.020, 2: 0.030}[after._mock_candidate_bin],
     )
@@ -1727,7 +1802,7 @@ def test_compute_optimal_trades_skips_sell_with_size_below_one(monkeypatch):
 
     monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
     monkeypatch.setattr(
-        candidates_module,
+        executor_module,
         "_compute_portfolio_utility_gain",
         lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
     )
@@ -1788,7 +1863,7 @@ def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monke
 
     monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
     monkeypatch.setattr(
-        candidates_module,
+        executor_module,
         "_compute_portfolio_utility_gain",
         lambda before, after, config: 0.020 if after._mock_candidate_bin == 1 else 0.0,
     )
@@ -1849,11 +1924,9 @@ def test_compute_optimal_trades_uses_repriced_candidate_for_final_utility(monkey
         return after
 
     monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
-    monkeypatch.setattr(
-        candidates_module,
-        "_compute_portfolio_utility_gain",
-        lambda before, after, config: 0.020 if after._mock_price > 0.25 else -0.010,
-    )
+    fake_utility_gain = lambda before, after, config: 0.020 if after._mock_price > 0.25 else -0.010
+    monkeypatch.setattr(candidates_module, "_compute_portfolio_utility_gain", fake_utility_gain)
+    monkeypatch.setattr(executor_module, "_compute_portfolio_utility_gain", fake_utility_gain)
 
     planned = executor._compute_optimal_trades(
         executor.portfolio,
@@ -1866,6 +1939,522 @@ def test_compute_optimal_trades_uses_repriced_candidate_for_final_utility(monkey
     assert planned[0].size == pytest.approx(20.0)
     assert planned[0].price == pytest.approx(0.30)
     assert planned[0].utility_gain == pytest.approx(0.020)
+
+
+def test_select_unbox_rotation_rejects_when_blocked_ticks_below_threshold(caplog):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    executor.config.unbox_min_blocked_ticks = 3
+    executor._unbox_blocked_ticks[0] = 1
+    orderbook = _make_orderbook(
+        bin_index=0,
+        yes_bids=[(0.20, 500.0)],
+        yes_asks=[(0.22, 500.0)],
+    )
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+        reservation_price=0.80,
+        threshold_price=0.82,
+    )
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=sell_candidate,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    with caplog.at_level(logging.INFO):
+        rotation = executor._select_unbox_rotation(
+            portfolio=executor.portfolio,
+            orderbooks={0: orderbook},
+            tick_config=executor.config,
+            hours_to_settlement=6.0,
+            boxed_contexts=[ctx],
+            sized_sell_reject_bins=set(),
+            sim_iter=0,
+            verbose=True,
+        )
+
+    assert rotation is None
+    assert "reject blocked_ticks_below_min" in caplog.text
+
+
+def test_select_unbox_rotation_rejects_when_cooldown_active(caplog):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    executor.config.unbox_min_blocked_ticks = 1
+    executor.config.unbox_bin_cooldown_seconds = 3600
+    executor._unbox_blocked_ticks[0] = 2
+    executor._unbox_last_executed_at[0] = time.time()
+    orderbook = _make_orderbook(
+        bin_index=0,
+        yes_bids=[(0.20, 500.0)],
+        yes_asks=[(0.22, 500.0)],
+    )
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+        reservation_price=0.80,
+        threshold_price=0.82,
+    )
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=sell_candidate,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    with caplog.at_level(logging.INFO):
+        rotation = executor._select_unbox_rotation(
+            portfolio=executor.portfolio,
+            orderbooks={0: orderbook},
+            tick_config=executor.config,
+            hours_to_settlement=6.0,
+            boxed_contexts=[ctx],
+            sized_sell_reject_bins=set(),
+            sim_iter=0,
+            verbose=True,
+        )
+
+    assert rotation is None
+    assert "reject cooldown_active" in caplog.text
+
+
+def test_note_boxed_bins_logs_initial_boxed_state_even_without_verbose(caplog):
+    executor = _make_executor(probabilities=[0.2])
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=None,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    with caplog.at_level(logging.INFO):
+        executor._note_boxed_bins([ctx], verbose=False)
+
+    assert "[test-event][UNBOX] Boxed bin=0" in caplog.text
+
+
+def test_select_unbox_rotation_logs_accept_even_without_verbose(caplog, monkeypatch):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    executor.config.unbox_min_blocked_ticks = 1
+    executor._unbox_blocked_ticks[0] = 1
+    orderbook = _make_orderbook(
+        bin_index=0,
+        yes_bids=[(0.20, 500.0)],
+        yes_asks=[(0.22, 500.0)],
+    )
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+        reservation_price=0.80,
+        threshold_price=0.82,
+    )
+    buy_candidate = _make_candidate(
+        action=TradeAction.BUY_YES,
+        bin_index=0,
+        size=35.0,
+        price=0.22,
+        utility_gain=0.010,
+        reservation_price=0.24,
+        threshold_price=0.24,
+    )
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=sell_candidate,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    monkeypatch.setattr(executor_module, "_generate_buy_yes_candidate", lambda **_kwargs: buy_candidate)
+    monkeypatch.setattr(
+        executor,
+        "_find_optimal_size_on",
+        lambda portfolio, candidate, orderbooks, hours_to_settlement, tick_config=None: candidate.size,
+    )
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_step = getattr(portfolio, "_mock_step", 0) + 1
+        after._mock_candidate_action = candidate.action
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+
+    def fake_portfolio_utility_gain(before, after, _config):
+        before_step = getattr(before, "_mock_step", 0)
+        after_step = getattr(after, "_mock_step", 0)
+        if before_step == 0 and after_step == 1:
+            return 0.004
+        if before_step == 1 and after_step == 2:
+            return 0.016
+        if before_step == 0 and after_step == 2:
+            return 0.020
+        return 0.0
+
+    monkeypatch.setattr(
+        executor_module,
+        "_compute_portfolio_utility_gain",
+        fake_portfolio_utility_gain,
+    )
+
+    with caplog.at_level(logging.INFO):
+        rotation = executor._select_unbox_rotation(
+            portfolio=executor.portfolio,
+            orderbooks={0: orderbook},
+            tick_config=executor.config,
+            hours_to_settlement=6.0,
+            boxed_contexts=[ctx],
+            sized_sell_reject_bins=set(),
+            sim_iter=0,
+            verbose=False,
+        )
+
+    assert rotation is not None
+    assert "[test-event][UNBOX] bin=0" in caplog.text
+    assert "accept" in caplog.text
+
+
+def test_select_unbox_rotation_rejects_repeat_unbox_below_elevated_min(caplog, monkeypatch):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    executor.config.unbox_min_blocked_ticks = 1
+    executor.config.unbox_min_net_utility = 0.006
+    executor.config.unbox_repeat_net_utility_step = 0.003
+    executor.config.unbox_repeat_net_utility_cap = 0.006
+    executor._unbox_blocked_ticks[0] = 1
+    executor._unbox_execution_counts[0] = 1
+    orderbook = _make_orderbook(
+        bin_index=0,
+        yes_bids=[(0.20, 500.0)],
+        yes_asks=[(0.22, 500.0)],
+    )
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+        reservation_price=0.80,
+        threshold_price=0.82,
+    )
+    buy_candidate = _make_candidate(
+        action=TradeAction.BUY_YES,
+        bin_index=0,
+        size=35.0,
+        price=0.22,
+        utility_gain=0.010,
+        reservation_price=0.24,
+        threshold_price=0.24,
+    )
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=sell_candidate,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    monkeypatch.setattr(executor_module, "_generate_buy_yes_candidate", lambda **_kwargs: buy_candidate)
+    monkeypatch.setattr(
+        executor,
+        "_find_optimal_size_on",
+        lambda portfolio, candidate, orderbooks, hours_to_settlement, tick_config=None: candidate.size,
+    )
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_step = getattr(portfolio, "_mock_step", 0) + 1
+        after._mock_candidate_action = candidate.action
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+
+    def fake_portfolio_utility_gain(before, after, _config):
+        before_step = getattr(before, "_mock_step", 0)
+        after_step = getattr(after, "_mock_step", 0)
+        if before_step == 0 and after_step == 1:
+            return 0.004
+        if before_step == 1 and after_step == 2:
+            return 0.012
+        if before_step == 0 and after_step == 2:
+            return 0.008
+        return 0.0
+
+    monkeypatch.setattr(
+        executor_module,
+        "_compute_portfolio_utility_gain",
+        fake_portfolio_utility_gain,
+    )
+
+    with caplog.at_level(logging.INFO):
+        rotation = executor._select_unbox_rotation(
+            portfolio=executor.portfolio,
+            orderbooks={0: orderbook},
+            tick_config=executor.config,
+            hours_to_settlement=6.0,
+            boxed_contexts=[ctx],
+            sized_sell_reject_bins=set(),
+            sim_iter=0,
+            verbose=True,
+        )
+
+    assert rotation is None
+    assert "reject net_package_utility_below_min" in caplog.text
+    assert "prior_unboxes=1" in caplog.text
+    assert "min=0.009000" in caplog.text
+
+
+def test_select_unbox_rotation_rejects_multi_bin_low_utility_unbox(caplog, monkeypatch):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    executor.config.unbox_min_blocked_ticks = 1
+    executor.config.unbox_min_net_utility = 0.006
+    executor.config.unbox_multi_bin_start_count = 2
+    executor.config.unbox_multi_bin_net_utility_step = 0.002
+    executor.config.unbox_multi_bin_net_utility_cap = 0.004
+    executor._unbox_blocked_ticks[0] = 1
+    executor._unbox_selected_counts[1] = 1
+    executor._unbox_selected_counts[2] = 1
+    orderbook = _make_orderbook(
+        bin_index=0,
+        yes_bids=[(0.20, 500.0)],
+        yes_asks=[(0.22, 500.0)],
+    )
+    sell_candidate = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+        reservation_price=0.80,
+        threshold_price=0.82,
+    )
+    buy_candidate = _make_candidate(
+        action=TradeAction.BUY_YES,
+        bin_index=0,
+        size=35.0,
+        price=0.22,
+        utility_gain=0.010,
+        reservation_price=0.24,
+        threshold_price=0.24,
+    )
+    ctx = BoxedBinContext(
+        bin_index=0,
+        held_side="NO",
+        target_side="YES",
+        sell_action=TradeAction.SELL_NO,
+        buy_action=TradeAction.BUY_YES,
+        sell_candidate=sell_candidate,
+        sell_block_reason="sell_friction",
+        opposite_buy_liquidity_ok=True,
+        opposite_buy_liquidity_reason="",
+    )
+
+    monkeypatch.setattr(executor_module, "_generate_buy_yes_candidate", lambda **_kwargs: buy_candidate)
+    monkeypatch.setattr(
+        executor,
+        "_find_optimal_size_on",
+        lambda portfolio, candidate, orderbooks, hours_to_settlement, tick_config=None: candidate.size,
+    )
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_step = getattr(portfolio, "_mock_step", 0) + 1
+        after._mock_candidate_action = candidate.action
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+
+    def fake_portfolio_utility_gain(before, after, _config):
+        before_step = getattr(before, "_mock_step", 0)
+        after_step = getattr(after, "_mock_step", 0)
+        if before_step == 0 and after_step == 1:
+            return 0.004
+        if before_step == 1 and after_step == 2:
+            return 0.012
+        if before_step == 0 and after_step == 2:
+            return 0.007
+        return 0.0
+
+    monkeypatch.setattr(
+        executor_module,
+        "_compute_portfolio_utility_gain",
+        fake_portfolio_utility_gain,
+    )
+
+    with caplog.at_level(logging.INFO):
+        rotation = executor._select_unbox_rotation(
+            portfolio=executor.portfolio,
+            orderbooks={0: orderbook},
+            tick_config=executor.config,
+            hours_to_settlement=6.0,
+            boxed_contexts=[ctx],
+            sized_sell_reject_bins=set(),
+            sim_iter=0,
+            verbose=True,
+        )
+
+    assert rotation is None
+    assert "reject net_package_utility_below_min" in caplog.text
+    assert "prior_distinct_bins=2" in caplog.text
+    assert "min=0.008000" in caplog.text
+
+
+def test_get_unbox_required_min_utility_caps_repeat_uplift():
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.unbox_min_net_utility = 0.006
+    executor.config.unbox_late_relax_start_hours_to_settlement = 0.0
+    executor.config.unbox_repeat_net_utility_step = 0.003
+    executor.config.unbox_repeat_net_utility_cap = 0.006
+    executor.config.unbox_multi_bin_start_count = 99
+    executor._unbox_execution_counts[0] = 5
+
+    required, prior, prior_distinct_bins, effective_base_min = executor._get_unbox_required_min_utility(
+        0,
+        executor.config,
+        hours_to_settlement=6.0,
+    )
+
+    assert prior == 5
+    assert prior_distinct_bins == 1
+    assert effective_base_min == pytest.approx(0.006)
+    assert required == pytest.approx(0.012)
+
+
+def test_get_unbox_required_min_utility_relaxes_close_to_settlement():
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.unbox_min_net_utility = 0.006
+    executor.config.unbox_late_relax_start_hours_to_settlement = 3.0
+    executor.config.unbox_late_net_utility_relax = 0.002
+    executor.config.unbox_multi_bin_start_count = 99
+
+    early_required, _prior, _distinct, early_base = executor._get_unbox_required_min_utility(
+        0,
+        executor.config,
+        hours_to_settlement=6.0,
+    )
+    late_required, _prior, _distinct, late_base = executor._get_unbox_required_min_utility(
+        0,
+        executor.config,
+        hours_to_settlement=0.0,
+    )
+
+    assert early_base == pytest.approx(0.006)
+    assert early_required == pytest.approx(0.006)
+    assert late_base == pytest.approx(0.004)
+    assert late_required == pytest.approx(0.004)
+
+
+def test_compute_optimal_trades_can_append_unbox_pair(monkeypatch):
+    executor = _make_executor(probabilities=[0.2])
+    executor.config.use_unbox_rotations = True
+    sell_trade = _make_candidate(
+        action=TradeAction.SELL_NO,
+        bin_index=0,
+        size=30.0,
+        price=0.78,
+        utility_gain=0.002,
+    )
+    sell_trade.is_unbox = True
+    sell_trade.unbox_role = "SELL"
+    sell_trade.unbox_pair_id = "pair-0"
+    buy_trade = _make_candidate(
+        action=TradeAction.BUY_YES,
+        bin_index=0,
+        size=35.0,
+        price=0.21,
+        utility_gain=0.015,
+    )
+    buy_trade.is_unbox = True
+    buy_trade.unbox_role = "BUY"
+    buy_trade.unbox_pair_id = "pair-0"
+    rotation = UnboxRotationCandidate(
+        event_key="test-event",
+        bin_idx=0,
+        held_side="NO",
+        target_side="YES",
+        sell_trade=sell_trade,
+        buy_trade=buy_trade,
+        sell_size=sell_trade.size,
+        buy_size=buy_trade.size,
+        sell_vwap=sell_trade.price,
+        buy_vwap=buy_trade.price,
+        gross_package_utility=0.02,
+        package_utility=0.018,
+    )
+
+    monkeypatch.setattr(executor_module, "generate_candidates", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        executor_module,
+        "detect_same_bin_unbox_contexts",
+        lambda **_kwargs: [
+            BoxedBinContext(
+                bin_index=0,
+                held_side="NO",
+                target_side="YES",
+                sell_action=TradeAction.SELL_NO,
+                buy_action=TradeAction.BUY_YES,
+                sell_candidate=sell_trade,
+                sell_block_reason="sell_friction",
+                opposite_buy_liquidity_ok=True,
+                opposite_buy_liquidity_reason="",
+            )
+        ],
+    )
+    calls = {"n": 0}
+
+    def fake_select(*, portfolio, orderbooks, tick_config, hours_to_settlement, boxed_contexts, sized_sell_reject_bins, sim_iter, verbose):
+        del portfolio, orderbooks, tick_config, hours_to_settlement, boxed_contexts, sized_sell_reject_bins, sim_iter, verbose
+        calls["n"] += 1
+        return rotation if calls["n"] == 1 else None
+
+    monkeypatch.setattr(executor, "_select_unbox_rotation", fake_select)
+
+    planned = executor._compute_optimal_trades(
+        executor.portfolio,
+        {},
+        hours_to_settlement=6.0,
+        verbose=False,
+    )
+
+    assert [t.action for t in planned] == [TradeAction.SELL_NO, TradeAction.BUY_YES]
+    assert all(t.is_unbox for t in planned)
 
 
 def test_run_tick_does_not_rebuy_when_api_is_stale_after_confirmed_fill():
@@ -2136,6 +2725,114 @@ def test_run_tick_bookkeeping_uses_submitted_values_after_repricing_and_size_red
         assert executed_candidate.price == pytest.approx((20 * 0.40 + 10 * 0.41) / 30)
         assert executed_candidate.utility_gain == pytest.approx(0.12)
         assert result.total_utility_gain == pytest.approx(0.12)
+
+    asyncio.run(run_case())
+
+
+def test_run_tick_executes_unbox_pair_sequentially():
+    class FakeLiveOrderExecutor:
+        def __init__(self):
+            self.dry_run = False
+            self.calls = []
+            self.executor = None
+            self.bin_ranges = {}
+
+        def get_tick_size(self, token_id):
+            del token_id
+            return "0.01"
+
+        def place_batch_orders(self, orders):
+            responses = []
+            loop = asyncio.get_running_loop()
+            for order in orders:
+                order_id = f"order-{len(self.calls) + 1}"
+                self.calls.append(dict(order))
+                fill = _make_fill(
+                    order_id=order_id,
+                    token_id=order["token_id"],
+                    side=order["side"],
+                    price=order["price"],
+                    size=order["size"],
+                    match_id=f"match-{order_id}",
+                )
+                loop.call_soon(self.executor.handle_fill, fill)
+                responses.append({"orderID": order_id})
+            return responses
+
+        def cancel_order(self, _order_id):
+            return True
+
+        def _fetch_conditional_balance_allowance(self, token_id, refresh=True):
+            return {"token_id": token_id, "refresh": refresh}
+
+    async def run_case():
+        order_executor = FakeLiveOrderExecutor()
+        executor = _make_executor(
+            capital=1_000.0,
+            rate_limit=RateLimitConfig(
+                max_orders_per_tick=2,
+                tick_timeout_seconds=5.0,
+                overlay_reconciliation_grace_seconds=90.0,
+                integrity_freeze_max_seconds=180.0,
+            ),
+            probabilities=[0.2],
+        )
+        executor.config.use_unbox_rotations = True
+        executor.order_executor = order_executor
+        order_executor.executor = executor
+        executor._post_confirm_delay = 0.0
+
+        async def stale_sync():
+            return None
+
+        executor.sync_portfolio = stale_sync
+        orderbook = _make_orderbook(
+            bin_index=0,
+            yes_bids=[(0.20, 500.0)],
+            yes_asks=[(0.22, 500.0)],
+        )
+        executor._get_orderbooks = lambda: {0: orderbook}
+
+        calls = {"n": 0}
+
+        def fake_compute(portfolio, orderbooks, hours_to_settlement, verbose=False):
+            del portfolio, orderbooks, hours_to_settlement, verbose
+            calls["n"] += 1
+            if calls["n"] > 1:
+                return []
+            sell_trade = _make_candidate(
+                action=TradeAction.SELL_NO,
+                bin_index=0,
+                size=30.0,
+                price=0.78,
+                utility_gain=0.004,
+                threshold_price=0.80,
+                execution_bound_price=0.78,
+            )
+            sell_trade.is_unbox = True
+            sell_trade.unbox_role = "SELL"
+            sell_trade.unbox_pair_id = "pair-0"
+            buy_trade = _make_candidate(
+                action=TradeAction.BUY_YES,
+                bin_index=0,
+                size=35.0,
+                price=0.22,
+                utility_gain=0.014,
+                threshold_price=0.24,
+                execution_bound_price=0.22,
+            )
+            buy_trade.is_unbox = True
+            buy_trade.unbox_role = "BUY"
+            buy_trade.unbox_pair_id = "pair-0"
+            return [sell_trade, buy_trade]
+
+        executor._compute_optimal_trades = fake_compute
+
+        result = await executor.run_tick(hours_to_settlement=6.0)
+
+        assert result.num_executed == 2
+        assert [call["side"] for call in order_executor.calls] == ["SELL", "BUY"]
+        assert len(order_executor.calls) == 2
 
     asyncio.run(run_case())
 

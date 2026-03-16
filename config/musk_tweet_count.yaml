@@ -65,6 +65,22 @@ kelly:
     fresh_start_minutes: 20.0
     fresh_start_edge_fraction: 0.25
 
+  # Late-stage same-bin boxed inventory rotations.
+  # Off by default until validated on shadow replay/backtests.
+  use_unbox_rotations: false
+  unbox_start_hours_to_settlement: 24.0
+  unbox_min_blocked_ticks: 3
+  unbox_min_net_utility: 0.012
+  unbox_late_relax_start_hours_to_settlement: 3.0
+  unbox_late_net_utility_relax: 0.002
+  unbox_repeat_net_utility_step: 0.003
+  unbox_repeat_net_utility_cap: 0.006
+  unbox_multi_bin_start_count: 2
+  unbox_multi_bin_net_utility_step: 0.002
+  unbox_multi_bin_net_utility_cap: 0.004
+  unbox_turnover_penalty: 0.002
+  unbox_bin_cooldown_seconds: 3600
+
   # Adaptive chunk sizing
   adaptive_delta:
     base_delta: 10.0
