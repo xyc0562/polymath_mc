@@ -131,6 +131,7 @@ class KellyTradingBot:
         self._setup_complete = False
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
         self._ema_probabilities: Optional[List[float]] = None
+        self._last_consensus_context: Optional[Dict[str, Any]] = None
         self._fresh_start_started_at: Optional[float] = None
 
         # Lock for thread-safe tick execution
@@ -370,15 +371,7 @@ class KellyTradingBot:
             consensus_config=self.config.market_consensus,
             hours_remaining=hours_remaining,
         )
-        if blend_context is not None:
-            logger.debug(
-                "[%s] Market consensus blend applied: alpha=%.3f coverage=%.2f avg_spread=%.3f gap=%.3f",
-                self.event_name,
-                blend_context["alpha"],
-                blend_context["coverage_ratio"],
-                blend_context["avg_spread"],
-                blend_context["gap"],
-            )
+        self._last_consensus_context = blend_context
 
         # Update portfolio
         self.portfolio.update_probabilities(probabilities, renormalize=False)

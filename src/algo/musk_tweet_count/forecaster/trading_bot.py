@@ -919,10 +919,18 @@ class GASKellyTradingBot:
                 # Update portfolio probabilities so table shows correct Kelly c* values
                 # (otherwise get_reservation_prices() uses stale probabilities)
                 if self.kelly_bot and self.kelly_bot.portfolio:
+                    # Gather cached orderbooks for consensus blend display
+                    _obs = {}
+                    if self.kelly_bot.orderbook_manager:
+                        for bi, tid in self.kelly_bot.bin_token_ids.items():
+                            ob = self.kelly_bot.orderbook_manager.get_orderbook(tid)
+                            if ob:
+                                _obs[bi] = ob
                     self.kelly_bot.update_probabilities(
                         current_count=effective_count,
                         hours_elapsed=hours_elapsed,
                         hours_remaining=hours_remaining,
+                        orderbooks=_obs or None,
                     )
                 self._log_probability_comparison(
                     probabilities=probabilities,
@@ -1059,12 +1067,41 @@ class GASKellyTradingBot:
             except Exception as e:
                 logger.debug(f"Could not get Kelly c* prices: {e}")
 
+        # Consensus blend context
+        consensus_str = ""
+        if self.kelly_bot and hasattr(self.kelly_bot, "_last_consensus_context"):
+            ctx = self.kelly_bot._last_consensus_context
+            if ctx is not None:
+                skipped = ctx.get("skipped")
+                if skipped:
+                    parts = [f"  Consensus: SKIPPED ({skipped})"]
+                    if "trusted_bins" in ctx:
+                        parts.append(f"trusted_bins={ctx['trusted_bins']:.0f}")
+                    if "coverage_ratio" in ctx:
+                        parts.append(f"coverage={ctx['coverage_ratio']:.2f}")
+                    if "avg_spread" in ctx:
+                        parts.append(f"avg_spread={ctx['avg_spread']:.3f}")
+                    parts.append(f"T-{ctx['hours_remaining']:.1f}h")
+                    consensus_str = "  ".join(parts)
+                else:
+                    consensus_str = (
+                        f"  Consensus: alpha={ctx['alpha']:.3f} "
+                        f"(alpha_t={ctx['alpha_t']:.3f}, alpha_p={ctx['alpha_p']:.3f}) "
+                        f"T-{ctx['hours_remaining']:.1f}h  "
+                        f"gap={ctx['gap']:.4f}  "
+                        f"coverage={ctx['coverage_ratio']:.2f}  "
+                        f"trusted_bins={ctx['trusted_bins']:.0f}  "
+                        f"avg_spread={ctx['avg_spread']:.3f}"
+                    )
+
         # Header with context
         logger.info("")
         logger.info("=" * 120)
         logger.info(f"  Event: {event_name}  |  Count: {current_count}  |  Time Left: {time_str}  |  Forecast @{time_stamp}")
         logger.info(f"  Forecast: {forecast_str}{std_str}")
         logger.info(f"  Bins: {num_live} live, {num_dead} dead  |  Edge: r={edge_config.required_roi:.0%}, c_mid={edge_config.friction_mid:.0%}, c_tail={edge_config.friction_tail:.0%}")
+        if consensus_str:
+            logger.info(consensus_str)
         logger.info("-" * 120)
         logger.info(f"{'Bin':<4} {'Range':<9} {'Model':>6} {'c*_Y':>6} {'Y.Ask':>6} {'Y.Thr':>6} {'c*_N':>6} {'N.Ask':>6} {'N.Thr':>6} {'Y.Pos':>7} {'N.Pos':>7} {'Signal':>8}")
         logger.info("-" * 120)

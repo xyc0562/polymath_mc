@@ -170,8 +170,20 @@ def compute_market_consensus_blend(
         orderbooks=orderbooks,
         market_config=consensus_config,
     )
-    if context is None or not context["blend_allowed"] or context["trusted_model_mass"] <= 0:
-        return probabilities, None
+
+    # Build skip reason if blend cannot proceed
+    if context is None:
+        return probabilities, {"skipped": "no_quote_context", "hours_remaining": hours_remaining}
+    if not context["blend_allowed"]:
+        return probabilities, {
+            "skipped": "blend_not_allowed",
+            "hours_remaining": hours_remaining,
+            "trusted_bins": float(len(context["trusted_bins"])),
+            "coverage_ratio": context["coverage_ratio"],
+            "avg_spread": context["avg_spread"],
+        }
+    if context["trusted_model_mass"] <= 0:
+        return probabilities, {"skipped": "no_model_mass", "hours_remaining": hours_remaining}
 
     alpha_t = 1.0
     if consensus_config.time_enabled:
@@ -189,7 +201,17 @@ def compute_market_consensus_blend(
 
     alpha = max(0.0, min(1.0, max(consensus_config.min_model_weight, alpha_t * alpha_p)))
     if alpha >= 1.0 - 1e-12:
-        return probabilities, None
+        return probabilities, {
+            "skipped": "alpha_1",
+            "alpha": alpha,
+            "alpha_t": alpha_t,
+            "alpha_p": alpha_p,
+            "hours_remaining": hours_remaining,
+            "gap": gap,
+            "coverage_ratio": context["coverage_ratio"],
+            "avg_spread": context["avg_spread"],
+            "trusted_bins": float(len(context["trusted_bins"])),
+        }
 
     model_mass = context["trusted_model_mass"]
     trusted_market_subdist = context["trusted_market_subdist"]
