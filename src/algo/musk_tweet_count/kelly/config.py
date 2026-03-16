@@ -174,7 +174,7 @@ class MarketConsensusConfig:
     min_model_weight: float = 0.30
 
     # Quote quality gates for the trusted-bin subset.
-    min_coverage_ratio: float = 0.85
+    min_coverage_ratio: float = 0.0
     max_avg_spread: float = 0.06
     max_bin_spread: float = 0.10
 

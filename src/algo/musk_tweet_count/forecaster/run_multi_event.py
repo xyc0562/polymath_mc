@@ -159,6 +159,18 @@ def log_config_summary(
     w(f"    Edge fraction cap:       {mi.fresh_start_edge_fraction:.2f}")
     w("")
 
+    mc = kelly_config.market_consensus
+    if mc.enabled:
+        w("  MARKET CONSENSUS")
+        w(f"    Time blend:              {mc.time_enabled} (tau={mc.time_tau:.1f}h)")
+        w(f"    Gap blend:               {mc.gap_enabled} (scale={mc.gap_scale:.2f}, gamma={mc.gap_gamma:.1f}, floor={mc.gap_floor:.2f})")
+        w(f"    Min model weight:        {mc.min_model_weight:.2f}")
+        w(f"    Min coverage ratio:      {mc.min_coverage_ratio:.2f}")
+        w(f"    Max avg spread:          {mc.max_avg_spread:.3f}")
+        w(f"    Max bin spread:          {mc.max_bin_spread:.3f}")
+        w(f"    Require trusted buys:    {mc.require_trusted_quote_for_buys}")
+        w("")
+
     # Rate limit
     rl = kelly_config.rate_limit
     w("  RATE LIMITING")
