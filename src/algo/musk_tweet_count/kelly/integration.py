@@ -1046,18 +1046,27 @@ class KellyTradingBot:
                 is_no=is_no,
                 verified_shares=verified_balance,
             )
-            _, missing_since, missing_count = self._set_side_missing_state(
-                pos,
-                is_no=is_no,
-                active=True,
-                now_ts=now_ts,
-            )
-            logger.warning(
+            # API reports 0 but balance shows verified_balance — the discrepancy
+            # is verified_balance shares.  Under 100 shares this is a harmless
+            # residual after partial sells; skip ambiguity flag and slack alert.
+            api_difference = verified_balance
+            if api_difference >= 100.0:
+                _, missing_since, missing_count = self._set_side_missing_state(
+                    pos,
+                    is_no=is_no,
+                    active=True,
+                    now_ts=now_ts,
+                )
+            else:
+                missing_since = 0.0
+                missing_count = 0
+            log_fn = logger.debug if api_difference < 100.0 else logger.warning
+            log_fn(
                 f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
                 f"but conditional balance still shows {verified_balance:.2f} shares; preserving local side "
                 f"(source={resolve_source}, avg=${getattr(pos, avg_attr):.4f}, unpriced={getattr(pos, unpriced_attr):.2f}sh/${getattr(pos, reserve_attr):.2f})"
             )
-            if self.on_position_sync_warning and not was_missing:
+            if self.on_position_sync_warning and not was_missing and api_difference >= 100.0:
                 try:
                     self.on_position_sync_warning(
                         PositionSyncWarningContext(
@@ -1077,18 +1086,25 @@ class KellyTradingBot:
                     )
             return "verified_positive"
 
-        _, missing_since, missing_count = self._set_side_missing_state(
-            pos,
-            is_no=is_no,
-            active=True,
-            now_ts=now_ts,
-        )
-        logger.warning(
+        # API reports 0, local has local_shares — discrepancy = local_shares.
+        api_difference = local_shares
+        if api_difference >= 100.0:
+            _, missing_since, missing_count = self._set_side_missing_state(
+                pos,
+                is_no=is_no,
+                active=True,
+                now_ts=now_ts,
+            )
+        else:
+            missing_since = 0.0
+            missing_count = 0
+        log_fn = logger.debug if api_difference < 100.0 else logger.warning
+        log_fn(
             f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
             f"but conditional balance could not be verified; retaining local side {local_shares:.2f} @ ${local_avg_cost:.4f} "
             f"(unpriced={local_unpriced:.2f}sh/${local_reserve:.2f}, missing_count={missing_count})"
         )
-        if self.on_position_sync_warning and not was_missing:
+        if self.on_position_sync_warning and not was_missing and api_difference >= 100.0:
             try:
                 self.on_position_sync_warning(
                     PositionSyncWarningContext(
