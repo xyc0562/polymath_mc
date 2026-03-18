@@ -94,3 +94,41 @@ def test_parse_args_rejects_conflicting_consensus_mode_and_flag():
 def test_parse_args_rejects_removed_market_aware_flag():
     with pytest.raises(SystemExit):
         parse_args(["--market-aware"])
+
+
+def test_parse_args_accepts_boundary_silence_overlay_flags():
+    args = parse_args(
+        [
+            "--boundary-silence-overlay",
+            "--boundary-silence-hours", "5.5",
+            "--boundary-silence-max-distance", "4",
+            "--boundary-silence-threshold-start", "170",
+            "--boundary-silence-threshold-floor", "80",
+            "--boundary-silence-threshold-step", "25",
+            "--boundary-silence-min-effective-n", "7",
+        ]
+    )
+
+    assert args.boundary_silence_overlay is True
+    assert args.boundary_silence_hours == 5.5
+    assert args.boundary_silence_max_distance == 4
+    assert args.boundary_silence_threshold_start == 170
+    assert args.boundary_silence_threshold_floor == 80
+    assert args.boundary_silence_threshold_step == 25.0
+    assert args.boundary_silence_min_effective_n == 7.0
+
+
+def test_parse_args_accepts_late_boundary_take_profit_flags():
+    args = parse_args(
+        [
+            "--late-boundary-take-profit",
+            "--late-boundary-trigger-price", "0.8",
+            "--late-boundary-min-sell-fraction", "0.7",
+            "--late-boundary-max-sell-fraction", "0.9",
+        ]
+    )
+
+    assert args.late_boundary_take_profit is True
+    assert args.late_boundary_trigger_price == 0.8
+    assert args.late_boundary_min_sell_fraction == 0.7
+    assert args.late_boundary_max_sell_fraction == 0.9

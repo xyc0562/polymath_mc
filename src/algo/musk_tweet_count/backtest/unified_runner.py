@@ -27,6 +27,7 @@ from ..kelly.config import KellyConfig, EdgeBufferConfig, RateLimitConfig, Event
 from ..kelly.portfolio import Portfolio, BinPosition
 from ..kelly.executor import KellyExecutor, TickResult
 from ..kelly.market_signals import compute_market_consensus_blend
+from ..kelly.take_profit import build_late_boundary_take_profit_context
 from ..kelly.backtest_backend import (
     SimulationConfig,
     BacktestOrderbookProvider,
@@ -153,6 +154,13 @@ class UnifiedBacktestConfig:
     bootstrap_start_hours: float = 6.0
     bootstrap_full_hours: float = 3.0
     bootstrap_max_blend: float = 0.35
+    boundary_silence_overlay: bool = False
+    boundary_silence_hours: float = 6.0
+    boundary_silence_max_distance: int = 5
+    boundary_silence_threshold_start: int = 180
+    boundary_silence_threshold_floor: int = 90
+    boundary_silence_threshold_step: float = 30.0
+    boundary_silence_min_effective_n: float = 5.0
 
     # Optional seeded replay inputs
     seed_state_path: Optional[str] = None
@@ -490,9 +498,33 @@ class UnifiedBacktestRunner:
             # Update orderbooks from historical data
             simulated_obs = self.price_provider.get_all_orderbooks(event, ts)
             orderbook_provider.update_from_simulated(simulated_obs, ts)
+            current_orderbooks = orderbook_provider.get_all_orderbooks()
 
             # Calculate hours to settlement before any quote-aware probability shaping.
             hours_to_settlement = (settlement_dt - dt).total_seconds() / 3600.0
+
+            nowcast = getattr(forecaster, "nowcast", None)
+            if hasattr(nowcast, "apply_late_boundary_silence_overlay"):
+                contract_date = forecaster.contract_utils.get_contract_date(dt)
+                current_day_events = forecaster.event_store.get_contract_day_events(contract_date)
+                probabilities = nowcast.apply_late_boundary_silence_overlay(
+                    probabilities=probabilities,
+                    current_count=current_count,
+                    events=current_day_events,
+                    contract_date=contract_date,
+                    now=dt,
+                    hours_remaining=hours_to_settlement,
+                    bin_ranges=[(b.lower_bound, b.upper_bound) for b in event.bins],
+                )
+                overlay_context = getattr(nowcast, "_last_boundary_overlay", None)
+                if overlay_context and overlay_context.get("active"):
+                    logger.debug(
+                        "  Boundary silence overlay: distance=%s silence=%smin threshold=%.0f n_eff=%.2f",
+                        overlay_context.get("distance_to_next_bin"),
+                        overlay_context.get("silence_minutes"),
+                        overlay_context.get("silence_threshold_minutes", 0.0),
+                        overlay_context.get("n_eff", 0.0),
+                    )
 
             probabilities, blend_context = compute_market_consensus_blend(
                 probabilities=probabilities,
@@ -522,6 +554,31 @@ class UnifiedBacktestRunner:
             portfolio.probabilities = probabilities
             portfolio.dead_bins = dead_bins
             portfolio.num_bins = num_bins
+
+            take_profit_context = build_late_boundary_take_profit_context(
+                config=self.config.trading.late_boundary_take_profit,
+                current_count=current_count,
+                bin_ranges=[(b.lower_bound, b.upper_bound) for b in event.bins],
+                hours_remaining=hours_to_settlement,
+                silence_minutes=(
+                    getattr(getattr(forecaster, "nowcast", None), "_last_impulse", {}) or {}
+                ).get("silence_min"),
+                portfolio=portfolio,
+                orderbooks=current_orderbooks,
+            )
+            executor.set_late_boundary_take_profit_context(take_profit_context)
+            if take_profit_context.active:
+                logger.debug(
+                    "  Late-boundary take-profit: bin=%s silence=%smin threshold=%.0f distance=%s ref_vwap=%.3f sell=%.0f-%.0f strength=%.2f",
+                    take_profit_context.current_bin_index,
+                    int(take_profit_context.silence_minutes),
+                    take_profit_context.silence_threshold_minutes,
+                    take_profit_context.distance_to_next_bin,
+                    take_profit_context.reference_vwap,
+                    take_profit_context.size_floor,
+                    take_profit_context.size_cap,
+                    take_profit_context.strength,
+                )
 
             # Store context for verbose logging
             self._current_tick_context = {
@@ -910,6 +967,15 @@ class UnifiedBacktestRunner:
             bootstrap_start_hours=self.config.bootstrap_start_hours,
             bootstrap_full_hours=self.config.bootstrap_full_hours,
             bootstrap_max_blend=self.config.bootstrap_max_blend,
+            late_boundary_silence=BucketNowcastConfig.LateBoundarySilenceConfig(
+                enabled=self.config.boundary_silence_overlay,
+                start_hours=self.config.boundary_silence_hours,
+                max_distance_to_next_bin=self.config.boundary_silence_max_distance,
+                silence_threshold_start_minutes=self.config.boundary_silence_threshold_start,
+                silence_threshold_floor_minutes=self.config.boundary_silence_threshold_floor,
+                silence_threshold_step_per_hour=self.config.boundary_silence_threshold_step,
+                min_effective_n=self.config.boundary_silence_min_effective_n,
+            ),
         )
         config = ForecasterConfig(
             monte_carlo=mc_config,

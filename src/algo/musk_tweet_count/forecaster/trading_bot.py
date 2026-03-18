@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from py_clob_client.client import ClobClient
 
@@ -20,6 +20,7 @@ from .projection import ProjectionModel, AsymmetricProjection, create_projection
 from ..kelly.config import KellyConfig
 from ..kelly.integration import KellyTradingBot
 from ..kelly.executor import TickResult
+from ..kelly.take_profit import build_late_boundary_take_profit_context
 from ..kelly.user_stream import UserStreamClient
 from ..kelly.websocket_client import OrderbookWebSocket
 
@@ -478,6 +479,64 @@ class GASKellyTradingBot:
 
         return probabilities
 
+    def _apply_boundary_silence_overlay(
+        self,
+        probabilities: List[float],
+        current_count: int,
+        hours_elapsed: float,
+        hours_remaining: float,
+    ) -> Tuple[List[float], Optional[Dict[str, Any]]]:
+        """Apply the late-boundary silence overlay after EMA smoothing."""
+        del hours_elapsed
+
+        nowcast = getattr(self.forecaster, "nowcast", None)
+        if not hasattr(nowcast, "apply_late_boundary_silence_overlay"):
+            return probabilities, None
+        if not self._market_bins:
+            return probabilities, None
+
+        now = datetime.now(self.forecaster.contract_utils.tz)
+        contract_date = self.forecaster.contract_utils.get_contract_date(now)
+        events = self.forecaster.event_store.get_contract_day_events(contract_date)
+        adjusted = nowcast.apply_late_boundary_silence_overlay(
+            probabilities=probabilities,
+            current_count=current_count,
+            events=events,
+            contract_date=contract_date,
+            now=now,
+            hours_remaining=hours_remaining,
+            bin_ranges=self._market_bins,
+        )
+        return adjusted, getattr(nowcast, "_last_boundary_overlay", None)
+
+    def _build_late_boundary_take_profit_context(
+        self,
+        current_count: int,
+        hours_elapsed: float,
+        hours_remaining: float,
+        orderbooks: Optional[Dict[int, "UnifiedOrderbook"]],
+    ):
+        """Build the late-boundary take-profit context from current state."""
+        del hours_elapsed
+
+        if not self.kelly_bot or not self.kelly_bot.portfolio or not self._market_bins:
+            return None
+
+        nowcast = getattr(self.forecaster, "nowcast", None)
+        silence_minutes = None
+        if nowcast and getattr(nowcast, "_last_impulse", None):
+            silence_minutes = nowcast._last_impulse.get("silence_min")
+
+        return build_late_boundary_take_profit_context(
+            config=self.kelly_config.late_boundary_take_profit,
+            current_count=current_count,
+            bin_ranges=self._market_bins,
+            hours_remaining=hours_remaining,
+            silence_minutes=silence_minutes,
+            portfolio=self.kelly_bot.portfolio,
+            orderbooks=orderbooks or {},
+        )
+
     def _on_orderbook_update(
         self,
         token_id: str,
@@ -647,6 +706,8 @@ class GASKellyTradingBot:
             clob_client=self.clob_client,
             config=self.kelly_config,
             probability_model=self._get_probabilities,
+            boundary_overlay_model=self._apply_boundary_silence_overlay,
+            take_profit_context_model=self._build_late_boundary_take_profit_context,
             dry_run=self.bot_config.dry_run,
             wallet_address=_get_wallet_for_positions(),
             api_key=os.getenv("CLOB_API_KEY"),
@@ -1094,12 +1155,47 @@ class GASKellyTradingBot:
                         f"avg_spread={ctx['avg_spread']:.3f}"
                     )
 
+        boundary_overlay_str = ""
+        if self.kelly_bot and hasattr(self.kelly_bot, "_last_boundary_overlay_context"):
+            ctx = self.kelly_bot._last_boundary_overlay_context
+            if ctx is not None and ctx.get("active"):
+                local_probs = ", ".join(
+                    f"{idx}:{prob:.3f}"
+                    for idx, prob in zip(ctx["local_bins"], ctx["overlay_local_probs"])
+                )
+                boundary_overlay_str = (
+                    f"  Boundary silence overlay: silence={ctx['silence_minutes']}min "
+                    f"(threshold={ctx['silence_threshold_minutes']:.0f}) "
+                    f"distance={ctx['distance_to_next_bin']} "
+                    f"n_eff={ctx['n_eff']:.2f} "
+                    f"local_mass={ctx['local_mass_before']:.3f} "
+                    f"local={local_probs}"
+                )
+
+        take_profit_str = ""
+        if self.kelly_bot and hasattr(self.kelly_bot, "_last_take_profit_context"):
+            ctx = self.kelly_bot._last_take_profit_context
+            if ctx is not None and ctx.active:
+                take_profit_str = (
+                    f"  Late-boundary take-profit: bin={ctx.current_bin_index} "
+                    f"silence={ctx.silence_minutes:.0f}min "
+                    f"(threshold={ctx.silence_threshold_minutes:.0f}) "
+                    f"distance={ctx.distance_to_next_bin} "
+                    f"ref_vwap={ctx.reference_vwap:.3f} "
+                    f"sell={ctx.size_floor:.0f}-{ctx.size_cap:.0f} "
+                    f"strength={ctx.strength:.2f}"
+                )
+
         # Header with context
         logger.info("")
         logger.info("=" * 120)
         logger.info(f"  Event: {event_name}  |  Count: {current_count}  |  Time Left: {time_str}  |  Forecast @{time_stamp}")
         logger.info(f"  Forecast: {forecast_str}{std_str}")
         logger.info(f"  Bins: {num_live} live, {num_dead} dead  |  Edge: r={edge_config.required_roi:.0%}, c_mid={edge_config.friction_mid:.0%}, c_tail={edge_config.friction_tail:.0%}")
+        if boundary_overlay_str:
+            logger.info(boundary_overlay_str)
+        if take_profit_str:
+            logger.info(take_profit_str)
         if consensus_str:
             logger.info(consensus_str)
         logger.info("-" * 120)

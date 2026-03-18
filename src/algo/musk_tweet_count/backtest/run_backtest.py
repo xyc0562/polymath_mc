@@ -38,7 +38,9 @@ from ..kelly.config import (
     MarketConsensusConfig,
     RobustKellyConfig,
     MarketBuyGuardConfig,
+    LateBoundaryTakeProfitConfig,
 )
+from ..forecaster.config import BucketNowcastConfig
 
 # Setup logging with immediate flush to prevent interleaving with print statements
 import sys
@@ -714,6 +716,81 @@ def main():
     )
 
     parser.add_argument(
+        "--boundary-silence-overlay",
+        action="store_true",
+        help="Enable the late-boundary silence overlay in the final hours before settlement.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-hours",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.start_hours,
+        help="Hours before settlement where the late-boundary silence overlay becomes eligible.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-max-distance",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.max_distance_to_next_bin,
+        help="Maximum tweets from the next bin edge for the late-boundary silence overlay.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-start",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_start_minutes,
+        help="Adaptive silence threshold at the overlay start window in minutes.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-floor",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_floor_minutes,
+        help="Minimum adaptive silence threshold in minutes once the overlay is active.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-step",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_step_per_hour,
+        help="Minutes to reduce the silence threshold by per hour inside the overlay window.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-min-effective-n",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.min_effective_n,
+        help="Minimum effective analog sample size required for the late-boundary silence overlay.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-take-profit",
+        action="store_true",
+        help="Enable late-boundary majority YES take-profit behavior near settlement.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-trigger-price",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.trigger_price,
+        help=f"Minimum majority-exit YES VWAP to trigger late-boundary take profit. Default: {LateBoundaryTakeProfitConfig.trigger_price}.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-min-sell-fraction",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.min_sell_fraction,
+        help=f"Minimum fraction of YES shares to sell when late-boundary take profit triggers. Default: {LateBoundaryTakeProfitConfig.min_sell_fraction}.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-max-sell-fraction",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.max_sell_fraction,
+        help=f"Maximum fraction of YES shares to sell under full late-boundary take-profit strength. Default: {LateBoundaryTakeProfitConfig.max_sell_fraction}.",
+    )
+
+    parser.add_argument(
         "--consensus-time",
         action="store_true",
         help="Enable time-based trusted-quote consensus blending near settlement.",
@@ -1010,6 +1087,12 @@ def main():
             max_avg_spread=args.market_buy_guard_max_avg_spread,
             disagreement_scale=args.market_buy_guard_disagreement_scale,
         ),
+        late_boundary_take_profit=LateBoundaryTakeProfitConfig(
+            enabled=args.late_boundary_take_profit,
+            trigger_price=args.late_boundary_trigger_price,
+            min_sell_fraction=args.late_boundary_min_sell_fraction,
+            max_sell_fraction=args.late_boundary_max_sell_fraction,
+        ),
         max_iters_per_tick=50,
     )
 
@@ -1030,6 +1113,13 @@ def main():
         bootstrap_start_hours=args.bootstrap_start_hours,
         bootstrap_full_hours=args.bootstrap_full_hours,
         bootstrap_max_blend=args.bootstrap_max_blend,
+        boundary_silence_overlay=args.boundary_silence_overlay,
+        boundary_silence_hours=args.boundary_silence_hours,
+        boundary_silence_max_distance=args.boundary_silence_max_distance,
+        boundary_silence_threshold_start=args.boundary_silence_threshold_start,
+        boundary_silence_threshold_floor=args.boundary_silence_threshold_floor,
+        boundary_silence_threshold_step=args.boundary_silence_threshold_step,
+        boundary_silence_min_effective_n=args.boundary_silence_min_effective_n,
         resume_from_timestamp=resume_from_ts,
         seed_state_path=args.seed_state,
         seed_log_path=args.seed_from_log,
@@ -1055,6 +1145,17 @@ def main():
             args.bootstrap_start_hours,
             args.bootstrap_full_hours,
             args.bootstrap_max_blend,
+        )
+    if args.boundary_silence_overlay:
+        logger.info(
+            "Late boundary silence overlay: enabled (window=%.1fh, max_distance=%d, threshold=max(%d, %d - %.1f*(%.1f-h)), min_n_eff=%.1f)",
+            args.boundary_silence_hours,
+            args.boundary_silence_max_distance,
+            args.boundary_silence_threshold_floor,
+            args.boundary_silence_threshold_start,
+            args.boundary_silence_threshold_step,
+            args.boundary_silence_hours,
+            args.boundary_silence_min_effective_n,
         )
     if args.consensus_time or args.consensus_gap:
         logger.info(

@@ -54,6 +54,7 @@ from .market_signals import (
     compute_market_quote_context,
     compute_robust_kelly_fraction,
 )
+from .take_profit import LateBoundaryTakeProfitContext
 
 if TYPE_CHECKING:
     from .user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
@@ -967,6 +968,7 @@ class KellyExecutor:
         self._unbox_selected_counts: Dict[int, int] = {}
         self._unbox_cycle_id: int = 0
         self._unbox_cycle_noted: bool = False
+        self._late_boundary_take_profit_context: Optional[LateBoundaryTakeProfitContext] = None
 
     def _check_rate_limit(self) -> bool:
         """
@@ -1235,11 +1237,22 @@ class KellyExecutor:
             limit_price=candidate.limit_price,
             threshold_price=candidate.threshold_price,
             execution_bound_price=candidate.execution_bound_price,
+            kind=candidate.kind,
+            size_floor=candidate.size_floor,
+            size_cap=candidate.size_cap,
+            min_utility_override=candidate.min_utility_override,
             is_unbox=candidate.is_unbox,
             unbox_role=candidate.unbox_role,
             unbox_pair_id=candidate.unbox_pair_id,
             unbox_package_utility=candidate.unbox_package_utility,
         )
+
+    def set_late_boundary_take_profit_context(
+        self,
+        context: Optional[LateBoundaryTakeProfitContext],
+    ) -> None:
+        """Set the per-tick late-boundary take-profit context."""
+        self._late_boundary_take_profit_context = context
 
     def _fresh_start_age_seconds(self, now: Optional[float] = None) -> Optional[float]:
         """Return throttle age in seconds from the first trading tick, if known."""
@@ -3074,18 +3087,20 @@ class KellyExecutor:
         orderbooks: Dict[int, UnifiedOrderbook],
         sell_cap: float,
         tick_config: KellyConfig,
+        sell_floor: float = 1.0,
     ) -> float:
         """Find the best positive-utility sell size within the no-reentry cap."""
         from .candidates import _compute_portfolio_utility_gain
 
+        min_size = max(1, int(math.ceil(sell_floor)))
         max_size = int(math.floor(sell_cap))
-        if max_size < 1:
+        if max_size < min_size:
             return 0.0
 
         best_size = 0.0
-        best_util = 0.0
+        best_util = float("-inf")
 
-        for size in range(1, max_size + 1):
+        for size in range(min_size, max_size + 1):
             sized_candidate = self._reprice_candidate_size(candidate, orderbooks, float(size))
             if sized_candidate is None or sized_candidate.size < 1.0:
                 continue
@@ -3096,7 +3111,7 @@ class KellyExecutor:
                 best_util = utility
                 best_size = float(size)
 
-        if best_util <= 0.0:
+        if best_util < 0.0:
             return 0.0
 
         return best_size
@@ -3138,6 +3153,7 @@ class KellyExecutor:
             orderbooks=orderbooks,
             config=tick_config,
             hours_to_settlement=hours_to_settlement,
+            take_profit_context=self._late_boundary_take_profit_context,
             verbose=False,
         )
 
@@ -3208,6 +3224,7 @@ class KellyExecutor:
             orderbooks=orderbooks,
             config=tick_config,
             hours_to_settlement=hours_to_settlement,
+            take_profit_context=self._late_boundary_take_profit_context,
             verbose=False,
         )
 
@@ -3283,6 +3300,8 @@ class KellyExecutor:
                 full_size = position.yes_shares
             else:
                 full_size = position.no_shares
+            if candidate.size_cap > 0.0:
+                full_size = min(full_size, candidate.size_cap)
 
         # Cap by available orderbook depth
         ob = orderbooks.get(candidate.bin_index)
@@ -3298,13 +3317,15 @@ class KellyExecutor:
             else:
                 return 0.0
         else:
-            min_size = 1.0
+            min_size = max(1.0, candidate.size_floor if candidate.size_floor > 0.0 else 1.0)
 
         if full_size <= min_size:
             sized_candidate = self._reprice_candidate_size(candidate, orderbooks, full_size)
             if sized_candidate is None:
                 return 0.0
             if not self._repriced_buy_is_feasible(portfolio, sized_candidate, tick_config):
+                return 0.0
+            if not is_buy and sized_candidate.size + 1e-9 < min_size:
                 return 0.0
             return sized_candidate.size if sized_candidate.size >= 1.0 else 0.0
 
@@ -3348,6 +3369,7 @@ class KellyExecutor:
                 orderbooks,
                 sell_cap,
                 tick_config,
+                sell_floor=min_size,
             )
 
             br = self._bin_range(candidate.bin_index)
@@ -3761,8 +3783,25 @@ class KellyExecutor:
                 orderbooks=orderbooks,
                 config=tick_config,
                 hours_to_settlement=hours_to_settlement,
+                take_profit_context=self._late_boundary_take_profit_context,
                 verbose=(verbose and sim_iter == 0),
             )
+
+            if planned_trades:
+                exhausted_take_profit_bins = {
+                    t.bin_index
+                    for t in planned_trades
+                    if t.kind == "late_boundary_take_profit"
+                }
+                if exhausted_take_profit_bins:
+                    candidates = [
+                        c
+                        for c in candidates
+                        if not (
+                            c.kind == "late_boundary_take_profit"
+                            and c.bin_index in exhausted_take_profit_bins
+                        )
+                    ]
 
             if not candidates:
                 logger.debug(f"[{self.event_name}][SIM iter={sim_iter}] No candidates")
@@ -3789,7 +3828,10 @@ class KellyExecutor:
             # Scan candidates in returned priority order. Invalid earlier candidates
             # should not block later candidates from the same simulation iteration.
             for candidate in candidates:
-                if candidate.utility_gain <= 0:
+                min_screen_util = candidate.min_utility_override
+                if min_screen_util is None:
+                    min_screen_util = 0.0 if candidate.kind == "late_boundary_take_profit" else 1e-12
+                if candidate.utility_gain < min_screen_util:
                     rejected.append(
                         self._log_optimizer_rejection(
                             sim_iter,
@@ -3878,6 +3920,8 @@ class KellyExecutor:
 
                 is_sell = sized_candidate.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)
                 min_util = tick_config.min_sell_utility if is_sell else tick_config.min_buy_utility
+                if candidate.min_utility_override is not None:
+                    min_util = candidate.min_utility_override
                 if actual_utility < min_util:
                     if is_sell:
                         sized_sell_reject_bins.add(candidate.bin_index)
@@ -3994,10 +4038,18 @@ class KellyExecutor:
                 else:
                     existing.limit_price = min(existing.limit_price, t.limit_price) if existing.limit_price > 0 else t.limit_price
                     existing.threshold_price = max(existing.threshold_price, t.threshold_price)
-                    existing.execution_bound_price = max(
-                        existing.execution_bound_price,
-                        t.execution_bound_price,
-                    )
+                existing.execution_bound_price = max(
+                    existing.execution_bound_price,
+                    t.execution_bound_price,
+                )
+                if t.kind == "late_boundary_take_profit":
+                    existing.kind = t.kind
+                if t.size_floor > 0:
+                    existing.size_floor = max(existing.size_floor, t.size_floor)
+                if t.size_cap > 0:
+                    existing.size_cap = max(existing.size_cap, t.size_cap)
+                if t.min_utility_override is not None:
+                    existing.min_utility_override = t.min_utility_override
                 existing.is_unbox = existing.is_unbox or t.is_unbox
                 existing.unbox_role = existing.unbox_role or t.unbox_role
                 existing.unbox_pair_id = existing.unbox_pair_id or t.unbox_pair_id
@@ -4018,6 +4070,10 @@ class KellyExecutor:
                     limit_price=t.limit_price,
                     threshold_price=t.threshold_price,
                     execution_bound_price=t.execution_bound_price,
+                    kind=t.kind,
+                    size_floor=t.size_floor,
+                    size_cap=t.size_cap,
+                    min_utility_override=t.min_utility_override,
                     is_unbox=t.is_unbox,
                     unbox_role=t.unbox_role,
                     unbox_pair_id=t.unbox_pair_id,

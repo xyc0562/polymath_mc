@@ -33,6 +33,7 @@ from .executor import KellyExecutor, OrderExecutor, ExecutionResult, TickResult
 from .websocket_client import OrderbookManager, OrderbookWebSocket, WebSocketConfig
 from .kelly_math import identify_dead_bins, renormalize_probabilities
 from .market_signals import compute_market_consensus_blend
+from .take_profit import LateBoundaryTakeProfitContext
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,15 @@ class KellyTradingBot:
         clob_client: ClobClient,
         config: KellyConfig,
         probability_model: Callable[[int, float, float], List[float]],
+        boundary_overlay_model: Optional[
+            Callable[[List[float], int, float, float], Tuple[List[float], Optional[Dict[str, Any]]]]
+        ] = None,
+        take_profit_context_model: Optional[
+            Callable[
+                [int, float, float, Optional[Dict[int, UnifiedOrderbook]]],
+                Optional[LateBoundaryTakeProfitContext],
+            ]
+        ] = None,
         dry_run: bool = False,
         wallet_address: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -107,6 +117,8 @@ class KellyTradingBot:
         self.clob_client = clob_client
         self.config = config
         self.probability_model = probability_model
+        self.boundary_overlay_model = boundary_overlay_model
+        self.take_profit_context_model = take_profit_context_model
         self.dry_run = dry_run
         self.wallet_address = wallet_address or os.getenv("WALLET_ADDRESS", "")
 
@@ -135,6 +147,8 @@ class KellyTradingBot:
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
         self._ema_probabilities: Optional[List[float]] = None
         self._last_consensus_context: Optional[Dict[str, Any]] = None
+        self._last_boundary_overlay_context: Optional[Dict[str, Any]] = None
+        self._last_take_profit_context: Optional[LateBoundaryTakeProfitContext] = None
         self._fresh_start_started_at: Optional[float] = None
         self._market_positions_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, dict]]] = {}
 
@@ -376,6 +390,17 @@ class KellyTradingBot:
                 probabilities = [p / total for p in probabilities]
         self._ema_probabilities = probabilities
 
+        if self.boundary_overlay_model is not None:
+            probabilities, overlay_context = self.boundary_overlay_model(
+                probabilities,
+                current_count,
+                hours_elapsed,
+                hours_remaining,
+            )
+            self._last_boundary_overlay_context = overlay_context
+        else:
+            self._last_boundary_overlay_context = None
+
         probabilities, blend_context = compute_market_consensus_blend(
             probabilities=probabilities,
             dead_bins=dead_bins,
@@ -387,6 +412,20 @@ class KellyTradingBot:
 
         # Update portfolio
         self.portfolio.update_probabilities(probabilities, renormalize=False)
+
+        if self.take_profit_context_model is not None:
+            self._last_take_profit_context = self.take_profit_context_model(
+                current_count,
+                hours_elapsed,
+                hours_remaining,
+                orderbooks,
+            )
+        else:
+            self._last_take_profit_context = None
+        if self.kelly_executor is not None:
+            self.kelly_executor.set_late_boundary_take_profit_context(
+                self._last_take_profit_context
+            )
 
         logger.debug(f"Updated probabilities: {probabilities}")
 

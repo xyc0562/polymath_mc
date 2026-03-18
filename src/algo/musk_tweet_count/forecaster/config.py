@@ -63,6 +63,18 @@ class NowcastConfig:
 class BucketNowcastConfig:
     """Configuration for bucket-based intraday nowcast model."""
 
+    @dataclass
+    class LateBoundarySilenceConfig:
+        """Configuration for the late-boundary silence overlay."""
+
+        enabled: bool = False
+        start_hours: float = 6.0
+        max_distance_to_next_bin: int = 5
+        silence_threshold_start_minutes: int = 180
+        silence_threshold_floor_minutes: int = 90
+        silence_threshold_step_per_hour: float = 30.0
+        min_effective_n: float = 5.0
+
     # Number of buckets per day (8 = 3-hour buckets)
     n_buckets: int = 8
 
@@ -92,6 +104,9 @@ class BucketNowcastConfig:
     bootstrap_silence_sigma_minutes: float = 60.0
     bootstrap_min_effective_n: float = 5.0
     bootstrap_full_effective_n: float = 20.0
+    late_boundary_silence: "BucketNowcastConfig.LateBoundarySilenceConfig" = field(
+        default_factory=lambda: BucketNowcastConfig.LateBoundarySilenceConfig()
+    )
 
     # Sampling distribution: "negbin", "com_poisson", or "negbin_reflected"
     bucket_distribution: str = "com_poisson"
@@ -364,6 +379,7 @@ class ForecasterConfig:
         intraday_curve_data = data.pop("intraday_curve", data.pop("intraday", {}))
         burst_features_data = data.pop("burst_features", {})
         nowcast_data = data.pop("nowcast", {})
+        bucket_nowcast_data = data.pop("bucket_nowcast", {})
         regime_data = data.pop("regime", data.pop("interday", {}))
         dispersion_data = data.pop("dispersion", {})
         weekend_data = data.pop("weekend", {})
@@ -371,6 +387,7 @@ class ForecasterConfig:
         update_data = data.pop("update", {})
         ensemble_data = data.pop("ensemble", {})
         gas_data = data.pop("gas", {})
+        late_boundary_silence_data = bucket_nowcast_data.pop("late_boundary_silence", {})
 
         # Handle bins
         bins_data = data.pop("bins", None)
@@ -382,6 +399,12 @@ class ForecasterConfig:
             intraday_curve=IntradayCurveConfig(**intraday_curve_data),
             burst_features=BurstFeaturesConfig(**burst_features_data),
             nowcast=NowcastConfig(**nowcast_data),
+            bucket_nowcast=BucketNowcastConfig(
+                late_boundary_silence=BucketNowcastConfig.LateBoundarySilenceConfig(
+                    **late_boundary_silence_data
+                ),
+                **bucket_nowcast_data,
+            ),
             regime=RegimeConfig(**regime_data),
             dispersion=DispersionConfig(**dispersion_data),
             weekend=WeekendConfig(**weekend_data),

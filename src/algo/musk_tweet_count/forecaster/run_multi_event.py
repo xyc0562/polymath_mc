@@ -39,7 +39,10 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
 from src.utils.crypto_utils import load_private_key
-from src.algo.musk_tweet_count.forecaster.config import ForecasterConfig
+from src.algo.musk_tweet_count.forecaster.config import (
+    BucketNowcastConfig,
+    ForecasterConfig,
+)
 from src.algo.musk_tweet_count.forecaster.data import ContractDayUtils
 from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventManager,
@@ -55,6 +58,7 @@ from src.algo.musk_tweet_count.kelly.config import (
     MarketConsensusConfig,
     RobustKellyConfig,
     MarketBuyGuardConfig,
+    LateBoundaryTakeProfitConfig,
 )
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPoolConfig
 from src.algo.musk_tweet_count.notifications import SlackNotifier
@@ -945,6 +949,81 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--boundary-silence-overlay",
+        action="store_true",
+        help="Enable the late-boundary silence overlay in the final hours before settlement.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-hours",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.start_hours,
+        help="Hours before settlement where the late-boundary silence overlay becomes eligible.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-max-distance",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.max_distance_to_next_bin,
+        help="Maximum tweets from the next bin edge for the late-boundary silence overlay.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-start",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_start_minutes,
+        help="Adaptive silence threshold at the overlay start window in minutes.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-floor",
+        type=int,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_floor_minutes,
+        help="Minimum adaptive silence threshold in minutes once the overlay is active.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-threshold-step",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_step_per_hour,
+        help="Minutes to reduce the silence threshold by per hour inside the overlay window.",
+    )
+
+    parser.add_argument(
+        "--boundary-silence-min-effective-n",
+        type=float,
+        default=BucketNowcastConfig.LateBoundarySilenceConfig.min_effective_n,
+        help="Minimum effective analog sample size required for the late-boundary silence overlay.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-take-profit",
+        action="store_true",
+        help="Enable late-boundary majority YES take-profit behavior near settlement.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-trigger-price",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.trigger_price,
+        help=f"Minimum majority-exit YES VWAP to trigger late-boundary take profit. Default: {LateBoundaryTakeProfitConfig.trigger_price}.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-min-sell-fraction",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.min_sell_fraction,
+        help=f"Minimum fraction of YES shares to sell when late-boundary take profit triggers. Default: {LateBoundaryTakeProfitConfig.min_sell_fraction}.",
+    )
+
+    parser.add_argument(
+        "--late-boundary-max-sell-fraction",
+        type=float,
+        default=LateBoundaryTakeProfitConfig.max_sell_fraction,
+        help=f"Maximum fraction of YES shares to sell under full late-boundary take-profit strength. Default: {LateBoundaryTakeProfitConfig.max_sell_fraction}.",
+    )
+
+    parser.add_argument(
         "--consensus-time",
         action="store_true",
         help="Enable time-based trusted-quote consensus blending near settlement.",
@@ -1237,6 +1316,12 @@ async def main() -> None:
             max_avg_spread=args.market_buy_guard_max_avg_spread,
             disagreement_scale=args.market_buy_guard_disagreement_scale,
         ),
+        late_boundary_take_profit=LateBoundaryTakeProfitConfig(
+            enabled=args.late_boundary_take_profit,
+            trigger_price=args.late_boundary_trigger_price,
+            min_sell_fraction=args.late_boundary_min_sell_fraction,
+            max_sell_fraction=args.late_boundary_max_sell_fraction,
+        ),
     )
 
     # Kelly collateral cap is the source of truth for both Kelly sizing and
@@ -1257,12 +1342,37 @@ async def main() -> None:
     forecaster_config.bucket_nowcast.bootstrap_start_hours = args.bootstrap_start_hours
     forecaster_config.bucket_nowcast.bootstrap_full_hours = args.bootstrap_full_hours
     forecaster_config.bucket_nowcast.bootstrap_max_blend = args.bootstrap_max_blend
+    forecaster_config.bucket_nowcast.late_boundary_silence.enabled = args.boundary_silence_overlay
+    forecaster_config.bucket_nowcast.late_boundary_silence.start_hours = args.boundary_silence_hours
+    forecaster_config.bucket_nowcast.late_boundary_silence.max_distance_to_next_bin = args.boundary_silence_max_distance
+    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_start_minutes = args.boundary_silence_threshold_start
+    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_floor_minutes = args.boundary_silence_threshold_floor
+    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_step_per_hour = args.boundary_silence_threshold_step
+    forecaster_config.bucket_nowcast.late_boundary_silence.min_effective_n = args.boundary_silence_min_effective_n
     if args.historical_bootstrap:
         logger.info(
             "Historical intraday bootstrap: enabled (start=%.1fh, full=%.1fh, max_blend=%.2f)",
             args.bootstrap_start_hours,
             args.bootstrap_full_hours,
             args.bootstrap_max_blend,
+        )
+    if args.boundary_silence_overlay:
+        logger.info(
+            "Late boundary silence overlay: enabled (window=%.1fh, max_distance=%d, threshold=max(%d, %d - %.1f*(%.1f-h)), min_n_eff=%.1f)",
+            args.boundary_silence_hours,
+            args.boundary_silence_max_distance,
+            args.boundary_silence_threshold_floor,
+            args.boundary_silence_threshold_start,
+            args.boundary_silence_threshold_step,
+            args.boundary_silence_hours,
+            args.boundary_silence_min_effective_n,
+        )
+    if args.late_boundary_take_profit:
+        logger.info(
+            "Late-boundary take-profit: enabled (trigger=%.2f, sell=%.0f%%-%.0f%%)",
+            args.late_boundary_trigger_price,
+            args.late_boundary_min_sell_fraction * 100.0,
+            args.late_boundary_max_sell_fraction * 100.0,
         )
     if args.consensus_time or args.consensus_gap:
         logger.info(

@@ -243,6 +243,25 @@ class MarketBuyGuardConfig:
 
 
 @dataclass
+class LateBoundaryTakeProfitConfig:
+    """
+    Configuration for late-boundary majority YES take-profit behavior.
+
+    This is a decision-layer guard. It does not change model probabilities.
+    """
+
+    enabled: bool = False
+    start_hours: float = 6.0
+    max_distance_to_next_bin: int = 5
+    silence_threshold_start_minutes: int = 180
+    silence_threshold_floor_minutes: int = 90
+    silence_threshold_step_per_hour: float = 30.0
+    trigger_price: float = 0.80
+    min_sell_fraction: float = 0.70
+    max_sell_fraction: float = 0.90
+
+
+@dataclass
 class CollateralConfig:
     """Configuration for collateral limits."""
 
@@ -341,6 +360,9 @@ class KellyConfig:
     # Market-aware buy guardrail
     market_buy_guard: MarketBuyGuardConfig = field(default_factory=MarketBuyGuardConfig)
 
+    # Late-boundary majority YES take-profit guard
+    late_boundary_take_profit: LateBoundaryTakeProfitConfig = field(default_factory=LateBoundaryTakeProfitConfig)
+
     # Late-stage same-bin rotation path for boxed inventory.
     use_unbox_rotations: bool = False
     unbox_start_hours_to_settlement: float = 24.0
@@ -371,6 +393,7 @@ class KellyConfig:
         market_consensus_data = data.pop("market_consensus", {})
         robust_kelly_data = data.pop("robust_kelly", {})
         market_buy_guard_data = data.pop("market_buy_guard", {})
+        late_boundary_take_profit_data = data.pop("late_boundary_take_profit", {})
 
         # Backward compatibility: convert old c_bin_max (absolute) to c_bin_max_ratio
         if "c_bin_max" in collateral_data and "c_bin_max_ratio" not in collateral_data:
@@ -396,6 +419,7 @@ class KellyConfig:
             market_consensus=MarketConsensusConfig(**market_consensus_data),
             robust_kelly=RobustKellyConfig(**robust_kelly_data),
             market_buy_guard=MarketBuyGuardConfig(**market_buy_guard_data),
+            late_boundary_take_profit=LateBoundaryTakeProfitConfig(**late_boundary_take_profit_data),
             **data,
         )
 

@@ -25,6 +25,7 @@ from .orderbook import (
 )
 from .portfolio import Portfolio
 from .kelly_math import compute_utility_gain
+from .take_profit import LateBoundaryTakeProfitContext
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,10 @@ class TradeCandidate:
     limit_price: float = 0.0  # Worst orderbook level consumed (actual tick price for FAK)
     threshold_price: float = 0.0  # Worst economically acceptable execution price this tick
     execution_bound_price: float = 0.0  # Directional live execution bound after guards/caps
+    kind: str = ""  # Optional strategy-specific marker
+    size_floor: float = 0.0  # Minimum acceptable size for optimizer
+    size_cap: float = 0.0  # Maximum acceptable size for optimizer
+    min_utility_override: Optional[float] = None  # Candidate-specific min utility threshold
     is_unbox: bool = False  # True when produced by the boxed-bin rotation path
     unbox_role: str = ""  # "SELL" or "BUY" inside an unbox pair
     unbox_pair_id: str = ""  # Stable ID to keep a sell+buy pair together in live execution
@@ -518,6 +523,7 @@ def generate_candidates(
     orderbooks: dict[int, UnifiedOrderbook],
     config: KellyConfig,
     hours_to_settlement: float,
+    take_profit_context: Optional[LateBoundaryTakeProfitContext] = None,
     verbose: bool = False,
 ) -> List[TradeCandidate]:
     """
@@ -641,9 +647,20 @@ def generate_candidates(
             no_sell_price = 1.0 - orderbook.yes_asks[0].price if orderbook.yes_asks else 0.0
             no_value = no_shares * no_sell_price
             no_is_stranded = no_shares < MIN_ORDER_SIZE or no_value < MIN_ORDER_VALUE_USD
+        take_profit_active_bin = (
+            take_profit_context.current_bin_index
+            if take_profit_context is not None and take_profit_context.active
+            else None
+        )
+
         if not has_no or no_is_stranded:
             if yes_liquidity_ok:
-                if (
+                if take_profit_active_bin == bin_index:
+                    if verbose:
+                        rejection_reasons.setdefault(bin_index, []).append(
+                            "BUY_YES: blocked_by_late_boundary_take_profit"
+                        )
+                elif (
                     config.market_consensus.enabled
                     and config.market_consensus.require_trusted_quote_for_buys
                     and bin_index not in trusted_consensus_bins
@@ -677,7 +694,30 @@ def generate_candidates(
         # Generate SELL YES candidate (if we have position)
         # Use min(model probability, Kelly reservation) for exit threshold
         # NOTE: Always allow selling even if liquidity is poor (need to exit positions)
-        if has_yes:
+        take_profit_on_current_bin = (
+            take_profit_context is not None
+            and take_profit_context.active
+            and take_profit_context.current_bin_index == bin_index
+        )
+
+        if (
+            has_yes
+            and take_profit_on_current_bin
+        ):
+            candidate = _generate_late_boundary_take_profit_sell_yes_candidate(
+                bin_index=bin_index,
+                orderbook=orderbook,
+                portfolio=portfolio,
+                reservation_price=reservation_yes,
+                config=config,
+                context=take_profit_context,
+                verbose=verbose,
+                rejection_reasons=rejection_reasons,
+            )
+            if candidate:
+                candidates.append(candidate)
+
+        if has_yes and not take_profit_on_current_bin:
             model_prob_yes = portfolio.probabilities[bin_index]
             candidate = _generate_sell_yes_candidate(
                 bin_index=bin_index,
@@ -763,6 +803,10 @@ def generate_candidates(
     sells = [c for c in candidates if c.action in (TradeAction.SELL_YES, TradeAction.SELL_NO)]
     buys = [c for c in candidates if c.action in (TradeAction.BUY_YES, TradeAction.BUY_NO)]
 
+    sells.sort(
+        key=lambda c: (0 if c.kind == "late_boundary_take_profit" else 1, c.bin_index)
+    )
+
     # Sort buys by utility gain per dollar spent (descending).
     # With a small screening chunk ($2), this approximates marginal utility per dollar.
     buys.sort(key=lambda c: c.utility_gain / c.cost if c.cost > 0 else 0, reverse=True)
@@ -796,6 +840,66 @@ def generate_candidates(
 
     # Sells come first, then buys
     return sells + buys
+
+
+def _generate_late_boundary_take_profit_sell_yes_candidate(
+    bin_index: int,
+    orderbook: UnifiedOrderbook,
+    portfolio: Portfolio,
+    reservation_price: float,
+    config: KellyConfig,
+    context: LateBoundaryTakeProfitContext,
+    verbose: bool = False,
+    rejection_reasons: dict = None,
+) -> Optional[TradeCandidate]:
+    """Generate a dedicated majority SELL_YES take-profit candidate."""
+    position = portfolio.get_position(bin_index)
+    if not position or not position.has_yes_position:
+        return None
+
+    def _reject(reason: str) -> None:
+        if verbose and rejection_reasons is not None:
+            rejection_reasons.setdefault(bin_index, []).append(f"SELL_YES(tp): {reason}")
+
+    if context.size_floor < 1.0 or context.size_cap < context.size_floor:
+        _reject("invalid_size_band")
+        return None
+
+    vwap, filled, worst_price = compute_vwap_sell_yes(orderbook, context.size_floor)
+    if filled + 1e-9 < context.size_floor or vwap <= 0.0:
+        _reject("insufficient_depth_for_majority_floor")
+        return None
+
+    new_portfolio = portfolio.simulate_sell_yes(bin_index, filled, vwap)
+    utility_gain = _compute_portfolio_utility_gain(portfolio, new_portfolio, config)
+    if utility_gain < 0.0:
+        _reject(
+            f"negative_utility ({utility_gain:.6f}, vwap={vwap:.1%}, trigger={config.late_boundary_take_profit.trigger_price:.1%})"
+        )
+        logger.debug(
+            f"SELL_YES(tp) bin {bin_index}: negative utility ({utility_gain:.6f}), skipping"
+        )
+        return None
+
+    trigger_price = config.late_boundary_take_profit.trigger_price
+    edge = (vwap - trigger_price) / trigger_price if trigger_price > 0 else 0.0
+
+    return TradeCandidate(
+        bin_index=bin_index,
+        action=TradeAction.SELL_YES,
+        size=filled,
+        price=vwap,
+        utility_gain=utility_gain,
+        reservation_price=reservation_price,
+        edge=edge,
+        limit_price=worst_price,
+        threshold_price=trigger_price,
+        execution_bound_price=trigger_price,
+        kind="late_boundary_take_profit",
+        size_floor=context.size_floor,
+        size_cap=context.size_cap,
+        min_utility_override=0.0,
+    )
 
 
 def _generate_buy_yes_candidate(

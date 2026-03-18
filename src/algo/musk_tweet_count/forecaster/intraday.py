@@ -1064,6 +1064,7 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
         self._last_regime: Optional[Dict[str, float | int | None]] = None
         self._last_impulse: Optional[Dict[str, float | int | None]] = None
         self._last_bootstrap: Optional[Dict[str, float | int]] = None
+        self._last_boundary_overlay: Optional[Dict[str, object]] = None
 
         # Historical suffix profiles for optional direct historical bootstrap
         self._historical_suffix_profiles: List[HistoricalSuffixProfile] = []
@@ -1561,28 +1562,34 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         return float(self.config.bootstrap_max_blend * time_alpha * sample_alpha)
 
-    def _sample_historical_bootstrap_suffix(
+    def _compute_late_boundary_silence_threshold(self, hours_remaining: float) -> float:
+        """Adaptive silence threshold for the late-boundary overlay."""
+        overlay_config = self.config.late_boundary_silence
+        decay_hours = max(0.0, overlay_config.start_hours - hours_remaining)
+        raw_threshold = (
+            overlay_config.silence_threshold_start_minutes
+            - overlay_config.silence_threshold_step_per_hour * decay_hours
+        )
+        return float(
+            max(
+                overlay_config.silence_threshold_floor_minutes,
+                raw_threshold,
+            )
+        )
+
+    def _weighted_historical_suffix_distribution(
         self,
-        observed: int,
         event_taus: np.ndarray,
         tau_now: int,
         end_tau: int,
         is_weekend: bool,
         expected_so_far: float,
-        n_simulations: int,
-        rng: np.random.Generator,
-    ) -> Optional[np.ndarray]:
-        """Sample remaining final counts from weighted historical suffix analogs."""
-        hours_left = max(0.0, end_tau - tau_now) / 60.0
-        self._last_bootstrap = None
-
-        if not self.config.use_historical_bootstrap:
-            return None
-        if hours_left > self.config.bootstrap_start_hours:
-            return None
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, float, float, float]]:
+        """Return weighted historical remaining-count distribution for the current suffix."""
         if not self._historical_suffix_profiles:
             return None
 
+        observed = int(event_taus.size)
         current_regime = observed / expected_so_far if expected_so_far >= self.config.min_expected_for_regime else 1.0
         current_regime = max(current_regime, 1e-3)
         current_recent60 = self._count_taus_in_window(event_taus, tau_now - 60, tau_now)
@@ -1634,23 +1641,58 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         weights_arr = np.asarray(weights, dtype=float)
         weights_sum = float(weights_arr.sum())
-        if weights_sum <= 0:
+        if weights_sum <= 0.0:
             return None
+
         probs = weights_arr / weights_sum
         n_eff = float((weights_sum ** 2) / np.square(weights_arr).sum())
-        alpha = self._compute_historical_bootstrap_alpha(hours_left, n_eff)
-
         remaining_arr = np.asarray(remaining_values, dtype=int)
         weighted_mean = float(np.dot(probs, remaining_arr))
         weighted_var = float(np.dot(probs, np.square(remaining_arr - weighted_mean)))
+        weighted_std = float(math.sqrt(max(weighted_var, 0.0)))
+        return remaining_arr, probs, n_eff, weighted_mean, weighted_std
+
+    def _sample_historical_bootstrap_suffix(
+        self,
+        observed: int,
+        event_taus: np.ndarray,
+        tau_now: int,
+        end_tau: int,
+        is_weekend: bool,
+        expected_so_far: float,
+        n_simulations: int,
+        rng: np.random.Generator,
+    ) -> Optional[np.ndarray]:
+        """Sample remaining final counts from weighted historical suffix analogs."""
+        hours_left = max(0.0, end_tau - tau_now) / 60.0
+        self._last_bootstrap = None
+
+        if not self.config.use_historical_bootstrap:
+            return None
+        if hours_left > self.config.bootstrap_start_hours:
+            return None
+        if not self._historical_suffix_profiles:
+            return None
+
+        distribution = self._weighted_historical_suffix_distribution(
+            event_taus=event_taus,
+            tau_now=tau_now,
+            end_tau=end_tau,
+            is_weekend=is_weekend,
+            expected_so_far=expected_so_far,
+        )
+        if distribution is None:
+            return None
+        remaining_arr, probs, n_eff, weighted_mean, weighted_std = distribution
+        alpha = self._compute_historical_bootstrap_alpha(hours_left, n_eff)
 
         self._last_bootstrap = {
             "hours_left": round(hours_left, 2),
-            "n_hist": int(len(remaining_values)),
+            "n_hist": int(remaining_arr.size),
             "n_eff": round(n_eff, 2),
             "alpha": round(alpha, 3),
             "remaining_mean": round(weighted_mean, 2),
-            "remaining_std": round(math.sqrt(max(weighted_var, 0.0)), 2),
+            "remaining_std": round(weighted_std, 2),
         }
 
         if alpha <= 0.0:
@@ -1658,6 +1700,162 @@ class BucketIntradayForecaster(BaseIntradayForecaster):
 
         sampled_remaining = rng.choice(remaining_arr, size=n_simulations, replace=True, p=probs)
         return observed + sampled_remaining
+
+    def apply_late_boundary_silence_overlay(
+        self,
+        probabilities: List[float],
+        *,
+        current_count: int,
+        events: List[TweetEvent],
+        contract_date: date,
+        now: datetime,
+        hours_remaining: float,
+        bin_ranges: List[Tuple[int, int]],
+    ) -> List[float]:
+        """Replace the local 3-bin window with a late-boundary silence analog distribution."""
+        overlay_config = self.config.late_boundary_silence
+        base_probabilities = list(probabilities)
+        self._last_boundary_overlay = {
+            "active": False,
+            "hours_remaining": float(hours_remaining),
+        }
+
+        if not overlay_config.enabled:
+            self._last_boundary_overlay["skipped_reason"] = "disabled"
+            return base_probabilities
+        if hours_remaining > overlay_config.start_hours:
+            self._last_boundary_overlay["skipped_reason"] = "outside_window"
+            return base_probabilities
+        if not bin_ranges:
+            self._last_boundary_overlay["skipped_reason"] = "no_bins"
+            return base_probabilities
+        if not self._historical_suffix_profiles:
+            self._last_boundary_overlay["skipped_reason"] = "no_historical_profiles"
+            return base_probabilities
+
+        current_bin_idx: Optional[int] = None
+        for idx, (lower, upper) in enumerate(bin_ranges):
+            if lower <= current_count <= upper:
+                current_bin_idx = idx
+                break
+        if current_bin_idx is None:
+            self._last_boundary_overlay["skipped_reason"] = "count_outside_bins"
+            return base_probabilities
+        if current_bin_idx + 1 >= len(bin_ranges):
+            self._last_boundary_overlay["skipped_reason"] = "no_next_bin"
+            return base_probabilities
+
+        next_lower = bin_ranges[current_bin_idx + 1][0]
+        distance_to_next_bin = next_lower - current_count
+        if distance_to_next_bin < 1 or distance_to_next_bin > overlay_config.max_distance_to_next_bin:
+            self._last_boundary_overlay["skipped_reason"] = "distance_outside_range"
+            self._last_boundary_overlay["distance_to_next_bin"] = int(distance_to_next_bin)
+            return base_probabilities
+
+        tau_now = int(self.contract_utils.get_tau(now, contract_date))
+        end_tau = min(1440, max(tau_now, int(round(tau_now + hours_remaining * 60.0))))
+        event_taus = np.asarray(
+            sorted(
+                self.contract_utils.get_tau(event.timestamp, contract_date)
+                for event in events
+                if event.timestamp < now
+            ),
+            dtype=np.int16,
+        )
+        silence_minutes = self._get_silence_minutes(event_taus, tau_now)
+        silence_threshold = self._compute_late_boundary_silence_threshold(hours_remaining)
+        if silence_minutes < silence_threshold:
+            self._last_boundary_overlay.update({
+                "skipped_reason": "insufficient_silence",
+                "distance_to_next_bin": int(distance_to_next_bin),
+                "silence_minutes": int(silence_minutes),
+                "silence_threshold_minutes": round(silence_threshold, 2),
+            })
+            return base_probabilities
+
+        is_weekend = self.contract_utils.is_weekend(contract_date)
+        buckets = self._weekend_buckets if is_weekend else self._weekday_buckets
+        if not buckets:
+            self._last_boundary_overlay["skipped_reason"] = "no_buckets"
+            return base_probabilities
+
+        full_bucket_idx = min(tau_now // self.bucket_size, self.n_buckets - 1)
+        full_partial = (tau_now % self.bucket_size) / self.bucket_size
+        expected_so_far = sum(b.mean for b in buckets[:full_bucket_idx])
+        expected_so_far += buckets[full_bucket_idx].mean * full_partial
+
+        distribution = self._weighted_historical_suffix_distribution(
+            event_taus=event_taus,
+            tau_now=tau_now,
+            end_tau=end_tau,
+            is_weekend=is_weekend,
+            expected_so_far=expected_so_far,
+        )
+        if distribution is None:
+            self._last_boundary_overlay.update({
+                "skipped_reason": "no_matching_analogs",
+                "distance_to_next_bin": int(distance_to_next_bin),
+                "silence_minutes": int(silence_minutes),
+                "silence_threshold_minutes": round(silence_threshold, 2),
+            })
+            return base_probabilities
+
+        remaining_arr, probs, n_eff, _, _ = distribution
+        if n_eff < overlay_config.min_effective_n:
+            self._last_boundary_overlay.update({
+                "skipped_reason": "insufficient_effective_n",
+                "distance_to_next_bin": int(distance_to_next_bin),
+                "silence_minutes": int(silence_minutes),
+                "silence_threshold_minutes": round(silence_threshold, 2),
+                "n_eff": round(n_eff, 2),
+            })
+            return base_probabilities
+
+        local_bins = [current_bin_idx, current_bin_idx + 1]
+        if current_bin_idx + 2 < len(bin_ranges):
+            local_bins.append(current_bin_idx + 2)
+
+        q_local = np.zeros(len(local_bins), dtype=float)
+        current_upper = bin_ranges[current_bin_idx][1]
+        next_upper = bin_ranges[current_bin_idx + 1][1]
+        for remaining, weight in zip(remaining_arr, probs):
+            final_count = current_count + int(remaining)
+            if final_count <= current_upper:
+                q_local[0] += weight
+            elif final_count <= next_upper or len(local_bins) == 2:
+                q_local[1] += weight
+            else:
+                q_local[-1] += weight
+
+        q_total = float(q_local.sum())
+        if q_total <= 0.0:
+            self._last_boundary_overlay["skipped_reason"] = "zero_local_distribution"
+            return base_probabilities
+        q_local /= q_total
+
+        local_mass_before = float(sum(base_probabilities[idx] for idx in local_bins))
+        updated_probabilities = list(base_probabilities)
+        for pos, idx in enumerate(local_bins):
+            updated_probabilities[idx] = float(local_mass_before * q_local[pos])
+
+        total = float(sum(updated_probabilities))
+        if total > 0.0:
+            updated_probabilities = [p / total for p in updated_probabilities]
+
+        self._last_boundary_overlay = {
+            "active": True,
+            "hours_remaining": float(hours_remaining),
+            "silence_minutes": int(silence_minutes),
+            "silence_threshold_minutes": round(silence_threshold, 2),
+            "distance_to_next_bin": int(distance_to_next_bin),
+            "local_bins": list(local_bins),
+            "local_mass_before": float(local_mass_before),
+            "base_local_probs": [float(base_probabilities[idx]) for idx in local_bins],
+            "overlay_local_probs": [float(updated_probabilities[idx]) for idx in local_bins],
+            "n_eff": round(n_eff, 2),
+            "skipped_reason": None,
+        }
+        return updated_probabilities
 
     def _sample_with_impulse(
         self,

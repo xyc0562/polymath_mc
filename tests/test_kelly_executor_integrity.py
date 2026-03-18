@@ -19,6 +19,7 @@ from src.algo.musk_tweet_count.kelly.executor import KellyExecutor, UnboxRotatio
 from src.algo.musk_tweet_count.kelly.integration import KellyTradingBot
 from src.algo.musk_tweet_count.kelly.orderbook import OrderbookLevel, UnifiedOrderbook
 from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
+from src.algo.musk_tweet_count.kelly.take_profit import build_late_boundary_take_profit_context
 from src.algo.musk_tweet_count.kelly.user_stream import FillEvent, OrderStatus
 
 
@@ -372,6 +373,151 @@ def test_resolve_live_fak_submission_handles_buy_2dp_inside_search():
     assert resolution.submitted_vwap == pytest.approx(0.203)
     assert resolution.price_moved is True
     assert resolution.size_reduced is False
+
+
+def test_take_profit_sell_size_respects_majority_band():
+    executor = _make_executor(probabilities=[0.55, 0.45])
+    executor.portfolio.execute_buy_yes(0, 100.0, 0.20, "yes-0")
+    orderbooks = {
+        0: _make_orderbook(yes_bids=[(0.84, 120.0)], yes_asks=[(0.85, 120.0)]),
+        1: _make_orderbook(yes_bids=[(0.10, 120.0)], yes_asks=[(0.12, 120.0)]),
+    }
+    context = build_late_boundary_take_profit_context(
+        config=executor.config.late_boundary_take_profit.__class__(enabled=True),
+        current_count=259,
+        bin_ranges=[(240, 259), (260, 279)],
+        hours_remaining=4.0,
+        silence_minutes=130.0,
+        portfolio=executor.portfolio,
+        orderbooks=orderbooks,
+    )
+    executor.set_late_boundary_take_profit_context(context)
+    candidate = TradeCandidate(
+        bin_index=0,
+        action=TradeAction.SELL_YES,
+        size=context.size_floor,
+        price=context.reference_vwap,
+        utility_gain=0.0,
+        reservation_price=0.55,
+        edge=0.05,
+        limit_price=context.reference_vwap,
+        threshold_price=0.80,
+        execution_bound_price=0.80,
+        kind="late_boundary_take_profit",
+        size_floor=context.size_floor,
+        size_cap=context.size_cap,
+        min_utility_override=0.0,
+    )
+
+    optimal = executor._find_optimal_size_on(
+        executor.portfolio,
+        candidate,
+        orderbooks,
+        4.0,
+        executor.config,
+    )
+
+    assert optimal >= context.size_floor
+    assert optimal <= context.size_cap
+
+
+def test_take_profit_sell_rejects_when_depth_is_below_majority_floor():
+    executor = _make_executor(probabilities=[0.55, 0.45])
+    executor.portfolio.execute_buy_yes(0, 100.0, 0.20, "yes-0")
+    orderbooks = {
+        0: _make_orderbook(yes_bids=[(0.84, 60.0)], yes_asks=[(0.85, 60.0)]),
+        1: _make_orderbook(yes_bids=[(0.10, 120.0)], yes_asks=[(0.12, 120.0)]),
+    }
+    candidate = TradeCandidate(
+        bin_index=0,
+        action=TradeAction.SELL_YES,
+        size=70.0,
+        price=0.84,
+        utility_gain=0.0,
+        reservation_price=0.55,
+        edge=0.05,
+        limit_price=0.84,
+        threshold_price=0.80,
+        execution_bound_price=0.80,
+        kind="late_boundary_take_profit",
+        size_floor=70.0,
+        size_cap=90.0,
+        min_utility_override=0.0,
+    )
+
+    optimal = executor._find_optimal_size_on(
+        executor.portfolio,
+        candidate,
+        orderbooks,
+        4.0,
+        executor.config,
+    )
+
+    assert optimal == 0.0
+
+
+def test_compute_optimal_trades_limits_take_profit_sell_to_one_per_tick(monkeypatch):
+    executor = _make_executor(probabilities=[0.55, 0.45])
+    tp_candidate = TradeCandidate(
+        bin_index=0,
+        action=TradeAction.SELL_YES,
+        size=70.0,
+        price=0.84,
+        utility_gain=0.010,
+        reservation_price=0.55,
+        edge=0.05,
+        limit_price=0.84,
+        threshold_price=0.80,
+        execution_bound_price=0.80,
+        kind="late_boundary_take_profit",
+        size_floor=70.0,
+        size_cap=90.0,
+        min_utility_override=0.0,
+    )
+    call_count = {"n": 0}
+
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, take_profit_context=None, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, take_profit_context, verbose
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return [tp_candidate]
+        return []
+
+    monkeypatch.setattr(executor_module, "generate_candidates", fake_generate)
+    monkeypatch.setattr(
+        executor,
+        "_find_optimal_size_on",
+        lambda portfolio, candidate, orderbooks, hours, tick_config=None: candidate.size,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_reprice_candidate_size",
+        lambda candidate, orderbooks, target_size: candidate,
+    )
+
+    def fake_simulate_trade(portfolio, candidate):
+        after = portfolio._copy()
+        after._mock_candidate_bin = candidate.bin_index
+        return after
+
+    monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    monkeypatch.setattr(
+        executor_module,
+        "_compute_portfolio_utility_gain",
+        lambda before, after, config: 0.010 if after._mock_candidate_bin == 0 else 0.0,
+    )
+
+    planned = executor._compute_optimal_trades(
+        executor.portfolio,
+        orderbooks={0: _make_orderbook(bin_index=0, yes_bids=[(0.84, 100.0)], yes_asks=[(0.86, 100.0)])},
+        hours_to_settlement=4.0,
+        verbose=False,
+    )
+
+    assert call_count["n"] >= 2
+    assert len(planned) == 1
+    assert planned[0].kind == "late_boundary_take_profit"
+    assert planned[0].bin_index == 0
 
 
 def test_confirmed_buy_overlay_applied_once_and_reconciled():
@@ -1718,8 +1864,8 @@ def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monk
     ]
     call_count = {"n": 0}
 
-    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
-        del portfolio, orderbooks, config, hours_to_settlement, verbose
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, take_profit_context=None, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, take_profit_context, verbose
         call_count["n"] += 1
         if call_count["n"] == 1:
             return list(candidates)
@@ -1782,8 +1928,8 @@ def test_compute_optimal_trades_skips_sell_with_size_below_one(monkeypatch):
     ]
     call_count = {"n": 0}
 
-    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
-        del portfolio, orderbooks, config, hours_to_settlement, verbose
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, take_profit_context=None, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, take_profit_context, verbose
         call_count["n"] += 1
         if call_count["n"] == 1:
             return list(candidates)
@@ -1844,8 +1990,8 @@ def test_compute_optimal_trades_skips_fak_cooldown_and_uses_next_candidate(monke
     ]
     call_count = {"n": 0}
 
-    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
-        del portfolio, orderbooks, config, hours_to_settlement, verbose
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, take_profit_context=None, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, take_profit_context, verbose
         call_count["n"] += 1
         if call_count["n"] == 1:
             return list(candidates)
@@ -1904,8 +2050,8 @@ def test_compute_optimal_trades_uses_repriced_candidate_for_final_utility(monkey
     }
     call_count = {"n": 0}
 
-    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, verbose=False):
-        del portfolio, orderbooks, config, hours_to_settlement, verbose
+    def fake_generate(*, portfolio, orderbooks, config, hours_to_settlement, take_profit_context=None, verbose=False):
+        del portfolio, orderbooks, config, hours_to_settlement, take_profit_context, verbose
         call_count["n"] += 1
         if call_count["n"] == 1:
             return [candidate]
