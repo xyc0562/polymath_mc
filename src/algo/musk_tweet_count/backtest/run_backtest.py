@@ -791,6 +791,96 @@ def main():
     )
 
     parser.add_argument(
+        "--use-unbox-rotations",
+        action="store_true",
+        help="Enable same-bin unbox rotations for boxed inventory.",
+    )
+
+    parser.add_argument(
+        "--unbox-start-hours-to-settlement",
+        type=float,
+        default=KellyConfig.unbox_start_hours_to_settlement,
+        help=f"Hours-to-settlement window where unbox rotations become eligible. Default: {KellyConfig.unbox_start_hours_to_settlement}.",
+    )
+
+    parser.add_argument(
+        "--unbox-min-blocked-ticks",
+        type=int,
+        default=KellyConfig.unbox_min_blocked_ticks,
+        help=f"Minimum consecutive blocked ticks before an unbox can trigger. Default: {KellyConfig.unbox_min_blocked_ticks}.",
+    )
+
+    parser.add_argument(
+        "--unbox-min-net-utility",
+        type=float,
+        default=KellyConfig.unbox_min_net_utility,
+        help=f"Minimum net package utility required for an unbox. Default: {KellyConfig.unbox_min_net_utility}.",
+    )
+
+    parser.add_argument(
+        "--unbox-late-relax-start-hours",
+        type=float,
+        default=KellyConfig.unbox_late_relax_start_hours_to_settlement,
+        help=f"Hours-to-settlement window where the unbox min net utility starts relaxing. Default: {KellyConfig.unbox_late_relax_start_hours_to_settlement}.",
+    )
+
+    parser.add_argument(
+        "--unbox-late-net-utility-relax",
+        type=float,
+        default=KellyConfig.unbox_late_net_utility_relax,
+        help=f"Reduction applied to the unbox min net utility inside the late-relax window. Default: {KellyConfig.unbox_late_net_utility_relax}.",
+    )
+
+    parser.add_argument(
+        "--unbox-repeat-net-utility-step",
+        type=float,
+        default=KellyConfig.unbox_repeat_net_utility_step,
+        help=f"Additional net utility required per prior unbox on the same bin. Default: {KellyConfig.unbox_repeat_net_utility_step}.",
+    )
+
+    parser.add_argument(
+        "--unbox-repeat-net-utility-cap",
+        type=float,
+        default=KellyConfig.unbox_repeat_net_utility_cap,
+        help=f"Maximum repeat-unbox utility uplift. Default: {KellyConfig.unbox_repeat_net_utility_cap}.",
+    )
+
+    parser.add_argument(
+        "--unbox-multi-bin-start-count",
+        type=int,
+        default=KellyConfig.unbox_multi_bin_start_count,
+        help=f"Distinct-bin count where the multi-bin unbox utility uplift starts. Default: {KellyConfig.unbox_multi_bin_start_count}.",
+    )
+
+    parser.add_argument(
+        "--unbox-multi-bin-net-utility-step",
+        type=float,
+        default=KellyConfig.unbox_multi_bin_net_utility_step,
+        help=f"Additional net utility required per prior unbox in other bins. Default: {KellyConfig.unbox_multi_bin_net_utility_step}.",
+    )
+
+    parser.add_argument(
+        "--unbox-multi-bin-net-utility-cap",
+        type=float,
+        default=KellyConfig.unbox_multi_bin_net_utility_cap,
+        help=f"Maximum multi-bin utility uplift. Default: {KellyConfig.unbox_multi_bin_net_utility_cap}.",
+    )
+
+    parser.add_argument(
+        "--unbox-turnover-penalty",
+        type=float,
+        default=KellyConfig.unbox_turnover_penalty,
+        help=f"Turnover penalty subtracted from gross package utility for unbox rotations. Default: {KellyConfig.unbox_turnover_penalty}.",
+    )
+
+    parser.add_argument(
+        "--unbox-bin-cooldown-seconds",
+        type=int,
+        default=KellyConfig.unbox_bin_cooldown_seconds,
+        help=f"Cooldown after executing an unbox on the same bin. Default: {KellyConfig.unbox_bin_cooldown_seconds}.",
+    )
+
+    parser.add_argument(
         "--consensus-time",
         action="store_true",
         help="Enable time-based trusted-quote consensus blending near settlement.",
@@ -1093,6 +1183,19 @@ def main():
             min_sell_fraction=args.late_boundary_min_sell_fraction,
             max_sell_fraction=args.late_boundary_max_sell_fraction,
         ),
+        use_unbox_rotations=args.use_unbox_rotations,
+        unbox_start_hours_to_settlement=args.unbox_start_hours_to_settlement,
+        unbox_min_blocked_ticks=args.unbox_min_blocked_ticks,
+        unbox_min_net_utility=args.unbox_min_net_utility,
+        unbox_late_relax_start_hours_to_settlement=args.unbox_late_relax_start_hours,
+        unbox_late_net_utility_relax=args.unbox_late_net_utility_relax,
+        unbox_repeat_net_utility_step=args.unbox_repeat_net_utility_step,
+        unbox_repeat_net_utility_cap=args.unbox_repeat_net_utility_cap,
+        unbox_multi_bin_start_count=args.unbox_multi_bin_start_count,
+        unbox_multi_bin_net_utility_step=args.unbox_multi_bin_net_utility_step,
+        unbox_multi_bin_net_utility_cap=args.unbox_multi_bin_net_utility_cap,
+        unbox_turnover_penalty=args.unbox_turnover_penalty,
+        unbox_bin_cooldown_seconds=args.unbox_bin_cooldown_seconds,
         max_iters_per_tick=50,
     )
 
@@ -1187,6 +1290,22 @@ def main():
             args.market_buy_guard_min_coverage,
             args.market_buy_guard_max_avg_spread,
             args.market_buy_guard_disagreement_scale,
+        )
+    if args.use_unbox_rotations:
+        logger.info(
+            "Unbox rotations: enabled (start=%.1fh, blocked_ticks>=%d, min_net=%.3f, late_relax_start=%.1fh, late_relax=%.3f, repeat_step=%.3f cap=%.3f, multi_bin_start=%d step=%.3f cap=%.3f, turnover=%.3f, cooldown=%ds)",
+            args.unbox_start_hours_to_settlement,
+            args.unbox_min_blocked_ticks,
+            args.unbox_min_net_utility,
+            args.unbox_late_relax_start_hours,
+            args.unbox_late_net_utility_relax,
+            args.unbox_repeat_net_utility_step,
+            args.unbox_repeat_net_utility_cap,
+            args.unbox_multi_bin_start_count,
+            args.unbox_multi_bin_net_utility_step,
+            args.unbox_multi_bin_net_utility_cap,
+            args.unbox_turnover_penalty,
+            args.unbox_bin_cooldown_seconds,
         )
     if args.capital_multiplier != 1.0:
         logger.info(f"Capital multiplier: {args.capital_multiplier}x (phantom capital: ${args.capital * (args.capital_multiplier - 1.0):.2f})")

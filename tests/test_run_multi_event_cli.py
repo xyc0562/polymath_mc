@@ -132,3 +132,37 @@ def test_parse_args_accepts_late_boundary_take_profit_flags():
     assert args.late_boundary_trigger_price == 0.8
     assert args.late_boundary_min_sell_fraction == 0.7
     assert args.late_boundary_max_sell_fraction == 0.9
+
+
+def test_parse_args_accepts_unbox_rotation_flags():
+    args = parse_args(
+        [
+            "--use-unbox-rotations",
+            "--unbox-start-hours-to-settlement", "18",
+            "--unbox-min-blocked-ticks", "1",
+            "--unbox-min-net-utility", "0.006",
+            "--unbox-late-relax-start-hours", "3",
+            "--unbox-late-net-utility-relax", "0.002",
+            "--unbox-repeat-net-utility-step", "0.003",
+            "--unbox-repeat-net-utility-cap", "0.006",
+            "--unbox-multi-bin-start-count", "2",
+            "--unbox-multi-bin-net-utility-step", "0.002",
+            "--unbox-multi-bin-net-utility-cap", "0.004",
+            "--unbox-turnover-penalty", "0.002",
+            "--unbox-bin-cooldown-seconds", "1800",
+        ]
+    )
+
+    assert args.use_unbox_rotations is True
+    assert args.unbox_start_hours_to_settlement == 18.0
+    assert args.unbox_min_blocked_ticks == 1
+    assert args.unbox_min_net_utility == 0.006
+    assert args.unbox_late_relax_start_hours == 3.0
+    assert args.unbox_late_net_utility_relax == 0.002
+    assert args.unbox_repeat_net_utility_step == 0.003
+    assert args.unbox_repeat_net_utility_cap == 0.006
+    assert args.unbox_multi_bin_start_count == 2
+    assert args.unbox_multi_bin_net_utility_step == 0.002
+    assert args.unbox_multi_bin_net_utility_cap == 0.004
+    assert args.unbox_turnover_penalty == 0.002
+    assert args.unbox_bin_cooldown_seconds == 1800

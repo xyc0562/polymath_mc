@@ -99,3 +99,75 @@ Delta:
     - no accepted unboxes
 - Working hypothesis:
   - the event path is diverging much earlier than the late-relax window, likely through ordinary trade sizing/selection sensitivity rather than the late unbox floor itself
+
+## Follow-up Update (2026-03-18)
+
+### Operational change
+- Added temporary CLI exposure for unbox controls in:
+  - `src/algo/musk_tweet_count/backtest/run_backtest.py`
+  - `src/algo/musk_tweet_count/forecaster/run_multi_event.py`
+- Goal:
+  - exercise the existing unbox path directly in normal replay commands
+  - remove ambiguity about whether late boxed events were failing because the path was disabled vs. because thresholds were too strict
+
+### Seeded replay: `Mar 10 - Mar 17`
+- Used the live boxed snapshot from `2026-03-17 12:06:09 UTC` in `data/dumps/new_idea.log`.
+- Seeded replay log:
+  - `data/dumps/backtest_mar10_mar17_seeded_unbox.log`
+- Main finding:
+  - the event was immediately recognized as boxed on bin `13`
+  - earliest rejection reason was `no_opposite_buy_candidate`
+  - once the opposite buy candidate existed, the next blocker was `net_package_utility_below_min`
+  - the current research-leading variant eventually accepted an unbox at about `T-3.41h`
+- This answered the earlier uncertainty:
+  - the event was not failing because it was never eligible
+  - it was eligible, but the package economics were too weak until later
+
+### Seeded calibration result
+- Tested a small seeded grid around the live boxed snapshot.
+- Key negative finding:
+  - changing only the late-relax schedule while keeping `unbox_min_net_utility = 0.006` did **not** move the first accepted unbox
+  - the effective floor at `T-3.57h` stayed well above the first plausible earlier package net (`0.002630`)
+- First variant that materially changed the event:
+  - `use_unbox_rotations = True`
+  - `unbox_min_blocked_ticks = 1`
+  - `unbox_min_net_utility = 0.003`
+  - `unbox_late_relax_start_hours_to_settlement = 5.0`
+  - `unbox_late_net_utility_relax = 0.002`
+  - multi-bin uplift unchanged
+  - repeat uplift unchanged
+  - `unbox_turnover_penalty = 0.002`
+- Effect on the seeded event:
+  - no unbox: `-$8,873.55`
+  - current research-leading unbox variant: `-$8,405.44`
+  - tuned seeded variant above: `-$8,320.43`
+- Interpretation:
+  - unboxing helps this live-style trapped state
+  - lowering the base unbox floor to `0.003` and opening the relax window to `5h` helps a bit more
+  - but the useful boundary is narrow: the first meaningfully earlier accepted package was at about `T-3.57h`, not much earlier
+
+### Churn / broader sanity check
+- Ran a small hourly matrix with `--consensus-mode time_only` on:
+  - `Feb 2 - Feb 4`
+  - `Mar 5 - Mar 7`
+  - `Mar 10 - Mar 17`
+- Summary file:
+  - `data/dumps/unbox_matrix_hourly_summary.txt`
+- Results:
+  - `Feb 2 - Feb 4`: baseline, current unbox, and tuned unbox were identical; `0` accepted unboxes
+  - `Mar 5 - Mar 7`: baseline, current unbox, and tuned unbox were identical; `0` accepted unboxes
+  - `Mar 10 - Mar 17`:
+    - baseline: `+$11,518.93`, `37` trades
+    - current research-leading unbox variant: `+$9,673.01`, `40` trades, `1` accepted unbox
+    - tuned seeded variant: `+$9,673.01`, `40` trades, `1` accepted unbox
+- Takeaway:
+  - the tuned variant did **not** increase churn relative to the current research-leading unbox settings on this small hourly matrix
+  - but it also did **not** improve over the current research-leading settings there
+  - both unbox variants underperformed baseline on the ordinary `Mar 10 - Mar 17` replay
+
+### Current conclusion
+- The strongest pre-2026-03-18 basket result is still the focused 10-event `multi-bin + late relaxation` variant above.
+- The new 2026-03-18 seeded calibration result suggests:
+  - unbox remains promising as a rescue path for specific live-style trapped boxed states
+  - but broadening thresholds further is not ready yet
+  - the next likely improvement path is narrower triggering or better opposite-side buy construction, not a blanket lowering of the unbox floor
