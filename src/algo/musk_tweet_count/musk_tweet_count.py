@@ -749,7 +749,7 @@ class DataAPIClient:
         try:
             response = self.session.get(
                 f"{self.base_url}/positions",
-                params={"user": address},
+                params={"user": address, "sizeThreshold": 0},
                 timeout=30
             )
             response.raise_for_status()

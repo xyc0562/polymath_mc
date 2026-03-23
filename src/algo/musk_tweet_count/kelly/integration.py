@@ -16,13 +16,14 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Callable, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from py_clob_client.client import ClobClient
 
 # Polymarket Data API for fetching positions
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+MARKET_POSITIONS_CACHE_TTL_SECONDS = 30.0
 
 from .config import KellyConfig
 from .orderbook import UnifiedOrderbook
@@ -117,6 +118,8 @@ class KellyTradingBot:
         # Bin metadata (set during setup)
         self.bin_upper_bounds: List[int] = []
         self.bin_token_ids: Dict[int, str] = {}  # bin_index -> YES token_id
+        self.bin_condition_ids: Dict[int, Optional[str]] = {}
+        self.market_condition_ids: Tuple[str, ...] = ()
         self.num_bins: int = 0
 
         # Components (initialized during setup)
@@ -133,6 +136,7 @@ class KellyTradingBot:
         self._ema_probabilities: Optional[List[float]] = None
         self._last_consensus_context: Optional[Dict[str, Any]] = None
         self._fresh_start_started_at: Optional[float] = None
+        self._market_positions_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, dict]]] = {}
 
         # Lock for thread-safe tick execution
         self._tick_lock = asyncio.Lock()
@@ -158,6 +162,14 @@ class KellyTradingBot:
         self.bin_lower_bounds = [b.get("lower_bound", 0) for b in bins]
         self.bin_token_ids = {i: b["token_id"] for i, b in enumerate(bins)}  # YES token IDs
         self.bin_no_token_ids = {i: b.get("no_token_id") for i, b in enumerate(bins)}  # NO token IDs
+        self.bin_condition_ids = {i: b.get("condition_id") for i, b in enumerate(bins)}
+        market_condition_ids: List[str] = []
+        seen_condition_ids = set()
+        for condition_id in self.bin_condition_ids.values():
+            if condition_id and condition_id not in seen_condition_ids:
+                seen_condition_ids.add(condition_id)
+                market_condition_ids.append(condition_id)
+        self.market_condition_ids = tuple(market_condition_ids)
 
         # Initialize portfolio
         # Phantom capital is based on event budget (c_event_max), not initial_capital.
@@ -681,7 +693,9 @@ class KellyTradingBot:
         try:
             response = requests.get(
                 f"{POLYMARKET_DATA_API}/positions",
-                params={"user": wallet_address.lower()},
+                # The Data API defaults sizeThreshold=1, which can omit sub-1-share
+                # residual positions that still matter for local inventory sync.
+                params={"user": wallet_address.lower(), "sizeThreshold": 0},
                 timeout=30,
             )
             response.raise_for_status()
@@ -689,7 +703,7 @@ class KellyTradingBot:
 
             # Parse positions: token_id -> {shares, avg_price, value}
             # Handle different response formats
-            positions = {}
+            positions: Dict[str, dict] = {}
 
             def parse_position(pos: dict) -> tuple:
                 """Parse position dict, returns (token_id, pos_info) or (None, None)."""
@@ -720,14 +734,26 @@ class KellyTradingBot:
                     if isinstance(pos, dict):
                         token_id, pos_info = parse_position(pos)
                         if token_id:
-                            positions[token_id] = pos_info
+                            self._merge_position_snapshot(
+                                positions,
+                                token_id=token_id,
+                                shares=pos_info["shares"],
+                                avg_price=pos_info["avg_price"],
+                                value=pos_info["value"],
+                            )
             elif isinstance(positions_data, dict):
                 pos_list = positions_data.get("positions", positions_data.get("data", []))
                 for pos in pos_list:
                     if isinstance(pos, dict):
                         token_id, pos_info = parse_position(pos)
                         if token_id:
-                            positions[token_id] = pos_info
+                            self._merge_position_snapshot(
+                                positions,
+                                token_id=token_id,
+                                shares=pos_info["shares"],
+                                avg_price=pos_info["avg_price"],
+                                value=pos_info["value"],
+                            )
 
             logger.debug(f"Fetched {len(positions)} positions from Polymarket API")
             return positions
@@ -738,6 +764,139 @@ class KellyTradingBot:
                 exc_info=True,
             )
             raise
+
+    @staticmethod
+    def _merge_position_snapshot(
+        positions: Dict[str, dict],
+        *,
+        token_id: Optional[str],
+        shares: float,
+        avg_price: float,
+        value: float,
+    ) -> None:
+        """Merge one API-like position row into token-keyed holdings."""
+        if not token_id or shares <= 0:
+            return
+
+        avg_price = max(0.0, avg_price)
+        value = value if value > 0 else (shares * avg_price if avg_price > 0 else 0.0)
+        existing = positions.get(token_id)
+        if existing is None:
+            positions[token_id] = {
+                "shares": shares,
+                "avg_price": avg_price,
+                "value": value,
+            }
+            return
+
+        total_shares = existing["shares"] + shares
+        total_value = existing["value"] + value
+        blended_avg = total_value / total_shares if total_shares > 0.01 and total_value > 0 else 0.0
+        positions[token_id] = {
+            "shares": total_shares,
+            "avg_price": blended_avg,
+            "value": total_value,
+        }
+
+    async def fetch_market_positions_for_event(self, wallet_address: str) -> Optional[Dict[str, dict]]:
+        """
+        Fetch user positions for this event's markets via /v1/market-positions.
+
+        Returns a token-keyed snapshot aggregated across this event's condition IDs.
+        Returns None on failure so callers can fall back to existing balance checks.
+        """
+        if not self.market_condition_ids:
+            return {}
+
+        wallet_key = wallet_address.lower()
+        now_ts = time.time()
+        aggregated_positions: Dict[str, dict] = {}
+        fetched_markets = 0
+        cache_hits = 0
+
+        logger.info(
+            f"[{self.event_name}] Querying market-positions verifier for {len(self.market_condition_ids)} "
+            f"market(s)"
+        )
+
+        for condition_id in self.market_condition_ids:
+            cache_key = (condition_id, wallet_key)
+            cached = self._market_positions_cache.get(cache_key)
+            if cached and now_ts - cached[0] <= MARKET_POSITIONS_CACHE_TTL_SECONDS:
+                condition_positions = cached[1]
+                cache_hits += 1
+            else:
+                try:
+                    response = requests.get(
+                        f"{POLYMARKET_DATA_API}/v1/market-positions",
+                        params={
+                            "market": condition_id,
+                            "user": wallet_key,
+                            "status": "OPEN",
+                            "limit": 500,
+                        },
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.event_name}] Failed to fetch market-positions verifier for "
+                        f"{condition_id}: {e}"
+                    )
+                    return None
+
+                condition_positions = {}
+                if isinstance(response_data, dict):
+                    response_rows = response_data.get("data", response_data.get("positions", []))
+                else:
+                    response_rows = response_data
+
+                for token_group in response_rows:
+                    if not isinstance(token_group, dict):
+                        continue
+                    fallback_token_id = token_group.get("token")
+                    positions_list = token_group.get("positions", [])
+                    for position_row in positions_list:
+                        if not isinstance(position_row, dict):
+                            continue
+                        proxy_wallet = str(position_row.get("proxyWallet", "")).lower()
+                        if proxy_wallet and proxy_wallet != wallet_key:
+                            continue
+
+                        token_id = position_row.get("asset") or fallback_token_id
+                        try:
+                            shares = float(position_row.get("size", 0) or 0)
+                            avg_price = float(position_row.get("avgPrice", 0) or 0)
+                            total_bought = float(position_row.get("totalBought", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+
+                        self._merge_position_snapshot(
+                            condition_positions,
+                            token_id=token_id,
+                            shares=shares,
+                            avg_price=avg_price,
+                            value=total_bought,
+                        )
+
+                self._market_positions_cache[cache_key] = (now_ts, condition_positions)
+                fetched_markets += 1
+
+            for token_id, pos_info in condition_positions.items():
+                self._merge_position_snapshot(
+                    aggregated_positions,
+                    token_id=token_id,
+                    shares=pos_info["shares"],
+                    avg_price=pos_info["avg_price"],
+                    value=pos_info["value"],
+                )
+
+        logger.info(
+            f"[{self.event_name}] market-positions verifier ready: {len(aggregated_positions)} token(s), "
+            f"{fetched_markets} fetched, {cache_hits} cache hit(s)"
+        )
+        return aggregated_positions
 
     async def fetch_usdc_balance(self) -> float:
         """
@@ -903,6 +1062,15 @@ class KellyTradingBot:
         setattr(pos, avg_attr, avg_cost)
         setattr(pos, unpriced_attr, unpriced_shares)
         setattr(pos, reserve_attr, unpriced_reserve)
+
+        # Track when unpriced shares first appeared for timeout-based cleanup.
+        since_attr = "no_unpriced_since" if is_no else "yes_unpriced_since"
+        if unpriced_shares > 0.01:
+            if getattr(pos, since_attr, 0.0) <= 0.0:
+                setattr(pos, since_attr, time.time())
+        else:
+            setattr(pos, since_attr, 0.0)
+
         if shares <= 0.01:
             self._set_side_missing_state(pos, is_no=is_no, active=False)
         pos.recompute_collateral_used()
@@ -1041,11 +1209,51 @@ class KellyTradingBot:
             return "verified_zero"
 
         if verified_balance is not None and verified_balance > 0.01:
+            balance_delta = max(0.0, verified_balance - local_shares)
             resolve_source = self._sync_position_side_from_balance(
                 pos=pos,
                 is_no=is_no,
                 verified_shares=verified_balance,
             )
+            # If the balance sync created unpriced shares, try to price them
+            # from the overlay ledger — same logic as _sync_position_side_from_api.
+            if (
+                resolve_source == "balance_increase_unpriced"
+                and self.kelly_executor is not None
+                and balance_delta > 0.01
+            ):
+                cur_shares, _, cur_unpriced, _ = self._get_side_state(pos, is_no)
+                if cur_unpriced > 0.01:
+                    priced_delta_shares, priced_delta_avg = (
+                        self.kelly_executor.get_overlay_price_hint_for_api_increase(
+                            bin_index=bin_idx,
+                            is_no=is_no,
+                            share_increase=balance_delta,
+                        )
+                    )
+                    if priced_delta_shares > 0.01:
+                        priced_delta_shares = min(priced_delta_shares, balance_delta)
+                        priced_base = max(0.0, local_shares - local_unpriced)
+                        base_notional = priced_base * local_avg_cost
+                        delta_notional = priced_delta_shares * priced_delta_avg
+                        total_priced = priced_base + priced_delta_shares
+                        blended_avg = (
+                            (base_notional + delta_notional) / total_priced
+                            if total_priced > 0.01 else 0.0
+                        )
+                        unresolved_delta = max(0.0, balance_delta - priced_delta_shares)
+                        unresolved = local_unpriced + unresolved_delta
+                        unresolved_reserve = local_reserve + unresolved_delta
+                        self._set_side_state(
+                            pos, is_no=is_no,
+                            shares=cur_shares, avg_cost=blended_avg,
+                            unpriced_shares=unresolved,
+                            unpriced_reserve=unresolved_reserve,
+                        )
+                        if unresolved <= 0.01:
+                            resolve_source = "balance_increase_overlay"
+                        else:
+                            resolve_source = "balance_increase_overlay+unpriced"
             # API reports 0 but balance shows verified_balance — the discrepancy
             # is verified_balance shares.  Under 100 shares this is a harmless
             # residual after partial sells; skip ambiguity flag and slack alert.
@@ -1064,7 +1272,9 @@ class KellyTradingBot:
             log_fn(
                 f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
                 f"but conditional balance still shows {verified_balance:.2f} shares; preserving local side "
-                f"(source={resolve_source}, avg=${getattr(pos, avg_attr):.4f}, unpriced={getattr(pos, unpriced_attr):.2f}sh/${getattr(pos, reserve_attr):.2f})"
+                f"(reason=positions_missing_balance_verified, source={resolve_source}, "
+                f"avg=${getattr(pos, avg_attr):.4f}, "
+                f"unpriced={getattr(pos, unpriced_attr):.2f}sh/${getattr(pos, reserve_attr):.2f})"
             )
             if self.on_position_sync_warning and not was_missing and api_difference >= 100.0:
                 try:
@@ -1102,7 +1312,8 @@ class KellyTradingBot:
         log_fn(
             f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing from positions API "
             f"but conditional balance could not be verified; retaining local side {local_shares:.2f} @ ${local_avg_cost:.4f} "
-            f"(unpriced={local_unpriced:.2f}sh/${local_reserve:.2f}, missing_count={missing_count})"
+            f"(reason=positions_missing_balance_unavailable, unpriced={local_unpriced:.2f}sh/${local_reserve:.2f}, "
+            f"missing_count={missing_count})"
         )
         if self.on_position_sync_warning and not was_missing and api_difference >= 100.0:
             try:
@@ -1191,6 +1402,134 @@ class KellyTradingBot:
             return "overlay+unpriced_reserve"
         return "unpriced_reserve"
 
+    def _apply_reported_side_snapshot(
+        self,
+        *,
+        pos,
+        bin_idx: int,
+        is_no: bool,
+        api_shares: float,
+        api_avg_price: float,
+        api_value: float,
+        snapshot_source: str,
+    ) -> None:
+        """Apply a reported side snapshot and keep logging/state handling unified."""
+        shares_attr, avg_attr, unpriced_attr, reserve_attr, side_label = self._side_attr_names(is_no)
+        local_shares = getattr(pos, shares_attr)
+        local_avg_cost = getattr(pos, avg_attr)
+        local_unpriced = getattr(pos, unpriced_attr)
+        local_reserve = getattr(pos, reserve_attr)
+        was_uncertain = local_unpriced > 0.01
+        previous_resolve_source = None
+        was_missing_unverified, _, _ = self._get_side_missing_state(pos, is_no)
+
+        if abs(api_shares - local_shares) > 0.01 or api_avg_price > 0 or api_value > 0:
+            previous_resolve_source = self._sync_position_side_from_api(
+                pos=pos,
+                bin_idx=bin_idx,
+                is_no=is_no,
+                api_shares=api_shares,
+                api_avg_price=api_avg_price,
+                api_value=api_value,
+            )
+
+            resolved_avg = getattr(pos, avg_attr)
+            current_unpriced = getattr(pos, unpriced_attr)
+            current_reserve = getattr(pos, reserve_attr)
+            if current_unpriced > 0.01:
+                logger.warning(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
+                    f"{local_shares:.2f} -> {api_shares:.2f} with unresolved increment "
+                    f"{current_unpriced:.2f}sh reserve=${current_reserve:.2f} "
+                    f"(source={previous_resolve_source}, snapshot={snapshot_source}, "
+                    f"local_avg=${local_avg_cost:.4f})"
+                )
+            else:
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
+                    f"{local_shares:.2f} -> {api_shares:.2f} @ ${resolved_avg:.4f} "
+                    f"(source={previous_resolve_source}, snapshot={snapshot_source})"
+                )
+
+            if was_uncertain and current_unpriced <= 0.01:
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis uncertainty cleared "
+                    f"(source={previous_resolve_source}, snapshot={snapshot_source})"
+                )
+            elif not was_uncertain and current_unpriced > 0.01:
+                logger.warning(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis unresolved; "
+                    f"blocking same-side adds until a priced sync arrives "
+                    f"(snapshot={snapshot_source})"
+                )
+            elif was_uncertain and current_unpriced > 0.01 and (
+                abs(current_unpriced - local_unpriced) > 0.01
+                or abs(current_reserve - local_reserve) > 0.01
+            ):
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} unresolved increment adjusted "
+                    f"{local_unpriced:.2f}sh/${local_reserve:.2f} -> {current_unpriced:.2f}sh/${current_reserve:.2f} "
+                    f"(snapshot={snapshot_source})"
+                )
+
+        if was_missing_unverified:
+            self._set_side_missing_state(pos, is_no=is_no, active=False)
+            if snapshot_source == "positions_api":
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing-side ambiguity cleared "
+                    "(positions API reports the side again)"
+                )
+            else:
+                logger.info(
+                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing-side ambiguity cleared "
+                    f"({snapshot_source} confirmed the side)"
+                )
+
+    def _maybe_resolve_stale_unpriced(self) -> None:
+        """Force-resolve unpriced shares that have exceeded the configured age limit."""
+        max_age = self.config.rate_limit.unpriced_max_age_seconds
+        if max_age <= 0 or not self.portfolio:
+            return
+
+        now_ts = time.time()
+        for bin_idx, pos in self.portfolio.positions.items():
+            for is_no in (False, True):
+                current_shares, current_avg_cost, current_unpriced, current_reserve = self._get_side_state(pos, is_no)
+                if current_unpriced <= 0.01:
+                    continue
+
+                since_attr = "no_unpriced_since" if is_no else "yes_unpriced_since"
+                unpriced_since = getattr(pos, since_attr, 0.0)
+                if unpriced_since <= 0.0:
+                    continue
+
+                age = now_ts - unpriced_since
+                if age < max_age:
+                    continue
+
+                # Determine fallback cost basis
+                priced_shares = max(0.0, current_shares - current_unpriced)
+                if priced_shares > 0.01 and current_avg_cost > 0:
+                    fallback_cost = current_avg_cost
+                else:
+                    fallback_cost = 1.0  # Conservative: assume full price
+
+                total_notional = (priced_shares * current_avg_cost) + (current_unpriced * fallback_cost)
+                blended_avg = total_notional / current_shares if current_shares > 0.01 else fallback_cost
+
+                side_label = "NO" if is_no else "YES"
+                logger.warning(
+                    f"[{self.event_name}] Stale unpriced force-resolve: bin {bin_idx} {side_label} "
+                    f"{current_unpriced:.2f} unpriced shares aged {age:.0f}s > {max_age:.0f}s; "
+                    f"resolving at ${fallback_cost:.4f} (blended avg=${blended_avg:.4f})"
+                )
+
+                self._set_side_state(
+                    pos, is_no=is_no,
+                    shares=current_shares, avg_cost=blended_avg,
+                    unpriced_shares=0.0, unpriced_reserve=0.0,
+                )
+
     async def sync_positions_from_api(self, wallet_address: str) -> Tuple[float, Dict[int, float]]:
         """
         Sync portfolio state from Polymarket API.
@@ -1257,93 +1596,119 @@ class KellyTradingBot:
             yes_token = self.bin_token_ids.get(bin_idx)
             pos = self.portfolio.ensure_position(bin_idx, yes_token or "")
 
-            shares_attr, avg_attr, unpriced_attr, reserve_attr, side_label = self._side_attr_names(is_no)
-            local_shares = getattr(pos, shares_attr)
-            local_avg_cost = getattr(pos, avg_attr)
-            local_unpriced = getattr(pos, unpriced_attr)
-            local_reserve = getattr(pos, reserve_attr)
-            was_uncertain = local_unpriced > 0.01
-            previous_resolve_source = None
-            was_missing_unverified, _, _ = self._get_side_missing_state(pos, is_no)
-
-            # Update to API value if different
-            if abs(api_shares - local_shares) > 0.01 or api_avg_price > 0 or api_value > 0:
-                previous_resolve_source = self._sync_position_side_from_api(
-                    pos=pos,
-                    bin_idx=bin_idx,
-                    is_no=is_no,
-                    api_shares=api_shares,
-                    api_avg_price=api_avg_price,
-                    api_value=api_value,
-                )
-
-                resolved_avg = getattr(pos, avg_attr)
-                current_unpriced = getattr(pos, unpriced_attr)
-                current_reserve = getattr(pos, reserve_attr)
-                if current_unpriced > 0.01:
-                    logger.warning(
-                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
-                        f"{local_shares:.2f} -> {api_shares:.2f} with unresolved increment "
-                        f"{current_unpriced:.2f}sh reserve=${current_reserve:.2f} "
-                        f"(source={previous_resolve_source}, local_avg=${local_avg_cost:.4f})"
-                    )
-                else:
-                    logger.info(
-                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} updated "
-                        f"{local_shares:.2f} -> {api_shares:.2f} @ ${resolved_avg:.4f} "
-                        f"(source={previous_resolve_source})"
-                    )
-
-                if was_uncertain and current_unpriced <= 0.01:
-                    logger.info(
-                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis uncertainty cleared "
-                        f"(source={previous_resolve_source})"
-                    )
-                elif not was_uncertain and current_unpriced > 0.01:
-                    logger.warning(
-                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} cost basis unresolved; "
-                        f"blocking same-side adds until a priced sync arrives"
-                    )
-                elif was_uncertain and current_unpriced > 0.01 and (
-                    abs(current_unpriced - local_unpriced) > 0.01
-                    or abs(current_reserve - local_reserve) > 0.01
-                ):
-                    logger.info(
-                        f"[{self.event_name}] API sync: bin {bin_idx} {side_label} unresolved increment adjusted "
-                        f"{local_unpriced:.2f}sh/${local_reserve:.2f} -> {current_unpriced:.2f}sh/${current_reserve:.2f}"
-                    )
-            if was_missing_unverified:
-                self._set_side_missing_state(pos, is_no=is_no, active=False)
-                logger.info(
-                    f"[{self.event_name}] API sync: bin {bin_idx} {side_label} missing-side ambiguity cleared "
-                    "(positions API reports the side again)"
-                )
+            self._apply_reported_side_snapshot(
+                pos=pos,
+                bin_idx=bin_idx,
+                is_no=is_no,
+                api_shares=api_shares,
+                api_avg_price=api_avg_price,
+                api_value=api_value,
+                snapshot_source="positions_api",
+            )
 
             synced_positions[bin_idx] = api_shares
 
         # Second, verify positions that API doesn't report before clearing them.
+        market_positions_snapshot: Optional[Dict[str, dict]] = None
+        market_positions_attempted = False
+
         for bin_idx in tracked_bins:
             pos = self.portfolio.positions.get(bin_idx)
             if not pos:
                 continue
 
+            async def ensure_market_positions_snapshot() -> Optional[Dict[str, dict]]:
+                nonlocal market_positions_snapshot, market_positions_attempted
+                if market_positions_attempted:
+                    return market_positions_snapshot
+                market_positions_attempted = True
+                market_positions_snapshot = await self.fetch_market_positions_for_event(wallet_address)
+                return market_positions_snapshot
+
             # Check YES position - if API doesn't have it and we do, verify before clearing
             if pos.yes_shares > 0.01 and (bin_idx, False) not in api_bin_positions:
-                self._handle_missing_api_side(
-                    pos=pos,
-                    bin_idx=bin_idx,
-                    is_no=False,
-                    token_id=self.bin_token_ids.get(bin_idx),
-                )
+                market_pos_info = None
+                market_snapshot = await ensure_market_positions_snapshot()
+                if market_snapshot is not None:
+                    market_pos_info = market_snapshot.get(self.bin_token_ids.get(bin_idx, ""))
+
+                if market_pos_info:
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} YES missing from positions API "
+                        f"but market-positions confirmed {market_pos_info['shares']:.2f} shares "
+                        f"(reason=positions_missing_market_verified)"
+                    )
+                    self._apply_reported_side_snapshot(
+                        pos=pos,
+                        bin_idx=bin_idx,
+                        is_no=False,
+                        api_shares=market_pos_info["shares"],
+                        api_avg_price=market_pos_info["avg_price"],
+                        api_value=market_pos_info["value"],
+                        snapshot_source="market_positions",
+                    )
+                    synced_positions[bin_idx] = market_pos_info["shares"]
+                else:
+                    if market_snapshot is not None:
+                        logger.debug(
+                            f"[{self.event_name}] API sync: bin {bin_idx} YES missing from positions API and "
+                            "market-positions omitted it; falling back to conditional balance verification"
+                        )
+                    elif self.market_condition_ids:
+                        logger.debug(
+                            f"[{self.event_name}] API sync: bin {bin_idx} YES missing from positions API and "
+                            "market-positions verifier unavailable; falling back to conditional balance verification"
+                        )
+                    self._handle_missing_api_side(
+                        pos=pos,
+                        bin_idx=bin_idx,
+                        is_no=False,
+                        token_id=self.bin_token_ids.get(bin_idx),
+                    )
 
             # Check NO position - if API doesn't have it and we do, verify before clearing
             if pos.no_shares > 0.01 and (bin_idx, True) not in api_bin_positions:
-                self._handle_missing_api_side(
-                    pos=pos,
-                    bin_idx=bin_idx,
-                    is_no=True,
-                    token_id=self.bin_no_token_ids.get(bin_idx),
-                )
+                market_pos_info = None
+                market_snapshot = await ensure_market_positions_snapshot()
+                if market_snapshot is not None:
+                    market_pos_info = market_snapshot.get(self.bin_no_token_ids.get(bin_idx, ""))
+
+                if market_pos_info:
+                    logger.info(
+                        f"[{self.event_name}] API sync: bin {bin_idx} NO missing from positions API "
+                        f"but market-positions confirmed {market_pos_info['shares']:.2f} shares "
+                        f"(reason=positions_missing_market_verified)"
+                    )
+                    self._apply_reported_side_snapshot(
+                        pos=pos,
+                        bin_idx=bin_idx,
+                        is_no=True,
+                        api_shares=market_pos_info["shares"],
+                        api_avg_price=market_pos_info["avg_price"],
+                        api_value=market_pos_info["value"],
+                        snapshot_source="market_positions",
+                    )
+                    synced_positions[bin_idx] = market_pos_info["shares"]
+                else:
+                    if market_snapshot is not None:
+                        logger.debug(
+                            f"[{self.event_name}] API sync: bin {bin_idx} NO missing from positions API and "
+                            "market-positions omitted it; falling back to conditional balance verification"
+                        )
+                    elif self.market_condition_ids:
+                        logger.debug(
+                            f"[{self.event_name}] API sync: bin {bin_idx} NO missing from positions API and "
+                            "market-positions verifier unavailable; falling back to conditional balance verification"
+                        )
+                    self._handle_missing_api_side(
+                        pos=pos,
+                        bin_idx=bin_idx,
+                        is_no=True,
+                        token_id=self.bin_no_token_ids.get(bin_idx),
+                    )
+
+        # Force-resolve any unpriced shares that have exceeded the age limit.
+        self._maybe_resolve_stale_unpriced()
 
         # IMPORTANT: Use event capital budget (c_event_max), NOT wallet USDC balance
         # In multi-event scenarios, each event has its own capital allocation.

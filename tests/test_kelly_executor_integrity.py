@@ -118,6 +118,8 @@ def _make_sync_bot(
     bot._setup_complete = True
     bot.bin_token_ids = {i: f"yes-{i}" for i in range(num_bins)}
     bot.bin_no_token_ids = {i: f"no-{i}" for i in range(num_bins)}
+    bot.bin_condition_ids = {i: f"condition-{i}" for i in range(num_bins)}
+    bot.market_condition_ids = tuple(bot.bin_condition_ids.values())
     bot.portfolio = Portfolio(
         initial_capital=initial_capital,
         capital=initial_capital,
@@ -958,6 +960,51 @@ def test_sync_positions_missing_price_can_use_overlay_hint(monkeypatch):
     assert position.has_yes_unpriced_increment is False
 
 
+def test_missing_api_side_balance_increase_uses_overlay_for_new_delta_only(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.4])
+    bot.config.rate_limit.unpriced_max_age_seconds = 10_000_000_000.0
+    bot.portfolio.execute_buy_yes(0, 20.0, 0.25, "yes-0")
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    position.yes_unpriced_shares = 2.0
+    position.yes_unpriced_reserve = 2.0
+    position.yes_unpriced_since = 100.0
+    position.recompute_collateral_used()
+
+    class FakeExecutor:
+        def get_overlay_price_hint_for_api_increase(self, *, bin_index, is_no, share_increase):
+            assert bin_index == 0
+            assert is_no is False
+            assert share_increase == pytest.approx(5.0)
+            return 5.0, 0.41
+
+    bot.kelly_executor = FakeExecutor()
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_balance():
+        return 0.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_balance)
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda token_id, refresh=True: 25.0 if token_id == "yes-0" else None,
+    )
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.yes_shares == pytest.approx(25.0)
+    assert position.yes_avg_cost == pytest.approx((18.0 * 0.25 + 5.0 * 0.41) / 23.0)
+    assert position.yes_unpriced_shares == pytest.approx(2.0)
+    assert position.yes_unpriced_reserve == pytest.approx(2.0)
+    assert position.yes_unpriced_since == pytest.approx(100.0)
+
+
 def test_truly_unpriceable_increment_blocks_same_side_add_but_not_other_bins(monkeypatch):
     bot = _make_sync_bot(num_bins=2, probabilities=[0.2, 0.8])
     bot.portfolio.execute_buy_no(0, 30.0, 0.7, "yes-0")
@@ -1139,6 +1186,59 @@ def test_sync_logging_reports_resolution_sources_and_uncertainty(monkeypatch, ca
     assert "cost basis uncertainty cleared" in caplog.text
 
 
+def test_stale_unpriced_is_force_resolved_after_timeout(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.4])
+    bot.config.rate_limit.unpriced_max_age_seconds = 300.0
+    bot.portfolio.execute_buy_yes(0, 10.0, 0.25, "yes-0")
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    position.yes_unpriced_shares = 4.0
+    position.yes_unpriced_reserve = 4.0
+    position.yes_unpriced_since = 100.0
+    position.recompute_collateral_used()
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_balance():
+        return 0.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_balance)
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda token_id, refresh=True: 10.0 if token_id == "yes-0" else None,
+    )
+    monkeypatch.setattr("src.algo.musk_tweet_count.kelly.integration.time.time", lambda: 401.0)
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.has_yes_unpriced_increment is False
+    assert position.yes_unpriced_since == 0.0
+    assert position.yes_avg_cost == pytest.approx(0.25)
+
+
+def test_portfolio_copy_preserves_unpriced_timestamps():
+    portfolio = Portfolio(initial_capital=100.0, capital=90.0, num_bins=1, probabilities=[0.5])
+    portfolio.execute_buy_yes(0, 10.0, 0.25, "yes-0")
+    position = portfolio.get_position(0)
+    assert position is not None
+    position.yes_unpriced_shares = 3.0
+    position.yes_unpriced_reserve = 3.0
+    position.yes_unpriced_since = 123.0
+    position.no_unpriced_since = 456.0
+    position.recompute_collateral_used()
+
+    copied = portfolio._copy()
+    copied_position = copied.get_position(0)
+    assert copied_position is not None
+    assert copied_position.yes_unpriced_since == pytest.approx(123.0)
+    assert copied_position.no_unpriced_since == pytest.approx(456.0)
+
+
 def test_missing_api_side_with_positive_conditional_balance_is_retained_and_sellable(monkeypatch):
     bot = _make_sync_bot(probabilities=[0.2])
     bot.portfolio.execute_buy_no(0, 251.1, 0.86523, "yes-0")
@@ -1188,6 +1288,258 @@ def test_missing_api_side_with_positive_conditional_balance_is_retained_and_sell
     assert any(c.action == TradeAction.SELL_NO for c in candidates)
     assert all(c.action != TradeAction.BUY_YES for c in candidates)
     assert bot.get_status()["position_sync"]["warning_count"] == 1
+
+
+def test_missing_api_side_uses_market_positions_verifier_before_balance_fallback(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.5])
+    bot.portfolio.execute_buy_yes(0, 12.0, 0.22, "yes-0")
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    async def fake_market_positions(_wallet_address):
+        return {
+            "yes-0": {
+                "shares": 15.0,
+                "avg_price": 0.31,
+                "value": 4.65,
+            }
+        }
+
+    def fail_balance(*_args, **_kwargs):
+        raise AssertionError("conditional balance fallback should not run when market-positions confirms the side")
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr(bot, "fetch_market_positions_for_event", fake_market_positions)
+    monkeypatch.setattr(bot, "_fetch_conditional_balance_shares", fail_balance)
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.yes_shares == pytest.approx(15.0)
+    assert position.yes_avg_cost == pytest.approx(0.31)
+    assert position.has_yes_unpriced_increment is False
+    assert position.has_yes_api_missing_unverified is False
+
+
+def test_missing_api_side_market_positions_omission_falls_back_to_balance_verification(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.5])
+    bot.portfolio.execute_buy_no(0, 150.0, 0.74, "yes-0")
+    balance_calls = {"count": 0}
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    async def fake_market_positions(_wallet_address):
+        return {}
+
+    def fake_balance(token_id, refresh=True):
+        balance_calls["count"] += 1
+        assert token_id == "no-0"
+        return 150.0
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr(bot, "fetch_market_positions_for_event", fake_market_positions)
+    monkeypatch.setattr(bot, "_fetch_conditional_balance_shares", fake_balance)
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.no_shares == pytest.approx(150.0)
+    assert position.has_no_api_missing_unverified is True
+    assert balance_calls["count"] == 1
+
+
+def test_market_positions_verifier_preserves_tiny_residual_inventory_behavior(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.7])
+    bot.portfolio.execute_buy_yes(0, 0.5, 0.18, "yes-0")
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    async def fake_market_positions(_wallet_address):
+        return {
+            "yes-0": {
+                "shares": 0.5,
+                "avg_price": 0.18,
+                "value": 0.09,
+            }
+        }
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr(bot, "fetch_market_positions_for_event", fake_market_positions)
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("balance fallback should not run")),
+    )
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    candidates = generate_candidates(
+        portfolio=bot.portfolio,
+        orderbooks={
+            0: _make_orderbook(
+                bin_index=0,
+                yes_bids=[(0.16, 100.0)],
+                yes_asks=[(0.17, 100.0)],
+            )
+        },
+        config=KellyConfig(),
+        hours_to_settlement=4.0,
+        verbose=True,
+    )
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.has_yes_position is True
+    assert position.has_yes_unpriced_increment is False
+    assert all(c.action != TradeAction.BUY_NO for c in candidates)
+
+
+def test_market_positions_verifier_cache_reused_within_ttl_and_refreshed_after(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.5])
+    bot.portfolio.execute_buy_yes(0, 9.0, 0.21, "yes-0")
+    now = {"value": 100.0}
+    market_calls = {"count": 0}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "token": "yes-0",
+                    "positions": [
+                        {
+                            "proxyWallet": "0xabc",
+                            "asset": "yes-0",
+                            "avgPrice": 0.25,
+                            "size": 9.0,
+                            "totalBought": 2.25,
+                        }
+                    ],
+                }
+            ]
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    def fake_requests_get(url, params=None, timeout=None):
+        assert url.endswith("/v1/market-positions")
+        assert params["market"] == "condition-0"
+        market_calls["count"] += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr("src.algo.musk_tweet_count.kelly.integration.requests.get", fake_requests_get)
+    monkeypatch.setattr("src.algo.musk_tweet_count.kelly.integration.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("balance fallback should not run")),
+    )
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+    now["value"] = 110.0
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+    now["value"] = 131.0
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    assert market_calls["count"] == 2
+
+
+def test_positions_api_reporting_side_again_bypasses_market_positions_verifier(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.5])
+    bot.portfolio.execute_buy_yes(0, 10.0, 0.20, "yes-0")
+    verifier_calls = {"count": 0}
+    states = [
+        {},
+        {
+            "yes-0": {
+                "shares": 10.0,
+                "avg_price": 0.27,
+                "value": 2.7,
+            }
+        },
+    ]
+
+    async def fake_fetch_positions(_wallet_address):
+        return states.pop(0)
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    async def fake_market_positions(_wallet_address):
+        verifier_calls["count"] += 1
+        return {
+            "yes-0": {
+                "shares": 10.0,
+                "avg_price": 0.20,
+                "value": 2.0,
+            }
+        }
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr(bot, "fetch_market_positions_for_event", fake_market_positions)
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert verifier_calls["count"] == 1
+    assert position.yes_avg_cost == pytest.approx(0.27)
+
+
+def test_market_positions_verifier_failure_falls_back_cleanly_to_balance_check(monkeypatch):
+    bot = _make_sync_bot(probabilities=[0.4])
+    bot.portfolio.execute_buy_no(0, 120.0, 0.72, "yes-0")
+
+    async def fake_fetch_positions(_wallet_address):
+        return {}
+
+    async def fake_fetch_usdc():
+        return 0.0
+
+    def fake_requests_get(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bot, "fetch_positions_from_api", fake_fetch_positions)
+    monkeypatch.setattr(bot, "fetch_usdc_balance", fake_fetch_usdc)
+    monkeypatch.setattr("src.algo.musk_tweet_count.kelly.integration.requests.get", fake_requests_get)
+    monkeypatch.setattr(
+        bot,
+        "_fetch_conditional_balance_shares",
+        lambda token_id, refresh=True: 120.0 if token_id == "no-0" else None,
+    )
+
+    asyncio.run(bot.sync_positions_from_api("0xabc"))
+
+    position = bot.portfolio.get_position(0)
+    assert position is not None
+    assert position.no_shares == pytest.approx(120.0)
+    assert position.has_no_api_missing_unverified is True
 
 
 def test_missing_api_side_verified_zero_clears_position(monkeypatch):

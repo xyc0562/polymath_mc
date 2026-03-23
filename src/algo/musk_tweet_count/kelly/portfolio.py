@@ -47,6 +47,10 @@ class BinPosition:
     yes_unpriced_reserve: float = 0.0
     no_unpriced_reserve: float = 0.0
 
+    # Wall-clock timestamp when unpriced shares first appeared (0 = none).
+    yes_unpriced_since: float = 0.0
+    no_unpriced_since: float = 0.0
+
     # Position side is missing from positions API but not yet verified closed.
     yes_api_missing_unverified: bool = False
     no_api_missing_unverified: bool = False
@@ -509,6 +513,8 @@ class Portfolio:
                 no_unpriced_shares=pos.no_unpriced_shares,
                 yes_unpriced_reserve=pos.yes_unpriced_reserve,
                 no_unpriced_reserve=pos.no_unpriced_reserve,
+                yes_unpriced_since=pos.yes_unpriced_since,
+                no_unpriced_since=pos.no_unpriced_since,
                 yes_api_missing_unverified=pos.yes_api_missing_unverified,
                 no_api_missing_unverified=pos.no_api_missing_unverified,
                 yes_api_missing_since=pos.yes_api_missing_since,

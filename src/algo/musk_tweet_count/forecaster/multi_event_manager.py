@@ -3501,7 +3501,7 @@ class MultiEventManager:
         try:
             response = requests.get(
                 f"{POLYMARKET_DATA_API}/positions",
-                params={"user": self.wallet_address.lower()},
+                params={"user": self.wallet_address.lower(), "sizeThreshold": 0},
                 timeout=30,
             )
             response.raise_for_status()

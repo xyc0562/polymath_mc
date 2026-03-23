@@ -146,6 +146,11 @@ class RateLimitConfig:
     # critical recovery event, and resumes trading from API state.
     integrity_freeze_max_seconds: float = 180.0
 
+    # Maximum age for unpriced shares before force-resolving with fallback
+    # cost basis. Prevents indefinite buy-blocking when the positions API
+    # never provides pricing for a confirmed fill.
+    unpriced_max_age_seconds: float = 300.0
+
 
 
 @dataclass

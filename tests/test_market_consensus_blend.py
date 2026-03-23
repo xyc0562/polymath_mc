@@ -106,7 +106,9 @@ def test_consensus_blend_passthrough_when_coverage_is_too_low():
     )
 
     assert blended == probabilities
-    assert context is None
+    assert context is not None
+    assert context["skipped"] == "blend_not_allowed"
+    assert context["coverage_ratio"] == pytest.approx(0.5)
 
 
 def test_consensus_time_alpha_decreases_toward_settlement():
