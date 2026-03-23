@@ -166,3 +166,9 @@ def test_parse_args_accepts_unbox_rotation_flags():
     assert args.unbox_multi_bin_net_utility_cap == 0.004
     assert args.unbox_turnover_penalty == 0.002
     assert args.unbox_bin_cooldown_seconds == 1800
+
+
+def test_parse_args_uses_updated_unbox_start_default():
+    args = parse_args([])
+
+    assert args.unbox_start_hours_to_settlement == 12.0

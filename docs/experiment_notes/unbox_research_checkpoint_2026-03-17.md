@@ -171,3 +171,66 @@ Delta:
   - unbox remains promising as a rescue path for specific live-style trapped boxed states
   - but broadening thresholds further is not ready yet
   - the next likely improvement path is narrower triggering or better opposite-side buy construction, not a blanket lowering of the unbox floor
+
+## Follow-up Update (2026-03-19)
+
+### Combined-unbox start-window sweep
+- Ran a focused 7-event hourly sweep keeping the combined package logic intact and changing only:
+  - `unbox_start_hours_to_settlement` in `{24h, 12h, 8h, 6h}`
+- All runs used:
+  - `--consensus-mode time_only`
+  - `use_unbox_rotations = True`
+  - `unbox_min_blocked_ticks = 1`
+  - `unbox_min_net_utility = 0.006`
+  - `unbox_late_relax_start_hours_to_settlement = 3.0`
+  - `unbox_late_net_utility_relax = 0.002`
+- Summary file:
+  - `data/dumps/unbox_start_window_20260318_summary.txt`
+
+### Main finding
+- `12h` is the best current start-window setting for the combined approach on this basket.
+- Totals across the 7-event basket:
+  - baseline: `+$42,235.73`, `230` trades, `0` accepted unboxes
+  - `24h`: `+$41,232.42`, `243` trades, `4` accepted unboxes
+  - `12h`: `+$43,356.78`, `237` trades, `3` accepted unboxes
+  - `8h`: `+$42,235.73`, `230` trades, `0` accepted unboxes
+  - `6h`: `+$42,235.73`, `230` trades, `0` accepted unboxes
+
+### Interpretation
+- The harmful early `Mar 10 - Mar 17` unbox happened at about `T-23.66h` under the `24h` window and disappears completely at `12h`.
+- The `12h` window still preserves the more useful mid-late accepted unboxes around `10-12h`, notably on:
+  - `Feb 23 - Feb 25`
+  - `Mar 10 - Mar 11`
+- `8h` and `6h` are too restrictive and suppress all combined unboxes on this basket.
+- Practical conclusion:
+  - narrowing the eligibility window is a better lever than lowering the combined utility floor further
+  - `12h` is a reasonable stopping point and does not look like a knife-edge overfit
+
+### Default-setting decision
+- Updated the code/config default for `unbox_start_hours_to_settlement` from `24.0` to `12.0`.
+- `use_unbox_rotations` remains off by default.
+- So baseline behavior is still unchanged unless unbox is explicitly enabled.
+
+### Broad sanity check with the `12h` window
+- Ran the standard multi-event backtest command family with:
+  - `--start-date 2025-12-15`
+  - `--projection asymmetric`
+  - `--intraday-mode bucket`
+  - `--capital-multiplier 1.5`
+  - `--duration 7`
+  - `--historical-bootstrap`
+  - `--consensus-mode time_only`
+- Comparison file:
+  - `data/dumps/unbox_start12_sanity_compare.txt`
+- Result:
+  - baseline: `+$137,630.21`, `2,059` trades
+  - combined unbox with `12h` start window:
+    - `+$140,102.58`, `2,084` trades, `12` accepted unboxes
+  - delta:
+    - `+$2,472.37`
+    - `+25` trades
+- Interpretation:
+  - the `12h` window did not just fix the focused basket; it also improved the broader replay set
+  - the changed-event count stayed small (`11/57` events)
+  - the most important earlier concern, `Mar 10 - Mar 17`, no longer regressed under the `12h` window
+  - there are still some negative changed events (`Jan 19 - Jan 21`, `Jan 9 - Jan 16`, `Jan 12 - Jan 14`), so this is a better default window, not proof that unbox should be on by default

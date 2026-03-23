@@ -365,7 +365,7 @@ class KellyConfig:
 
     # Late-stage same-bin rotation path for boxed inventory.
     use_unbox_rotations: bool = False
-    unbox_start_hours_to_settlement: float = 24.0
+    unbox_start_hours_to_settlement: float = 12.0
     unbox_min_blocked_ticks: int = 3
     unbox_min_net_utility: float = 0.012
     unbox_late_relax_start_hours_to_settlement: float = 3.0

@@ -68,7 +68,7 @@ kelly:
   # Late-stage same-bin boxed inventory rotations.
   # Off by default until validated on shadow replay/backtests.
   use_unbox_rotations: false
-  unbox_start_hours_to_settlement: 24.0
+  unbox_start_hours_to_settlement: 12.0
   unbox_min_blocked_ticks: 3
   unbox_min_net_utility: 0.012
   unbox_late_relax_start_hours_to_settlement: 3.0
