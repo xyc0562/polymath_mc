@@ -309,7 +309,7 @@ class KellyConfig:
 
     # Minimum utility gain to execute a sell trade.
     # Higher than buy to create hysteresis and prevent cycling.
-    min_sell_utility: float = 0.006
+    min_sell_utility: float = 0.004
 
     # Fractional Kelly parameter α ∈ (0, 1].
     # Controls risk aversion via CRRA power utility with γ = 1/α.

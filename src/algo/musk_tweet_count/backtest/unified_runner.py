@@ -116,6 +116,8 @@ class UnifiedBacktestConfig:
 
     # Tick frequency
     tick_interval_seconds: int = 3600  # 1 hour between ticks
+    late_tick_interval_seconds: Optional[int] = None
+    late_tick_start_hours_before_settlement: Optional[float] = None
     resume_from_timestamp: Optional[int] = None
 
     # Forecaster settings
@@ -338,21 +340,6 @@ class UnifiedBacktestRunner:
         self._trade_table_header_printed = False
         self._capital_exhausted_logged = False
 
-        # Sample timestamps
-        tick_interval = self.config.tick_interval_seconds
-        sampled_timestamps = self._sample_timestamps(
-            event.all_timestamps,
-            tick_interval,
-            start_at_ts=self.config.resume_from_timestamp,
-        )
-        if self.config.resume_from_timestamp is not None:
-            resume_dt = datetime.fromtimestamp(self.config.resume_from_timestamp, tz=timezone.utc)
-            logger.info(f"  Replay resume timestamp: {resume_dt.isoformat()}")
-        logger.info(f"  Sampled {len(sampled_timestamps)} ticks (every {tick_interval}s)")
-        if not sampled_timestamps:
-            logger.error("No sampled ticks available after applying replay start timestamp")
-            return None
-
         # Calculate settlement time for exit logic
         # Settlement is at 12pm EST (noon ET) on the end date of counting
         # Contract days use noon ET boundaries: "Dec 19 - Dec 26" means Dec 19 12:00 to Dec 26 12:00
@@ -374,6 +361,31 @@ class UnifiedBacktestRunner:
         settlement_ts = int(settlement_dt.timestamp())
         exit_window_start = settlement_dt - timedelta(hours=self.config.exit_hours_before_settlement)
         in_exit_mode = False
+
+        # Sample timestamps
+        tick_interval = self.config.tick_interval_seconds
+        sampled_timestamps = self._sample_timestamps(
+            event.all_timestamps,
+            tick_interval,
+            start_at_ts=self.config.resume_from_timestamp,
+            settlement_ts=settlement_ts,
+        )
+        if self.config.resume_from_timestamp is not None:
+            resume_dt = datetime.fromtimestamp(self.config.resume_from_timestamp, tz=timezone.utc)
+            logger.info(f"  Replay resume timestamp: {resume_dt.isoformat()}")
+        if self.config.late_tick_interval_seconds is not None and self.config.late_tick_start_hours_before_settlement is not None:
+            logger.info(
+                "  Sampled %d ticks (every %ss, then every %ss inside final %.1fh)",
+                len(sampled_timestamps),
+                tick_interval,
+                self.config.late_tick_interval_seconds,
+                self.config.late_tick_start_hours_before_settlement,
+            )
+        else:
+            logger.info(f"  Sampled {len(sampled_timestamps)} ticks (every {tick_interval}s)")
+        if not sampled_timestamps:
+            logger.error("No sampled ticks available after applying replay start timestamp")
+            return None
 
         # Track contract day for interday model updates
         last_contract_day = None
@@ -864,6 +876,7 @@ class UnifiedBacktestRunner:
         timestamps: List[int],
         interval_seconds: int,
         start_at_ts: Optional[int] = None,
+        settlement_ts: Optional[int] = None,
     ) -> List[int]:
         """Sample timestamps at regular intervals."""
         if not timestamps:
@@ -875,10 +888,39 @@ class UnifiedBacktestRunner:
             if not eligible:
                 return []
 
-        sampled = [eligible[0]]
-        last_ts = eligible[0]
+        late_interval = self.config.late_tick_interval_seconds
+        late_start_hours = self.config.late_tick_start_hours_before_settlement
+        if (
+            settlement_ts is None
+            or late_interval is None
+            or late_start_hours is None
+        ):
+            return self._sample_timestamps_at_interval(eligible, interval_seconds)
 
-        for ts in eligible[1:]:
+        switch_ts = settlement_ts - int(late_start_hours * 3600.0)
+        early = [ts for ts in eligible if ts < switch_ts]
+        late = [ts for ts in eligible if ts >= switch_ts]
+
+        sampled: List[int] = []
+        if early:
+            sampled.extend(self._sample_timestamps_at_interval(early, interval_seconds))
+        if late:
+            sampled.extend(self._sample_timestamps_at_interval(late, late_interval))
+        return sampled
+
+    @staticmethod
+    def _sample_timestamps_at_interval(
+        timestamps: List[int],
+        interval_seconds: int,
+    ) -> List[int]:
+        """Sample a sorted timestamp series at a fixed interval."""
+        if not timestamps:
+            return []
+
+        sampled = [timestamps[0]]
+        last_ts = timestamps[0]
+
+        for ts in timestamps[1:]:
             if ts - last_ts >= interval_seconds:
                 sampled.append(ts)
                 last_ts = ts

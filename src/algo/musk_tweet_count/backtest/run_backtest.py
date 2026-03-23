@@ -621,6 +621,22 @@ def main():
     )
 
     parser.add_argument(
+        "--late-tick-interval",
+        type=int,
+        default=None,
+        help="Optional higher-fidelity tick interval in seconds for the final settlement window. "
+             "Example: 300 for 5-minute replay near settlement.",
+    )
+
+    parser.add_argument(
+        "--late-tick-start-hours",
+        type=float,
+        default=None,
+        help="Optional hours-before-settlement window where --late-tick-interval takes over. "
+             "Example: 24 means use the late interval inside the final 24 hours.",
+    )
+
+    parser.add_argument(
         "--projection",
         type=str,
         default="asymmetric",
@@ -1058,6 +1074,15 @@ def main():
     if args.seed_log_event and not args.seed_from_log:
         logger.error("--seed-log-event requires --seed-from-log")
         return
+    if (args.late_tick_interval is None) != (args.late_tick_start_hours is None):
+        logger.error("--late-tick-interval and --late-tick-start-hours must be set together")
+        return
+    if args.late_tick_interval is not None and args.late_tick_interval <= 0:
+        logger.error("--late-tick-interval must be positive")
+        return
+    if args.late_tick_start_hours is not None and args.late_tick_start_hours <= 0:
+        logger.error("--late-tick-start-hours must be positive")
+        return
 
     resume_from_ts = None
     if args.resume_from_ts:
@@ -1211,6 +1236,8 @@ def main():
         interday_model=args.interday_model,
         event_trading_rules=event_trading_rules,
         tick_interval_seconds=args.tick_interval,
+        late_tick_interval_seconds=args.late_tick_interval,
+        late_tick_start_hours_before_settlement=args.late_tick_start_hours,
         cmp_nu_scale=args.nu_scale,
         use_historical_bootstrap=args.historical_bootstrap,
         bootstrap_start_hours=args.bootstrap_start_hours,
@@ -1238,6 +1265,13 @@ def main():
     logger.info(f"Projection model: {args.projection}")
     logger.info(f"Intraday mode: {args.intraday_mode}")
     logger.info(f"Interday model: {args.interday_model}")
+    if args.late_tick_interval is not None:
+        logger.info(
+            "Mixed tick schedule: %ss default, %ss inside final %.1fh",
+            args.tick_interval,
+            args.late_tick_interval,
+            args.late_tick_start_hours,
+        )
     if args.exit_mode != "kelly_only":
         logger.info(f"Exit mode: {args.exit_mode}")
     if args.nu_scale != 1.0:
