@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 
 from src.algo.musk_tweet_count.forecaster.run_multi_event import (
     build_collateral_config,
@@ -25,6 +26,92 @@ def test_build_collateral_config_defaults_to_dataclass_cap():
     )
 
     assert collateral.c_event_max == CollateralConfig.c_event_max
+
+
+def test_build_collateral_config_uses_yaml_backed_base():
+    base = CollateralConfig(c_event_max=180.0, c_bin_max_ratio=0.25, capital_multiplier=1.0)
+
+    collateral = build_collateral_config(
+        max_per_event=None,
+        capital_multiplier=1.4,
+        base=base,
+    )
+
+    assert collateral.c_event_max == 180.0
+    assert collateral.c_bin_max_ratio == 0.25
+    assert collateral.capital_multiplier == 1.4
+
+
+def test_parse_args_uses_yaml_defaults_for_runner(tmp_path: Path):
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text(
+        """
+trading:
+  dry_run: false
+  slow_loop_interval_seconds: 120
+  fast_loop_interval_seconds: 12
+  forecast_cache_seconds: 130
+forecaster:
+  intraday_mode: bucket
+kelly:
+  edge_buffer:
+    required_roi: 0.07
+  collateral:
+    c_event_max: 222.0
+  websocket:
+    enabled: false
+  use_unbox_rotations: true
+  unbox_start_hours_to_settlement: 9.0
+""".strip(),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config_path)])
+
+    assert args.live is True
+    assert args.dry_run is False
+    assert args.tick_interval == 120
+    assert args.fast_tick_interval == 12
+    assert args.forecast_cache_seconds == 130
+    assert args.max_per_event == 222.0
+    assert args.required_roi == 0.07
+    assert args.no_ws is True
+    assert args.use_unbox_rotations is True
+    assert args.unbox_start_hours_to_settlement == 9.0
+    assert args.intraday_mode == "bucket"
+
+
+def test_parse_args_cli_overrides_yaml_defaults(tmp_path: Path):
+    config_path = tmp_path / "runner.yaml"
+    config_path.write_text(
+        """
+trading:
+  dry_run: false
+  slow_loop_interval_seconds: 120
+kelly:
+  collateral:
+    c_event_max: 222.0
+  websocket:
+    enabled: false
+""".strip(),
+        encoding="utf-8",
+    )
+
+    args = parse_args(
+        [
+            "--config", str(config_path),
+            "--dry-run",
+            "--tick-interval", "90",
+            "--max-per-event", "333",
+            "--ws",
+        ]
+    )
+
+    assert args.live is False
+    assert args.dry_run is True
+    assert args.tick_interval == 90
+    assert args.max_per_event == 333.0
+    assert args.no_ws is False
 
 
 def test_parse_args_accepts_c_event_max_alias():

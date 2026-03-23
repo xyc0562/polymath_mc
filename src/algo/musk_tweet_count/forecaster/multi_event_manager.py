@@ -224,6 +224,8 @@ class MultiEventConfig:
 
     # Trading bot configuration (shared across events)
     tick_interval_seconds: int = 300
+    fast_tick_interval_seconds: int = 30
+    forecast_cache_seconds: int = 165
     dry_run: bool = True
     disable_websocket: bool = False
 
@@ -2647,12 +2649,14 @@ class MultiEventManager:
         # Create bot config (sync-driven: bot idles, manager triggers ticks)
         bot_config = TradingBotConfig(
             slow_tick_interval_seconds=self.config.tick_interval_seconds,
+            fast_tick_interval_seconds=self.config.fast_tick_interval_seconds,
             dry_run=self.config.dry_run,
             settlement_date=event_info.settlement_date,
             initial_capital=allocated_capital,
             training_days=self.config.training_days,
             use_gas=self.config.use_gas,
             disable_websocket=self.config.disable_websocket,
+            forecast_cache_timeout=self.config.forecast_cache_seconds,
             event_name=event_info.short_name,
             projection_model=self.config.projection_model,
             sync_driven=True,

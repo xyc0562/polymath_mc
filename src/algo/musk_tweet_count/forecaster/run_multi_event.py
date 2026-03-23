@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import asyncio
+from copy import deepcopy
+from dataclasses import replace
 import json
 import logging
 import os
@@ -25,6 +27,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import requests
+import yaml
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency
@@ -65,6 +68,142 @@ from src.algo.musk_tweet_count.notifications import SlackNotifier
 
 logger = logging.getLogger(__name__)
 CONTRACT_UTILS = ContractDayUtils()
+DEFAULT_RUNNER_CONFIG_PATH = "config/musk_tweet_count.yaml"
+
+
+def _resolve_project_path(path_str: str) -> Path:
+    """Resolve a config path against cwd first, then project root."""
+    path = Path(path_str)
+    if path.exists():
+        return path
+    project_path = project_root / path
+    if project_path.exists():
+        return project_path
+    return path
+
+
+def _load_runner_yaml_config(config_path: str) -> dict:
+    """Load the shared Musk tweet count YAML config for the live runner."""
+    path = _resolve_project_path(config_path)
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _consensus_mode_from_config(config: MarketConsensusConfig) -> str:
+    """Convert consensus booleans into the CLI preset mode string."""
+    if not config.enabled or (not config.time_enabled and not config.gap_enabled):
+        return "off"
+    if config.time_enabled and config.gap_enabled:
+        return "time_gap"
+    if config.time_enabled:
+        return "time_only"
+    return "gap_only"
+
+
+def _build_base_configs_from_yaml(
+    config_path: str,
+) -> tuple[dict, KellyConfig, ForecasterConfig, dict]:
+    """Build base runtime configs from the shared YAML file."""
+    raw_config = _load_runner_yaml_config(config_path)
+    kelly_config = KellyConfig.from_dict(deepcopy(raw_config.get("kelly", {})))
+    forecaster_config = ForecasterConfig.from_dict(
+        deepcopy(raw_config.get("forecaster", {}))
+    )
+
+    trading_config = raw_config.get("trading", {})
+    websocket_config = raw_config.get("kelly", {}).get("websocket", {})
+
+    runtime_defaults = {
+        "live": not bool(trading_config.get("dry_run", True)),
+        "tick_interval": int(
+            trading_config.get(
+                "slow_loop_interval_seconds",
+                trading_config.get("tick_interval_seconds", 3600),
+            )
+        ),
+        "fast_tick_interval": int(
+            trading_config.get("fast_loop_interval_seconds", 30)
+        ),
+        "forecast_cache_seconds": int(
+            trading_config.get("forecast_cache_seconds", 165)
+        ),
+        "no_ws": not bool(websocket_config.get("enabled", True)),
+    }
+
+    cli_defaults = {
+        "max_per_event": kelly_config.collateral.c_event_max,
+        "tick_interval": runtime_defaults["tick_interval"],
+        "fast_tick_interval": runtime_defaults["fast_tick_interval"],
+        "forecast_cache_seconds": runtime_defaults["forecast_cache_seconds"],
+        "live": runtime_defaults["live"],
+        "no_ws": runtime_defaults["no_ws"],
+        "kappa": kelly_config.kappa,
+        "kelly_fraction": kelly_config.kelly_fraction,
+        "required_roi": kelly_config.edge_buffer.required_roi,
+        "min_prob": kelly_config.edge_buffer.min_perceived_prob,
+        "min_market_price": kelly_config.edge_buffer.min_market_price,
+        "max_spread_ratio": kelly_config.edge_buffer.max_spread_ratio,
+        "no_require_two_sided": not kelly_config.edge_buffer.require_two_sided_liquidity,
+        "capital_multiplier": kelly_config.collateral.capital_multiplier,
+        "min_buy_utility": kelly_config.min_buy_utility,
+        "min_sell_utility": kelly_config.min_sell_utility,
+        "fresh_start_minutes": kelly_config.market_impact.fresh_start_minutes,
+        "fresh_start_edge_fraction": kelly_config.market_impact.fresh_start_edge_fraction,
+        "no_fresh_start_throttle": not kelly_config.market_impact.fresh_start_enabled,
+        "intraday_mode": forecaster_config.intraday_mode,
+        "interday_model": forecaster_config.interday_model,
+        "historical_bootstrap": forecaster_config.bucket_nowcast.use_historical_bootstrap,
+        "bootstrap_start_hours": forecaster_config.bucket_nowcast.bootstrap_start_hours,
+        "bootstrap_full_hours": forecaster_config.bucket_nowcast.bootstrap_full_hours,
+        "bootstrap_max_blend": forecaster_config.bucket_nowcast.bootstrap_max_blend,
+        "boundary_silence_overlay": forecaster_config.bucket_nowcast.late_boundary_silence.enabled,
+        "boundary_silence_hours": forecaster_config.bucket_nowcast.late_boundary_silence.start_hours,
+        "boundary_silence_max_distance": forecaster_config.bucket_nowcast.late_boundary_silence.max_distance_to_next_bin,
+        "boundary_silence_threshold_start": forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_start_minutes,
+        "boundary_silence_threshold_floor": forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_floor_minutes,
+        "boundary_silence_threshold_step": forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_step_per_hour,
+        "boundary_silence_min_effective_n": forecaster_config.bucket_nowcast.late_boundary_silence.min_effective_n,
+        "late_boundary_take_profit": kelly_config.late_boundary_take_profit.enabled,
+        "late_boundary_trigger_price": kelly_config.late_boundary_take_profit.trigger_price,
+        "late_boundary_min_sell_fraction": kelly_config.late_boundary_take_profit.min_sell_fraction,
+        "late_boundary_max_sell_fraction": kelly_config.late_boundary_take_profit.max_sell_fraction,
+        "use_unbox_rotations": kelly_config.use_unbox_rotations,
+        "unbox_start_hours_to_settlement": kelly_config.unbox_start_hours_to_settlement,
+        "unbox_min_blocked_ticks": kelly_config.unbox_min_blocked_ticks,
+        "unbox_min_net_utility": kelly_config.unbox_min_net_utility,
+        "unbox_late_relax_start_hours": kelly_config.unbox_late_relax_start_hours_to_settlement,
+        "unbox_late_net_utility_relax": kelly_config.unbox_late_net_utility_relax,
+        "unbox_repeat_net_utility_step": kelly_config.unbox_repeat_net_utility_step,
+        "unbox_repeat_net_utility_cap": kelly_config.unbox_repeat_net_utility_cap,
+        "unbox_multi_bin_start_count": kelly_config.unbox_multi_bin_start_count,
+        "unbox_multi_bin_net_utility_step": kelly_config.unbox_multi_bin_net_utility_step,
+        "unbox_multi_bin_net_utility_cap": kelly_config.unbox_multi_bin_net_utility_cap,
+        "unbox_turnover_penalty": kelly_config.unbox_turnover_penalty,
+        "unbox_bin_cooldown_seconds": kelly_config.unbox_bin_cooldown_seconds,
+        "consensus_mode": _consensus_mode_from_config(kelly_config.market_consensus),
+        "consensus_time_tau": kelly_config.market_consensus.time_tau,
+        "consensus_gap_scale": kelly_config.market_consensus.gap_scale,
+        "consensus_gap_gamma": kelly_config.market_consensus.gap_gamma,
+        "consensus_gap_floor": kelly_config.market_consensus.gap_floor,
+        "consensus_min_model_weight": kelly_config.market_consensus.min_model_weight,
+        "consensus_min_coverage": kelly_config.market_consensus.min_coverage_ratio,
+        "consensus_max_avg_spread": kelly_config.market_consensus.max_avg_spread,
+        "consensus_max_bin_spread": kelly_config.market_consensus.max_bin_spread,
+        "consensus_allow_untrusted_buys": not kelly_config.market_consensus.require_trusted_quote_for_buys,
+        "robust_kelly": kelly_config.robust_kelly.enabled,
+        "robust_kelly_min_fraction_multiplier": kelly_config.robust_kelly.min_fraction_multiplier,
+        "robust_kelly_min_coverage": kelly_config.robust_kelly.min_coverage_ratio,
+        "robust_kelly_max_avg_spread": kelly_config.robust_kelly.max_avg_spread,
+        "robust_kelly_disagreement_scale": kelly_config.robust_kelly.disagreement_scale,
+        "market_buy_guard": kelly_config.market_buy_guard.enabled,
+        "market_buy_guard_max_widening": kelly_config.market_buy_guard.max_threshold_widening,
+        "market_buy_guard_min_coverage": kelly_config.market_buy_guard.min_coverage_ratio,
+        "market_buy_guard_max_avg_spread": kelly_config.market_buy_guard.max_avg_spread,
+        "market_buy_guard_disagreement_scale": kelly_config.market_buy_guard.disagreement_scale,
+    }
+    return raw_config, kelly_config, forecaster_config, cli_defaults
 
 
 def _resolve_consensus_mode(
@@ -188,7 +327,9 @@ def log_config_summary(
 
     # Multi-event
     w("  MULTI-EVENT")
-    w(f"    Tick interval:           {multi_event_config.tick_interval_seconds}s")
+    w(f"    Slow tick interval:      {multi_event_config.tick_interval_seconds}s")
+    w(f"    Fast tick interval:      {multi_event_config.fast_tick_interval_seconds}s")
+    w(f"    Forecast cache:          {multi_event_config.forecast_cache_seconds}s")
     w(f"    Orderbook websocket:     {not multi_event_config.disable_websocket}")
     w(f"    Event duration filter:   {multi_event_config.min_event_duration_days}-{multi_event_config.max_event_duration_days} days")
     w(f"    Projection model:        {multi_event_config.projection_model}")
@@ -687,21 +828,40 @@ def build_collateral_config(
     *,
     max_per_event: Optional[float],
     capital_multiplier: float,
+    base: Optional[CollateralConfig] = None,
 ) -> CollateralConfig:
-    """Build Kelly collateral config from CLI values."""
+    """Build Kelly collateral config from YAML-backed defaults plus CLI values."""
+    base_config = base or CollateralConfig()
     return CollateralConfig(
         c_event_max=(
             max_per_event
-            if max_per_event is not None else CollateralConfig.c_event_max
+            if max_per_event is not None else base_config.c_event_max
         ),
+        c_bin_max_ratio=base_config.c_bin_max_ratio,
         capital_multiplier=capital_multiplier,
     )
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument(
+        "--config",
+        type=str,
+        default=DEFAULT_RUNNER_CONFIG_PATH,
+    )
+    bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
+    _, _, _, cli_defaults = _build_base_configs_from_yaml(bootstrap_args.config)
+
     parser = argparse.ArgumentParser(
         description="Run multi-event trading bot with shared capital pool"
+    )
+    parser.set_defaults(**cli_defaults)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=bootstrap_args.config,
+        help=f"Path to base YAML config (default: {DEFAULT_RUNNER_CONFIG_PATH})",
     )
 
     # Capital configuration
@@ -716,8 +876,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--c-event-max",
         dest="max_per_event",
         type=float,
-        default=None,
-        help="Maximum capital per event / Kelly c_event_max (default: KellyConfig.collateral.c_event_max)",
+        default=cli_defaults.get("max_per_event"),
+        help="Maximum capital per event / Kelly c_event_max (default: from YAML config)",
     )
     parser.add_argument(
         "--min-allocation",
@@ -730,23 +890,46 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--tick-interval",
         type=int,
-        default=3600,
-        help="Seconds between trading ticks (default: 3600)",
+        default=cli_defaults.get("tick_interval", 3600),
+        help="Seconds between slow trading ticks (default: from YAML config)",
     )
     parser.add_argument(
+        "--fast-tick-interval",
+        type=int,
+        default=cli_defaults.get("fast_tick_interval", 30),
+        help="Seconds between fast orderbook checks (default: from YAML config)",
+    )
+    parser.add_argument(
+        "--forecast-cache-seconds",
+        type=int,
+        default=cli_defaults.get("forecast_cache_seconds", 165),
+        help="Forecast cache timeout in seconds (default: from YAML config)",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--dry-run",
-        action="store_true",
+        dest="live",
+        action="store_false",
         help="Run in dry-run mode (no real orders)",
     )
-    parser.add_argument(
+    mode_group.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        help="Run in live mode (real orders)",
+    )
+    ws_group = parser.add_mutually_exclusive_group()
+    ws_group.add_argument(
         "--no-ws",
+        dest="no_ws",
         action="store_true",
         help="Disable market-data websocket streaming and use REST orderbook fetches only.",
     )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Run in live mode (real orders)",
+    ws_group.add_argument(
+        "--ws",
+        dest="no_ws",
+        action="store_false",
+        help="Enable market-data websocket streaming.",
     )
 
     # Event selection
@@ -776,10 +959,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to event trading rules YAML config (default: config/event_trading_rules.yaml). "
              "Controls when trading is allowed based on event duration and counting status.",
     )
-    parser.add_argument(
+    realtime_group = parser.add_mutually_exclusive_group()
+    realtime_group.add_argument(
         "--disable-realtime-tracker",
+        dest="disable_realtime_tracker",
         action="store_true",
         help="Disable provisional twikit polling. Default: enabled.",
+    )
+    realtime_group.add_argument(
+        "--realtime-tracker",
+        dest="disable_realtime_tracker",
+        action="store_false",
+        help="Enable provisional twikit polling.",
     )
     parser.add_argument(
         "--realtime-poll-interval",
@@ -810,81 +1001,97 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--kappa",
         type=float,
-        default=KellyConfig.kappa,
-        help=f"Fractional Kelly multiplier (default: {KellyConfig.kappa})",
+        default=cli_defaults.get("kappa", KellyConfig.kappa),
+        help="Fractional Kelly multiplier (default: from YAML config)",
     )
     parser.add_argument(
         "--kelly-fraction",
         type=float,
-        default=KellyConfig.kelly_fraction,
-        help=f"Fractional Kelly parameter α ∈ (0, 1]. "
-             f"1.0 = full Kelly, 0.5 = half Kelly, 0.25 = quarter Kelly (default: {KellyConfig.kelly_fraction})",
+        default=cli_defaults.get("kelly_fraction", KellyConfig.kelly_fraction),
+        help="Fractional Kelly parameter α ∈ (0, 1]. "
+             "1.0 = full Kelly, 0.5 = half Kelly, 0.25 = quarter Kelly (default: from YAML config)",
     )
     parser.add_argument(
         "--required-roi",
         type=float,
-        default=EdgeBufferConfig.required_roi,
-        help=f"Required ROI for edge buffer (default: {EdgeBufferConfig.required_roi})",
+        default=cli_defaults.get("required_roi", EdgeBufferConfig.required_roi),
+        help="Required ROI for edge buffer (default: from YAML config)",
     )
     parser.add_argument(
         "--min-prob",
         type=float,
-        default=EdgeBufferConfig.min_perceived_prob,
-        help=f"Minimum model probability to trade a bin (default: {EdgeBufferConfig.min_perceived_prob})",
+        default=cli_defaults.get("min_prob", EdgeBufferConfig.min_perceived_prob),
+        help="Minimum model probability to trade a bin (default: from YAML config)",
     )
     parser.add_argument(
         "--min-market-price",
         type=float,
-        default=EdgeBufferConfig.min_market_price,
-        help=f"Minimum market price to trade (default: {EdgeBufferConfig.min_market_price})",
+        default=cli_defaults.get("min_market_price", EdgeBufferConfig.min_market_price),
+        help="Minimum market price to trade (default: from YAML config)",
     )
     parser.add_argument(
         "--max-spread-ratio",
         type=float,
-        default=EdgeBufferConfig.max_spread_ratio,
-        help=f"Maximum spread ratio (ask-bid)/bid to trade. Default: {EdgeBufferConfig.max_spread_ratio}. Set to 0 to disable.",
+        default=cli_defaults.get("max_spread_ratio", EdgeBufferConfig.max_spread_ratio),
+        help="Maximum spread ratio (ask-bid)/bid to trade. Default: from YAML config. Set to 0 to disable.",
     )
-    parser.add_argument(
+    two_sided_group = parser.add_mutually_exclusive_group()
+    two_sided_group.add_argument(
         "--no-require-two-sided",
+        dest="no_require_two_sided",
         action="store_true",
         help="Disable requirement for two-sided liquidity (both bid and ask). Default: require two-sided.",
+    )
+    two_sided_group.add_argument(
+        "--require-two-sided",
+        dest="no_require_two_sided",
+        action="store_false",
+        help="Require two-sided liquidity (both bid and ask).",
     )
     parser.add_argument(
         "--capital-multiplier",
         type=float,
-        default=CollateralConfig.capital_multiplier,
-        help=f"Capital multiplier for phantom capital injection. "
-             f"1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
-             f"Real capital still hard-gates execution. Default: {CollateralConfig.capital_multiplier}",
+        default=cli_defaults.get("capital_multiplier", CollateralConfig.capital_multiplier),
+        help="Capital multiplier for phantom capital injection. "
+             "1.0 = standard Kelly. 2.0 = Kelly sees 2x capital → bigger positions. "
+             "Real capital still hard-gates execution. Default: from YAML config",
     )
     parser.add_argument(
         "--min-buy-utility",
         type=float,
-        default=KellyConfig.min_buy_utility,
-        help=f"Minimum utility gain for buys (default: {KellyConfig.min_buy_utility})",
+        default=cli_defaults.get("min_buy_utility", KellyConfig.min_buy_utility),
+        help="Minimum utility gain for buys (default: from YAML config)",
     )
     parser.add_argument(
         "--min-sell-utility",
         type=float,
-        default=KellyConfig.min_sell_utility,
-        help=f"Minimum utility gain for sells (default: {KellyConfig.min_sell_utility})",
+        default=cli_defaults.get("min_sell_utility", KellyConfig.min_sell_utility),
+        help="Minimum utility gain for sells (default: from YAML config)",
     )
     parser.add_argument(
         "--fresh-start-minutes",
         type=float,
-        default=MarketImpactConfig.fresh_start_minutes,
-        help=f"Minutes to throttle after an event's first trading tick (default: {MarketImpactConfig.fresh_start_minutes})",
+        default=cli_defaults.get("fresh_start_minutes", MarketImpactConfig.fresh_start_minutes),
+        help="Minutes to throttle after an event's first trading tick (default: from YAML config)",
     )
     parser.add_argument(
         "--fresh-start-edge-fraction",
         type=float,
-        default=MarketImpactConfig.fresh_start_edge_fraction,
-        help=f"Fraction of available edge the executor may consume per fresh-start tick (default: {MarketImpactConfig.fresh_start_edge_fraction})",
+        default=cli_defaults.get("fresh_start_edge_fraction", MarketImpactConfig.fresh_start_edge_fraction),
+        help="Fraction of available edge the executor may consume per fresh-start tick (default: from YAML config)",
     )
-    parser.add_argument(
+    fresh_start_group = parser.add_mutually_exclusive_group()
+    fresh_start_group.add_argument(
         "--no-fresh-start-throttle",
+        dest="no_fresh_start_throttle",
         action="store_true",
         help="Disable fresh-start market impact throttling.",
+    )
+    fresh_start_group.add_argument(
+        "--fresh-start-throttle",
+        dest="no_fresh_start_throttle",
+        action="store_false",
+        help="Enable fresh-start market impact throttling.",
     )
 
     # Projection model
@@ -904,7 +1111,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--intraday-mode",
         type=str,
-        default="ridge",
+        default=cli_defaults.get("intraday_mode", "ridge"),
         choices=["ridge", "bucket"],
         help="Intraday forecaster mode: 'ridge' (default) uses Ridge regression with "
              "linear F(τ) scaling, 'bucket' uses Negative Binomial per 3-hour bucket.",
@@ -913,7 +1120,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--interday-model",
         type=str,
-        default="ewma",
+        default=cli_defaults.get("interday_model", "ewma"),
         choices=["ewma", "gas", "pig"],
         help="Interday forecaster mode: "
              "'ewma' (default) uses the original EWMA regime model. "
@@ -924,193 +1131,260 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--historical-bootstrap",
         action="store_true",
+        default=cli_defaults.get("historical_bootstrap", False),
         help="Blend late intraday bucket forecasts with weighted historical suffix samples.",
     )
 
     parser.add_argument(
         "--bootstrap-start-hours",
         type=float,
-        default=6.0,
+        default=cli_defaults.get("bootstrap_start_hours", 6.0),
         help="Hours left threshold where historical bootstrap starts blending in. Default: 6.0.",
     )
 
     parser.add_argument(
         "--bootstrap-full-hours",
         type=float,
-        default=3.0,
+        default=cli_defaults.get("bootstrap_full_hours", 3.0),
         help="Hours left threshold where historical bootstrap reaches max blend. Default: 3.0.",
     )
 
     parser.add_argument(
         "--bootstrap-max-blend",
         type=float,
-        default=0.35,
+        default=cli_defaults.get("bootstrap_max_blend", 0.35),
         help="Maximum mixture weight for historical bootstrap samples. Default: 0.35.",
     )
 
     parser.add_argument(
         "--boundary-silence-overlay",
         action="store_true",
+        default=cli_defaults.get("boundary_silence_overlay", False),
         help="Enable the late-boundary silence overlay in the final hours before settlement.",
     )
 
     parser.add_argument(
         "--boundary-silence-hours",
         type=float,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.start_hours,
+        default=cli_defaults.get(
+            "boundary_silence_hours",
+            BucketNowcastConfig.LateBoundarySilenceConfig.start_hours,
+        ),
         help="Hours before settlement where the late-boundary silence overlay becomes eligible.",
     )
 
     parser.add_argument(
         "--boundary-silence-max-distance",
         type=int,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.max_distance_to_next_bin,
+        default=cli_defaults.get(
+            "boundary_silence_max_distance",
+            BucketNowcastConfig.LateBoundarySilenceConfig.max_distance_to_next_bin,
+        ),
         help="Maximum tweets from the next bin edge for the late-boundary silence overlay.",
     )
 
     parser.add_argument(
         "--boundary-silence-threshold-start",
         type=int,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_start_minutes,
+        default=cli_defaults.get(
+            "boundary_silence_threshold_start",
+            BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_start_minutes,
+        ),
         help="Adaptive silence threshold at the overlay start window in minutes.",
     )
 
     parser.add_argument(
         "--boundary-silence-threshold-floor",
         type=int,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_floor_minutes,
+        default=cli_defaults.get(
+            "boundary_silence_threshold_floor",
+            BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_floor_minutes,
+        ),
         help="Minimum adaptive silence threshold in minutes once the overlay is active.",
     )
 
     parser.add_argument(
         "--boundary-silence-threshold-step",
         type=float,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_step_per_hour,
+        default=cli_defaults.get(
+            "boundary_silence_threshold_step",
+            BucketNowcastConfig.LateBoundarySilenceConfig.silence_threshold_step_per_hour,
+        ),
         help="Minutes to reduce the silence threshold by per hour inside the overlay window.",
     )
 
     parser.add_argument(
         "--boundary-silence-min-effective-n",
         type=float,
-        default=BucketNowcastConfig.LateBoundarySilenceConfig.min_effective_n,
+        default=cli_defaults.get(
+            "boundary_silence_min_effective_n",
+            BucketNowcastConfig.LateBoundarySilenceConfig.min_effective_n,
+        ),
         help="Minimum effective analog sample size required for the late-boundary silence overlay.",
     )
 
     parser.add_argument(
         "--late-boundary-take-profit",
         action="store_true",
+        default=cli_defaults.get("late_boundary_take_profit", False),
         help="Enable late-boundary majority YES take-profit behavior near settlement.",
     )
 
     parser.add_argument(
         "--late-boundary-trigger-price",
         type=float,
-        default=LateBoundaryTakeProfitConfig.trigger_price,
-        help=f"Minimum majority-exit YES VWAP to trigger late-boundary take profit. Default: {LateBoundaryTakeProfitConfig.trigger_price}.",
+        default=cli_defaults.get(
+            "late_boundary_trigger_price",
+            LateBoundaryTakeProfitConfig.trigger_price,
+        ),
+        help="Minimum majority-exit YES VWAP to trigger late-boundary take profit. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--late-boundary-min-sell-fraction",
         type=float,
-        default=LateBoundaryTakeProfitConfig.min_sell_fraction,
-        help=f"Minimum fraction of YES shares to sell when late-boundary take profit triggers. Default: {LateBoundaryTakeProfitConfig.min_sell_fraction}.",
+        default=cli_defaults.get(
+            "late_boundary_min_sell_fraction",
+            LateBoundaryTakeProfitConfig.min_sell_fraction,
+        ),
+        help="Minimum fraction of YES shares to sell when late-boundary take profit triggers. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--late-boundary-max-sell-fraction",
         type=float,
-        default=LateBoundaryTakeProfitConfig.max_sell_fraction,
-        help=f"Maximum fraction of YES shares to sell under full late-boundary take-profit strength. Default: {LateBoundaryTakeProfitConfig.max_sell_fraction}.",
+        default=cli_defaults.get(
+            "late_boundary_max_sell_fraction",
+            LateBoundaryTakeProfitConfig.max_sell_fraction,
+        ),
+        help="Maximum fraction of YES shares to sell under full late-boundary take-profit strength. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--use-unbox-rotations",
         action="store_true",
+        default=cli_defaults.get("use_unbox_rotations", False),
         help="Enable same-bin unbox rotations for boxed inventory.",
     )
 
     parser.add_argument(
         "--unbox-start-hours-to-settlement",
         type=float,
-        default=KellyConfig.unbox_start_hours_to_settlement,
-        help=f"Hours-to-settlement window where unbox rotations become eligible. Default: {KellyConfig.unbox_start_hours_to_settlement}.",
+        default=cli_defaults.get(
+            "unbox_start_hours_to_settlement",
+            KellyConfig.unbox_start_hours_to_settlement,
+        ),
+        help="Hours-to-settlement window where unbox rotations become eligible. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-min-blocked-ticks",
         type=int,
-        default=KellyConfig.unbox_min_blocked_ticks,
-        help=f"Minimum consecutive blocked ticks before an unbox can trigger. Default: {KellyConfig.unbox_min_blocked_ticks}.",
+        default=cli_defaults.get(
+            "unbox_min_blocked_ticks",
+            KellyConfig.unbox_min_blocked_ticks,
+        ),
+        help="Minimum consecutive blocked ticks before an unbox can trigger. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-min-net-utility",
         type=float,
-        default=KellyConfig.unbox_min_net_utility,
-        help=f"Minimum net package utility required for an unbox. Default: {KellyConfig.unbox_min_net_utility}.",
+        default=cli_defaults.get(
+            "unbox_min_net_utility",
+            KellyConfig.unbox_min_net_utility,
+        ),
+        help="Minimum net package utility required for an unbox. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-late-relax-start-hours",
         type=float,
-        default=KellyConfig.unbox_late_relax_start_hours_to_settlement,
-        help=f"Hours-to-settlement window where the unbox min net utility starts relaxing. Default: {KellyConfig.unbox_late_relax_start_hours_to_settlement}.",
+        default=cli_defaults.get(
+            "unbox_late_relax_start_hours",
+            KellyConfig.unbox_late_relax_start_hours_to_settlement,
+        ),
+        help="Hours-to-settlement window where the unbox min net utility starts relaxing. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-late-net-utility-relax",
         type=float,
-        default=KellyConfig.unbox_late_net_utility_relax,
-        help=f"Reduction applied to the unbox min net utility inside the late-relax window. Default: {KellyConfig.unbox_late_net_utility_relax}.",
+        default=cli_defaults.get(
+            "unbox_late_net_utility_relax",
+            KellyConfig.unbox_late_net_utility_relax,
+        ),
+        help="Reduction applied to the unbox min net utility inside the late-relax window. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-repeat-net-utility-step",
         type=float,
-        default=KellyConfig.unbox_repeat_net_utility_step,
-        help=f"Additional net utility required per prior unbox on the same bin. Default: {KellyConfig.unbox_repeat_net_utility_step}.",
+        default=cli_defaults.get(
+            "unbox_repeat_net_utility_step",
+            KellyConfig.unbox_repeat_net_utility_step,
+        ),
+        help="Additional net utility required per prior unbox on the same bin. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-repeat-net-utility-cap",
         type=float,
-        default=KellyConfig.unbox_repeat_net_utility_cap,
-        help=f"Maximum repeat-unbox utility uplift. Default: {KellyConfig.unbox_repeat_net_utility_cap}.",
+        default=cli_defaults.get(
+            "unbox_repeat_net_utility_cap",
+            KellyConfig.unbox_repeat_net_utility_cap,
+        ),
+        help="Maximum repeat-unbox utility uplift. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-multi-bin-start-count",
         type=int,
-        default=KellyConfig.unbox_multi_bin_start_count,
-        help=f"Distinct-bin count where the multi-bin unbox utility uplift starts. Default: {KellyConfig.unbox_multi_bin_start_count}.",
+        default=cli_defaults.get(
+            "unbox_multi_bin_start_count",
+            KellyConfig.unbox_multi_bin_start_count,
+        ),
+        help="Distinct-bin count where the multi-bin unbox utility uplift starts. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-multi-bin-net-utility-step",
         type=float,
-        default=KellyConfig.unbox_multi_bin_net_utility_step,
-        help=f"Additional net utility required per prior unbox in other bins. Default: {KellyConfig.unbox_multi_bin_net_utility_step}.",
+        default=cli_defaults.get(
+            "unbox_multi_bin_net_utility_step",
+            KellyConfig.unbox_multi_bin_net_utility_step,
+        ),
+        help="Additional net utility required per prior unbox in other bins. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-multi-bin-net-utility-cap",
         type=float,
-        default=KellyConfig.unbox_multi_bin_net_utility_cap,
-        help=f"Maximum multi-bin utility uplift. Default: {KellyConfig.unbox_multi_bin_net_utility_cap}.",
+        default=cli_defaults.get(
+            "unbox_multi_bin_net_utility_cap",
+            KellyConfig.unbox_multi_bin_net_utility_cap,
+        ),
+        help="Maximum multi-bin utility uplift. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-turnover-penalty",
         type=float,
-        default=KellyConfig.unbox_turnover_penalty,
-        help=f"Turnover penalty subtracted from gross package utility for unbox rotations. Default: {KellyConfig.unbox_turnover_penalty}.",
+        default=cli_defaults.get(
+            "unbox_turnover_penalty",
+            KellyConfig.unbox_turnover_penalty,
+        ),
+        help="Turnover penalty subtracted from gross package utility for unbox rotations. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--unbox-bin-cooldown-seconds",
         type=int,
-        default=KellyConfig.unbox_bin_cooldown_seconds,
-        help=f"Cooldown after executing an unbox on the same bin. Default: {KellyConfig.unbox_bin_cooldown_seconds}.",
+        default=cli_defaults.get(
+            "unbox_bin_cooldown_seconds",
+            KellyConfig.unbox_bin_cooldown_seconds,
+        ),
+        help="Cooldown after executing an unbox on the same bin. Default: from YAML config.",
     )
 
     parser.add_argument(
@@ -1123,7 +1397,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--consensus-mode",
         type=str,
         choices=["off", "time_only", "gap_only", "time_gap"],
-        default="off",
+        default=cli_defaults.get("consensus_mode", "off"),
         help="Consensus preset mode. 'time_only' enables the recommended time-based blend without gap-based damping.",
     )
 
@@ -1136,131 +1410,170 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--consensus-time-tau",
         type=float,
-        default=MarketConsensusConfig.time_tau,
-        help=f"Time constant in hours for time-based consensus alpha. Default: {MarketConsensusConfig.time_tau}.",
+        default=cli_defaults.get("consensus_time_tau", MarketConsensusConfig.time_tau),
+        help="Time constant in hours for time-based consensus alpha. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-gap-scale",
         type=float,
-        default=MarketConsensusConfig.gap_scale,
-        help=f"Half-L1 disagreement scale for gap-based consensus alpha. Default: {MarketConsensusConfig.gap_scale}.",
+        default=cli_defaults.get("consensus_gap_scale", MarketConsensusConfig.gap_scale),
+        help="Half-L1 disagreement scale for gap-based consensus alpha. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-gap-gamma",
         type=float,
-        default=MarketConsensusConfig.gap_gamma,
-        help=f"Curvature for gap-based consensus alpha. Default: {MarketConsensusConfig.gap_gamma}.",
+        default=cli_defaults.get("consensus_gap_gamma", MarketConsensusConfig.gap_gamma),
+        help="Curvature for gap-based consensus alpha. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-gap-floor",
         type=float,
-        default=MarketConsensusConfig.gap_floor,
-        help=f"Minimum gap-based model weight before the combined floor. Default: {MarketConsensusConfig.gap_floor}.",
+        default=cli_defaults.get("consensus_gap_floor", MarketConsensusConfig.gap_floor),
+        help="Minimum gap-based model weight before the combined floor. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-min-model-weight",
         type=float,
-        default=MarketConsensusConfig.min_model_weight,
-        help=f"Global minimum model weight after consensus blending. Default: {MarketConsensusConfig.min_model_weight}.",
+        default=cli_defaults.get(
+            "consensus_min_model_weight",
+            MarketConsensusConfig.min_model_weight,
+        ),
+        help="Global minimum model weight after consensus blending. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-min-coverage",
         type=float,
-        default=MarketConsensusConfig.min_coverage_ratio,
-        help=f"Minimum live-bin trusted-quote coverage for consensus blending. Default: {MarketConsensusConfig.min_coverage_ratio}.",
+        default=cli_defaults.get(
+            "consensus_min_coverage",
+            MarketConsensusConfig.min_coverage_ratio,
+        ),
+        help="Minimum live-bin trusted-quote coverage for consensus blending. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-max-avg-spread",
         type=float,
-        default=MarketConsensusConfig.max_avg_spread,
-        help=f"Maximum average YES spread across trusted bins for consensus blending. Default: {MarketConsensusConfig.max_avg_spread}.",
+        default=cli_defaults.get(
+            "consensus_max_avg_spread",
+            MarketConsensusConfig.max_avg_spread,
+        ),
+        help="Maximum average YES spread across trusted bins for consensus blending. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-max-bin-spread",
         type=float,
-        default=MarketConsensusConfig.max_bin_spread,
-        help=f"Maximum YES spread for a bin to count as trusted by consensus. Default: {MarketConsensusConfig.max_bin_spread}.",
+        default=cli_defaults.get(
+            "consensus_max_bin_spread",
+            MarketConsensusConfig.max_bin_spread,
+        ),
+        help="Maximum YES spread for a bin to count as trusted by consensus. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--consensus-allow-untrusted-buys",
         action="store_true",
+        default=cli_defaults.get("consensus_allow_untrusted_buys", False),
         help="Allow fresh BUY entries in bins without trusted quotes even when consensus mode is enabled.",
     )
 
     parser.add_argument(
         "--robust-kelly",
         action="store_true",
+        default=cli_defaults.get("robust_kelly", False),
         help="Reduce effective Kelly fraction when the market strongly disagrees and quote quality is good.",
     )
 
     parser.add_argument(
         "--robust-kelly-min-fraction-multiplier",
         type=float,
-        default=RobustKellyConfig.min_fraction_multiplier,
-        help=f"Minimum multiplier on Kelly fraction under full robust-Kelly haircut. Default: {RobustKellyConfig.min_fraction_multiplier}.",
+        default=cli_defaults.get(
+            "robust_kelly_min_fraction_multiplier",
+            RobustKellyConfig.min_fraction_multiplier,
+        ),
+        help="Minimum multiplier on Kelly fraction under full robust-Kelly haircut. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--robust-kelly-min-coverage",
         type=float,
-        default=RobustKellyConfig.min_coverage_ratio,
-        help=f"Minimum live-bin quote coverage for robust Kelly haircuting. Default: {RobustKellyConfig.min_coverage_ratio}.",
+        default=cli_defaults.get(
+            "robust_kelly_min_coverage",
+            RobustKellyConfig.min_coverage_ratio,
+        ),
+        help="Minimum live-bin quote coverage for robust Kelly haircuting. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--robust-kelly-max-avg-spread",
         type=float,
-        default=RobustKellyConfig.max_avg_spread,
-        help=f"Maximum average YES mid spread to allow robust Kelly haircuting. Default: {RobustKellyConfig.max_avg_spread}.",
+        default=cli_defaults.get(
+            "robust_kelly_max_avg_spread",
+            RobustKellyConfig.max_avg_spread,
+        ),
+        help="Maximum average YES mid spread to allow robust Kelly haircuting. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--robust-kelly-disagreement-scale",
         type=float,
-        default=RobustKellyConfig.disagreement_scale,
-        help=f"Half-L1 model-vs-market disagreement scale for full robust-Kelly haircut. Default: {RobustKellyConfig.disagreement_scale}.",
+        default=cli_defaults.get(
+            "robust_kelly_disagreement_scale",
+            RobustKellyConfig.disagreement_scale,
+        ),
+        help="Half-L1 model-vs-market disagreement scale for full robust-Kelly haircut. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--market-buy-guard",
         action="store_true",
+        default=cli_defaults.get("market_buy_guard", False),
         help="Widen buy-entry thresholds when the market strongly disagrees and quote quality is good.",
     )
 
     parser.add_argument(
         "--market-buy-guard-max-widening",
         type=float,
-        default=MarketBuyGuardConfig.max_threshold_widening,
-        help=f"Maximum extra buy-threshold widening in probability points. Default: {MarketBuyGuardConfig.max_threshold_widening}.",
+        default=cli_defaults.get(
+            "market_buy_guard_max_widening",
+            MarketBuyGuardConfig.max_threshold_widening,
+        ),
+        help="Maximum extra buy-threshold widening in probability points. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--market-buy-guard-min-coverage",
         type=float,
-        default=MarketBuyGuardConfig.min_coverage_ratio,
-        help=f"Minimum live-bin quote coverage for buy guard. Default: {MarketBuyGuardConfig.min_coverage_ratio}.",
+        default=cli_defaults.get(
+            "market_buy_guard_min_coverage",
+            MarketBuyGuardConfig.min_coverage_ratio,
+        ),
+        help="Minimum live-bin quote coverage for buy guard. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--market-buy-guard-max-avg-spread",
         type=float,
-        default=MarketBuyGuardConfig.max_avg_spread,
-        help=f"Maximum average YES mid spread to allow buy guard. Default: {MarketBuyGuardConfig.max_avg_spread}.",
+        default=cli_defaults.get(
+            "market_buy_guard_max_avg_spread",
+            MarketBuyGuardConfig.max_avg_spread,
+        ),
+        help="Maximum average YES mid spread to allow buy guard. Default: from YAML config.",
     )
 
     parser.add_argument(
         "--market-buy-guard-disagreement-scale",
         type=float,
-        default=MarketBuyGuardConfig.disagreement_scale,
-        help=f"Half-L1 model-vs-market disagreement scale for full buy guard. Default: {MarketBuyGuardConfig.disagreement_scale}.",
+        default=cli_defaults.get(
+            "market_buy_guard_disagreement_scale",
+            MarketBuyGuardConfig.disagreement_scale,
+        ),
+        help="Half-L1 model-vs-market disagreement scale for full buy guard. Default: from YAML config.",
     )
 
     # Other
@@ -1276,6 +1589,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     args = parser.parse_args(argv)
+    args.dry_run = not args.live
     _resolve_consensus_mode(parser, args)
     return args
 
@@ -1327,12 +1641,19 @@ async def main() -> None:
         print(f"{'='*80}")
         sys.exit(0)
 
-    # Validate dry-run vs live
-    if args.live and args.dry_run:
-        logger.error("Cannot specify both --dry-run and --live")
-        sys.exit(1)
+    config_path = _resolve_project_path(args.config)
+    if config_path.exists():
+        logger.info(f"Loaded base config from {config_path}")
+    else:
+        logger.warning(
+            "Base config not found at %s, falling back to code defaults",
+            config_path,
+        )
+    _, base_kelly_config, base_forecaster_config, _ = _build_base_configs_from_yaml(
+        str(config_path)
+    )
 
-    dry_run = not args.live
+    dry_run = args.dry_run
     if dry_run:
         logger.info("Running in DRY-RUN mode (no real orders)")
     else:
@@ -1351,7 +1672,8 @@ async def main() -> None:
 
     # Create configurations
     # Kelly config first (source of truth for c_event_max)
-    edge_buffer_config = EdgeBufferConfig(
+    edge_buffer_config = replace(
+        base_kelly_config.edge_buffer,
         required_roi=args.required_roi,
         min_perceived_prob=args.min_prob,
         min_market_price=args.min_market_price,
@@ -1362,15 +1684,18 @@ async def main() -> None:
     collateral_config = build_collateral_config(
         max_per_event=args.max_per_event,
         capital_multiplier=args.capital_multiplier,
+        base=base_kelly_config.collateral,
     )
 
-    market_impact_config = MarketImpactConfig(
+    market_impact_config = replace(
+        base_kelly_config.market_impact,
         fresh_start_enabled=not args.no_fresh_start_throttle,
         fresh_start_minutes=args.fresh_start_minutes,
         fresh_start_edge_fraction=args.fresh_start_edge_fraction,
     )
 
-    kelly_config = KellyConfig(
+    kelly_config = replace(
+        base_kelly_config,
         kappa=args.kappa,
         kelly_fraction=args.kelly_fraction,
         min_buy_utility=args.min_buy_utility,
@@ -1378,7 +1703,8 @@ async def main() -> None:
         edge_buffer=edge_buffer_config,
         market_impact=market_impact_config,
         collateral=collateral_config,
-        market_consensus=MarketConsensusConfig(
+        market_consensus=replace(
+            base_kelly_config.market_consensus,
             enabled=args.consensus_time or args.consensus_gap,
             time_enabled=args.consensus_time,
             time_tau=args.consensus_time_tau,
@@ -1392,21 +1718,24 @@ async def main() -> None:
             max_bin_spread=args.consensus_max_bin_spread,
             require_trusted_quote_for_buys=not args.consensus_allow_untrusted_buys,
         ),
-        robust_kelly=RobustKellyConfig(
+        robust_kelly=replace(
+            base_kelly_config.robust_kelly,
             enabled=args.robust_kelly,
             min_fraction_multiplier=args.robust_kelly_min_fraction_multiplier,
             min_coverage_ratio=args.robust_kelly_min_coverage,
             max_avg_spread=args.robust_kelly_max_avg_spread,
             disagreement_scale=args.robust_kelly_disagreement_scale,
         ),
-        market_buy_guard=MarketBuyGuardConfig(
+        market_buy_guard=replace(
+            base_kelly_config.market_buy_guard,
             enabled=args.market_buy_guard,
             max_threshold_widening=args.market_buy_guard_max_widening,
             min_coverage_ratio=args.market_buy_guard_min_coverage,
             max_avg_spread=args.market_buy_guard_max_avg_spread,
             disagreement_scale=args.market_buy_guard_disagreement_scale,
         ),
-        late_boundary_take_profit=LateBoundaryTakeProfitConfig(
+        late_boundary_take_profit=replace(
+            base_kelly_config.late_boundary_take_profit,
             enabled=args.late_boundary_take_profit,
             trigger_price=args.late_boundary_trigger_price,
             min_sell_fraction=args.late_boundary_min_sell_fraction,
@@ -1437,21 +1766,29 @@ async def main() -> None:
         min_allocation=args.min_allocation,
     )
 
-    forecaster_config = ForecasterConfig(
+    bucket_nowcast_config = replace(
+        base_forecaster_config.bucket_nowcast,
+        use_historical_bootstrap=args.historical_bootstrap,
+        bootstrap_start_hours=args.bootstrap_start_hours,
+        bootstrap_full_hours=args.bootstrap_full_hours,
+        bootstrap_max_blend=args.bootstrap_max_blend,
+        late_boundary_silence=replace(
+            base_forecaster_config.bucket_nowcast.late_boundary_silence,
+            enabled=args.boundary_silence_overlay,
+            start_hours=args.boundary_silence_hours,
+            max_distance_to_next_bin=args.boundary_silence_max_distance,
+            silence_threshold_start_minutes=args.boundary_silence_threshold_start,
+            silence_threshold_floor_minutes=args.boundary_silence_threshold_floor,
+            silence_threshold_step_per_hour=args.boundary_silence_threshold_step,
+            min_effective_n=args.boundary_silence_min_effective_n,
+        ),
+    )
+    forecaster_config = replace(
+        base_forecaster_config,
         intraday_mode=args.intraday_mode,
         interday_model=args.interday_model,
+        bucket_nowcast=bucket_nowcast_config,
     )
-    forecaster_config.bucket_nowcast.use_historical_bootstrap = args.historical_bootstrap
-    forecaster_config.bucket_nowcast.bootstrap_start_hours = args.bootstrap_start_hours
-    forecaster_config.bucket_nowcast.bootstrap_full_hours = args.bootstrap_full_hours
-    forecaster_config.bucket_nowcast.bootstrap_max_blend = args.bootstrap_max_blend
-    forecaster_config.bucket_nowcast.late_boundary_silence.enabled = args.boundary_silence_overlay
-    forecaster_config.bucket_nowcast.late_boundary_silence.start_hours = args.boundary_silence_hours
-    forecaster_config.bucket_nowcast.late_boundary_silence.max_distance_to_next_bin = args.boundary_silence_max_distance
-    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_start_minutes = args.boundary_silence_threshold_start
-    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_floor_minutes = args.boundary_silence_threshold_floor
-    forecaster_config.bucket_nowcast.late_boundary_silence.silence_threshold_step_per_hour = args.boundary_silence_threshold_step
-    forecaster_config.bucket_nowcast.late_boundary_silence.min_effective_n = args.boundary_silence_min_effective_n
     if args.historical_bootstrap:
         logger.info(
             "Historical intraday bootstrap: enabled (start=%.1fh, full=%.1fh, max_blend=%.2f)",
@@ -1551,6 +1888,8 @@ async def main() -> None:
         capital_pool=capital_pool_config,
         max_per_event=max_per_event,
         tick_interval_seconds=args.tick_interval,
+        fast_tick_interval_seconds=args.fast_tick_interval,
+        forecast_cache_seconds=args.forecast_cache_seconds,
         dry_run=dry_run,
         disable_websocket=args.no_ws,
         event_trading_rules=event_trading_rules,

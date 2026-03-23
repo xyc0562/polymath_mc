@@ -411,6 +411,13 @@ class KellyConfig:
             data["min_buy_utility"] = old_min_utility
             data["min_sell_utility"] = 2 * old_min_utility
 
+        # Backward compatibility: the shared YAML historically used "tau"
+        # for the minimum utility threshold before buy/sell were split.
+        if "tau" in data:
+            old_tau = data.pop("tau")
+            data.setdefault("min_buy_utility", old_tau)
+            data.setdefault("min_sell_utility", 2 * old_tau)
+
         return cls(
             edge_buffer=EdgeBufferConfig(**edge_buffer_data),
             market_impact=MarketImpactConfig(**market_impact_data),

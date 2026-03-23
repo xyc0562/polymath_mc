@@ -69,8 +69,8 @@ kelly:
   # Off by default until validated on shadow replay/backtests.
   use_unbox_rotations: false
   unbox_start_hours_to_settlement: 12.0
-  unbox_min_blocked_ticks: 3
-  unbox_min_net_utility: 0.012
+  unbox_min_blocked_ticks: 1
+  unbox_min_net_utility: 0.006
   unbox_late_relax_start_hours_to_settlement: 3.0
   unbox_late_net_utility_relax: 0.002
   unbox_repeat_net_utility_step: 0.003
