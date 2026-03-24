@@ -230,7 +230,7 @@ class MultiEventConfig:
     disable_websocket: bool = False
 
     # Forecaster configuration
-    training_days: int = 45
+    training_days: int = 40
     use_gas: bool = True
 
     # How often to poll lastSync for XTracker data updates (seconds)

@@ -76,7 +76,7 @@ class TradingBotConfig:
     initial_capital: float = 1000.0
 
     # Number of days of history to use for model fitting
-    training_days: int = 45
+    training_days: int = 40
 
     # Whether to use GAS model (vs EWMA)
     use_gas: bool = True

@@ -47,10 +47,10 @@ class NowcastConfig:
     ridge_alpha: float = 1.0
 
     # Training window in days - shorter for faster adaptation
-    training_window_days: int = 45
+    training_window_days: int = 40
 
     # Half-life for sample weighting (days) - shorter for more reactivity
-    weight_half_life_days: float = 14.0
+    weight_half_life_days: float = 10.0
 
     # Threshold for implied rate feature (fraction of day)
     implied_rate_threshold: float = 0.05
@@ -79,10 +79,10 @@ class BucketNowcastConfig:
     n_buckets: int = 8
 
     # Training window in days
-    training_window_days: int = 45
+    training_window_days: int = 40
 
     # Half-life for sample weighting (days)
-    weight_half_life_days: float = 14.0
+    weight_half_life_days: float = 10.0
 
     # Regime multiplier bounds (clamp to prevent extreme adjustments)
     regime_min: float = 0.85

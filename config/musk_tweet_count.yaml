@@ -22,8 +22,8 @@ forecaster:
 
   # Nowcast model
   nowcast:
-    training_window_days: 45
-    weight_half_life_days: 14.0
+    training_window_days: 40
+    weight_half_life_days: 10.0
 
   # GAS regime model
   gas:

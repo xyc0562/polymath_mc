@@ -121,7 +121,7 @@ class UnifiedBacktestConfig:
     resume_from_timestamp: Optional[int] = None
 
     # Forecaster settings
-    training_days: int = 45
+    training_days: int = 40
 
     # Verbose mode: print detailed trade information
     verbose: bool = False
