@@ -1971,8 +1971,45 @@ class KellyExecutor:
                 api_shares = api_position.yes_shares
             else:
                 api_shares = api_position.no_shares
-            tolerance = self._overlay_api_tolerance_shares(api_shares)
-            if abs(residual) > tolerance:
+            share_tolerance = self._overlay_api_tolerance_shares(api_shares)
+            within_share_tolerance = abs(residual) <= share_tolerance
+
+            # Notional tolerance: compute the dollar value of the residual
+            # using the weighted average price of matching fragments. Only
+            # applies when the API has already partially consumed the fill
+            # (remaining < half of original), so we don't clear overlays
+            # that the API hasn't acknowledged at all.
+            notional_cap = self.config.rate_limit.overlay_reconciliation_api_tolerance_max_notional
+            within_notional_tolerance = False
+            residual_notional = 0.0
+            if notional_cap > 0 and not within_share_tolerance:
+                direction_is_buy = residual > 0
+                weighted_price_num = 0.0
+                weighted_price_den = 0.0
+                total_original = 0.0
+                total_remaining = 0.0
+                for fragment in self._overlay_ledger:
+                    if (
+                        fragment.bin_index == bin_index
+                        and fragment.position_kind == position_kind
+                        and fragment.is_buy == direction_is_buy
+                        and fragment.remaining_size > self._overlay_size_epsilon
+                    ):
+                        weighted_price_num += fragment.remaining_size * fragment.price
+                        weighted_price_den += fragment.remaining_size
+                        total_original += fragment.original_size
+                        total_remaining += fragment.remaining_size
+                # Only apply if the API consumed at least half the original fill
+                partially_consumed = (
+                    total_original > self._overlay_size_epsilon
+                    and total_remaining < total_original * 0.5
+                )
+                if partially_consumed and weighted_price_den > self._overlay_size_epsilon:
+                    avg_price = weighted_price_num / weighted_price_den
+                    residual_notional = abs(residual) * avg_price
+                    within_notional_tolerance = residual_notional <= notional_cap
+
+            if not within_share_tolerance and not within_notional_tolerance:
                 continue
 
             direction = "buy" if residual > 0 else "sell"
@@ -1987,11 +2024,11 @@ class KellyExecutor:
                     continue
                 fragment.remaining_size = 0.0
 
+            cleared_by = "share" if within_share_tolerance else f"notional(${residual_notional:.2f})"
             logger.info(
                 f"[{self.event_name}][INTEGRITY] Cleared residual overlay within API tolerance: "
                 f"bin={bin_index} {position_kind} residual={residual:+.2f} shares "
-                f"api={api_shares:.2f} tol={tolerance:.2f} "
-                f"(fraction={self.config.rate_limit.overlay_reconciliation_api_tolerance_fraction:.3f})"
+                f"api={api_shares:.2f} tol={share_tolerance:.2f} cleared_by={cleared_by}"
             )
 
         self._prune_overlay_ledger()

@@ -141,6 +141,12 @@ class RateLimitConfig:
     # large stale-position mismatches on bigger inventory.
     overlay_reconciliation_api_tolerance_max_shares: float = 1.0
 
+    # Notional (dollar) tolerance for clearing residual overlay. If the
+    # residual shares * fill price is below this amount, clear the overlay
+    # regardless of the share-based cap. This prevents cheap low-price
+    # positions from triggering freezes over negligible dollar amounts.
+    overlay_reconciliation_api_tolerance_max_notional: float = 10.0
+
     # Hard deadline for an event integrity freeze. Once exceeded, the executor
     # drops any residual overlay, trusts the latest API snapshot, logs a
     # critical recovery event, and resumes trading from API state.

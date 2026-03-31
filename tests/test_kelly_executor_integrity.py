@@ -609,6 +609,7 @@ def test_overlay_residual_above_api_tolerance_is_retained():
         capital=200.0,
         rate_limit=RateLimitConfig(
             overlay_reconciliation_api_tolerance_fraction=0.05,
+            overlay_reconciliation_api_tolerance_max_notional=0.0,
         ),
     )
     candidate = _make_candidate(size=20.0, price=0.25)
@@ -640,6 +641,7 @@ def test_overlay_api_tolerance_is_capped_for_large_positions():
         rate_limit=RateLimitConfig(
             overlay_reconciliation_api_tolerance_fraction=0.05,
             overlay_reconciliation_api_tolerance_max_shares=1.0,
+            overlay_reconciliation_api_tolerance_max_notional=0.0,
         ),
     )
     candidate = _make_candidate(size=20.0, price=0.25)
