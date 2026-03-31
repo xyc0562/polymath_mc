@@ -771,6 +771,9 @@ def test_kelly_bot_status_exposes_integrity_fields():
     )
 
     class FakeExecutor:
+        def get_overlay_pending_bins(self):
+            return set()
+
         def get_pending_count(self):
             return 2
 
@@ -1081,6 +1084,9 @@ def test_sync_positions_missing_price_can_use_overlay_hint(monkeypatch):
     bot.portfolio.execute_buy_yes(0, 20.0, 0.25, "yes-0")
 
     class FakeExecutor:
+        def get_overlay_pending_bins(self):
+            return set()
+
         def get_overlay_price_hint_for_api_increase(self, *, bin_index, is_no, share_increase):
             assert bin_index == 0
             assert is_no is False
@@ -1125,6 +1131,9 @@ def test_missing_api_side_balance_increase_uses_overlay_for_new_delta_only(monke
     position.recompute_collateral_used()
 
     class FakeExecutor:
+        def get_overlay_pending_bins(self):
+            return set()
+
         def get_overlay_price_hint_for_api_increase(self, *, bin_index, is_no, share_increase):
             assert bin_index == 0
             assert is_no is False
@@ -1163,6 +1172,9 @@ def test_truly_unpriceable_increment_blocks_same_side_add_but_not_other_bins(mon
     bot.portfolio.execute_buy_no(0, 30.0, 0.7, "yes-0")
 
     class FakeExecutor:
+        def get_overlay_pending_bins(self):
+            return set()
+
         def get_overlay_price_hint_for_api_increase(self, *, bin_index, is_no, share_increase):
             assert bin_index == 0
             assert is_no is True
@@ -1298,6 +1310,9 @@ def test_sync_logging_reports_resolution_sources_and_uncertainty(monkeypatch, ca
     bot.portfolio.execute_buy_no(0, 10.0, 0.8, "yes-0")
 
     class FakeExecutor:
+        def get_overlay_pending_bins(self):
+            return set()
+
         def get_overlay_price_hint_for_api_increase(self, *, bin_index, is_no, share_increase):
             return 0.0, 0.0
 

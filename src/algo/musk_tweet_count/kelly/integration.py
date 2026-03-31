@@ -937,6 +937,117 @@ class KellyTradingBot:
         )
         return aggregated_positions
 
+    async def fetch_market_positions_for_bins(
+        self,
+        wallet_address: str,
+        bin_indices: set[int],
+    ) -> Optional[Dict[str, dict]]:
+        """
+        Fetch user positions via /v1/market-positions for specific bins only.
+
+        Targeted variant of fetch_market_positions_for_event() that only
+        queries condition_ids associated with the requested bins. Uses the
+        same per-(condition_id, wallet_key) cache.
+
+        Returns a token-keyed snapshot, or None on failure.
+        """
+        # Map bin indices to their unique condition_ids
+        target_condition_ids: list[str] = []
+        seen: set[str] = set()
+        for bin_idx in bin_indices:
+            cid = self.bin_condition_ids.get(bin_idx)
+            if cid and cid not in seen:
+                seen.add(cid)
+                target_condition_ids.append(cid)
+
+        if not target_condition_ids:
+            return {}
+
+        wallet_key = wallet_address.lower()
+        now_ts = time.time()
+        aggregated_positions: Dict[str, dict] = {}
+        fetched_markets = 0
+        cache_hits = 0
+
+        for condition_id in target_condition_ids:
+            cache_key = (condition_id, wallet_key)
+            cached = self._market_positions_cache.get(cache_key)
+            if cached and now_ts - cached[0] <= MARKET_POSITIONS_CACHE_TTL_SECONDS:
+                condition_positions = cached[1]
+                cache_hits += 1
+            else:
+                try:
+                    response = requests.get(
+                        f"{POLYMARKET_DATA_API}/v1/market-positions",
+                        params={
+                            "market": condition_id,
+                            "user": wallet_key,
+                            "status": "OPEN",
+                            "limit": 500,
+                        },
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.event_name}] Failed to fetch market-positions for "
+                        f"overlay bin verification (condition={condition_id}): {e}"
+                    )
+                    return None
+
+                condition_positions = {}
+                if isinstance(response_data, dict):
+                    response_rows = response_data.get("data", response_data.get("positions", []))
+                else:
+                    response_rows = response_data
+
+                for token_group in response_rows:
+                    if not isinstance(token_group, dict):
+                        continue
+                    fallback_token_id = token_group.get("token")
+                    positions_list = token_group.get("positions", [])
+                    for position_row in positions_list:
+                        if not isinstance(position_row, dict):
+                            continue
+                        proxy_wallet = str(position_row.get("proxyWallet", "")).lower()
+                        if proxy_wallet and proxy_wallet != wallet_key:
+                            continue
+
+                        token_id = position_row.get("asset") or fallback_token_id
+                        try:
+                            shares = float(position_row.get("size", 0) or 0)
+                            avg_price = float(position_row.get("avgPrice", 0) or 0)
+                            total_bought = float(position_row.get("totalBought", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+
+                        self._merge_position_snapshot(
+                            condition_positions,
+                            token_id=token_id,
+                            shares=shares,
+                            avg_price=avg_price,
+                            value=total_bought,
+                        )
+
+                self._market_positions_cache[cache_key] = (now_ts, condition_positions)
+                fetched_markets += 1
+
+            for token_id, pos_info in condition_positions.items():
+                self._merge_position_snapshot(
+                    aggregated_positions,
+                    token_id=token_id,
+                    shares=pos_info["shares"],
+                    avg_price=pos_info["avg_price"],
+                    value=pos_info["value"],
+                )
+
+        logger.info(
+            f"[{self.event_name}] Overlay bin verification: {len(aggregated_positions)} token(s) from "
+            f"{len(target_condition_ids)} condition(s), {fetched_markets} fetched, {cache_hits} cache hit(s)"
+        )
+        return aggregated_positions
+
     async def fetch_usdc_balance(self) -> float:
         """
         Fetch current USDC balance from CLOB client.
@@ -1646,6 +1757,55 @@ class KellyTradingBot:
             )
 
             synced_positions[bin_idx] = api_shares
+
+        # Overlay-aware verification: when the executor has pending overlay
+        # fragments (confirmed fills not yet reflected in the API), fetch
+        # market-positions for those specific bins. The bulk /positions API can
+        # lag by 20+ minutes for new fills, but /v1/market-positions is faster.
+        if self.kelly_executor is not None and self.market_condition_ids:
+            overlay_bins = self.kelly_executor.get_overlay_pending_bins()
+            if overlay_bins:
+                overlay_bin_indices = {bin_idx for bin_idx, _ in overlay_bins}
+                overlay_market_snapshot = await self.fetch_market_positions_for_bins(
+                    wallet_address, overlay_bin_indices
+                )
+                if overlay_market_snapshot is not None:
+                    for bin_idx, position_kind in overlay_bins:
+                        is_no = position_kind == "NO"
+                        token_id = (
+                            self.bin_no_token_ids.get(bin_idx, "")
+                            if is_no
+                            else self.bin_token_ids.get(bin_idx, "")
+                        )
+                        market_info = overlay_market_snapshot.get(token_id)
+                        if not market_info:
+                            continue
+
+                        bulk_key = (bin_idx, is_no)
+                        bulk_shares = (
+                            api_bin_positions[bulk_key]["shares"]
+                            if bulk_key in api_bin_positions
+                            else 0.0
+                        )
+
+                        if abs(market_info["shares"] - bulk_shares) > 0.01:
+                            yes_token = self.bin_token_ids.get(bin_idx)
+                            pos = self.portfolio.ensure_position(bin_idx, yes_token or "")
+                            self._apply_reported_side_snapshot(
+                                pos=pos,
+                                bin_idx=bin_idx,
+                                is_no=is_no,
+                                api_shares=market_info["shares"],
+                                api_avg_price=market_info["avg_price"],
+                                api_value=market_info["value"],
+                                snapshot_source="market_positions_overlay",
+                            )
+                            synced_positions[bin_idx] = market_info["shares"]
+                            logger.info(
+                                f"[{self.event_name}] Overlay verification: bin {bin_idx} "
+                                f"{position_kind} market-positions={market_info['shares']:.2f} "
+                                f"(bulk API had {bulk_shares:.2f})"
+                            )
 
         # Second, verify positions that API doesn't report before clearing them.
         market_positions_snapshot: Optional[Dict[str, dict]] = None

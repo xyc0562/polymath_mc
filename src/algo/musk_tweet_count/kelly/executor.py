@@ -2192,6 +2192,18 @@ class KellyExecutor:
         self._prune_recent_tracking(now)
         return True
 
+    def get_overlay_pending_bins(self) -> set[tuple[int, str]]:
+        """Return (bin_index, position_kind) pairs with residual overlay fragments.
+
+        Used by the integration layer to decide which bins need market-positions
+        verification when the bulk positions API may be stale.
+        """
+        return {
+            (f.bin_index, f.position_kind)
+            for f in self._overlay_ledger
+            if f.remaining_size > self._overlay_size_epsilon
+        }
+
     def get_overlay_price_hint_for_api_increase(
         self,
         *,
