@@ -1,17 +1,15 @@
 """
 Implied probability extraction from Deribit option data.
 
-Primary: Call-spread digital extraction (model-free).
-Fallback: Black-76 N(d2) from individual strike IV.
+Uses call-spread digital extraction (model-free) exclusively.
+Strikes without liquid adjacent options are skipped rather than
+falling back to model-dependent BS N(d2).
 """
 
 import logging
-import math
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple
-
-from scipy.stats import norm
 
 from .deribit_client import DeribitOption
 
@@ -42,7 +40,7 @@ class ImpliedProb:
     prob_conservative: float  # Worst-case for our trade
     prob_mid: float
     prob_aggressive: float  # Best-case for our trade
-    method: str  # "call_spread" or "bs_fallback"
+    method: str  # "call_spread"
     forward: float
     T_years: float
 
@@ -203,102 +201,6 @@ def digital_prob_from_call_spread(
         T_years=0.0,  # Set by caller
     )
 
-
-# --- Black-76 N(d2) fallback ---
-
-
-def _compute_d2(
-    forward: float,
-    strike: float,
-    vol: float,
-    T: float,
-) -> Optional[float]:
-    """
-    Compute d2 = [ln(F/K) - σ²T/2] / (σ√T) for Black-76.
-
-    Returns None if inputs are invalid (T <= 0, vol <= 0, etc.).
-    """
-    if T <= 0 or vol <= 0 or forward <= 0 or strike <= 0:
-        return None
-
-    sqrt_T = math.sqrt(T)
-    d2 = (math.log(forward / strike) - 0.5 * vol * vol * T) / (vol * sqrt_T)
-    return d2
-
-
-def prob_above_strike_bs(
-    forward: float,
-    strike: float,
-    vol: float,
-    T_years: float,
-) -> Optional[float]:
-    """
-    Compute P(S > K at T) via Black-76 N(d2).
-
-    Args:
-        forward: Forward price (Deribit underlying_price).
-        strike: Strike price.
-        vol: Implied volatility as decimal (0.65 for 65%).
-        T_years: Time to target (Polymarket resolution) in years.
-
-    Returns:
-        Risk-neutral probability or None if computation fails.
-    """
-    d2 = _compute_d2(forward, strike, vol, T_years)
-    if d2 is None:
-        return None
-    return float(norm.cdf(d2))
-
-
-def bs_implied_prob(
-    forward: float,
-    strike: float,
-    mark_iv: float,
-    bid_iv: Optional[float],
-    ask_iv: Optional[float],
-    T_years: float,
-) -> Optional[ImpliedProb]:
-    """
-    Compute implied probability with bid/ask bounds via Black-76 N(d2).
-
-    Returns None if mark_iv is zero or T is invalid.
-    """
-    if mark_iv <= 0 or T_years <= 0:
-        return None
-
-    # Mid estimate using mark_iv
-    prob_mid = prob_above_strike_bs(forward, strike, mark_iv, T_years)
-    if prob_mid is None:
-        return None
-
-    # Bid/ask bounds
-    # Higher IV -> probability moves toward 0.5
-    # For P > 0.5 (ITM): higher IV = lower prob -> bid_iv gives aggressive, ask_iv gives conservative
-    # For P < 0.5 (OTM): higher IV = higher prob -> ask_iv gives aggressive, bid_iv gives conservative
-    # Simplification: compute both and take min/max
-    probs = [prob_mid]
-    if bid_iv is not None and bid_iv > 0:
-        p = prob_above_strike_bs(forward, strike, bid_iv, T_years)
-        if p is not None:
-            probs.append(p)
-    if ask_iv is not None and ask_iv > 0:
-        p = prob_above_strike_bs(forward, strike, ask_iv, T_years)
-        if p is not None:
-            probs.append(p)
-
-    return ImpliedProb(
-        prob_conservative=min(probs),
-        prob_mid=prob_mid,
-        prob_aggressive=max(probs),
-        method="bs_fallback",
-        forward=forward,
-        T_years=T_years,
-    )
-
-
-# --- Orchestrator ---
-
-
 def time_to_resolution_years(
     now: datetime,
     poly_resolution_utc: datetime,
@@ -321,7 +223,8 @@ def build_implied_prob_map(
     """
     Build implied probability map for all target (date, strike) pairs.
 
-    Tries call-spread digital extraction first, falls back to BS N(d2).
+    Uses call-spread digital extraction only. Strikes without liquid
+    adjacent Deribit options are skipped.
 
     Args:
         options: All Deribit BTC options.
@@ -347,61 +250,37 @@ def build_implied_prob_map(
         if opt.option_type == "C" and opt.underlying_price > 0:
             forwards[opt.expiry_date] = opt.underlying_price
 
+    skipped_no_expiry = 0
+    skipped_too_soon = 0
+    skipped_no_spread = 0
+
     for (exp_date, strike), poly_resolution in target_strikes.items():
+        curve = curves.get(exp_date, [])
+        if not curve:
+            skipped_no_expiry += 1
+            continue
+
         T = time_to_resolution_years(now, poly_resolution)
         T_hours = T * 365.25 * 24
 
         if T_hours < min_T_hours:
-            logger.debug(
-                f"Skipping ({exp_date}, {strike}): T={T_hours:.1f}h < {min_T_hours}h"
-            )
+            skipped_too_soon += 1
             continue
 
         forward = forwards.get(exp_date, 0.0)
-
-        # Try call-spread first
-        curve = curves.get(exp_date, [])
         prob = digital_prob_from_call_spread(curve, strike, min_call_spread_usd)
 
-        if prob is not None:
-            prob.forward = forward
-            prob.T_years = T
-            result[(exp_date, strike)] = prob
+        if prob is None:
+            skipped_no_spread += 1
             continue
 
-        # Fallback: BS N(d2)
-        # Find the option at this exact strike for IV data
-        matching_opt = None
-        for opt in options:
-            if (
-                opt.option_type == "C"
-                and opt.expiry_date == exp_date
-                and opt.strike == strike
-            ):
-                matching_opt = opt
-                break
-
-        if matching_opt is not None and matching_opt.mark_iv > 0:
-            prob = bs_implied_prob(
-                forward=forward,
-                strike=strike,
-                mark_iv=matching_opt.mark_iv,
-                bid_iv=matching_opt.bid_iv,
-                ask_iv=matching_opt.ask_iv,
-                T_years=T,
-            )
-            if prob is not None:
-                result[(exp_date, strike)] = prob
-                continue
-
-        logger.debug(
-            f"No probability estimate for ({exp_date}, {strike}): "
-            f"no call-spread bracket and no matching option IV"
-        )
+        prob.forward = forward
+        prob.T_years = T
+        result[(exp_date, strike)] = prob
 
     logger.info(
         f"Built implied probs for {len(result)}/{len(target_strikes)} targets "
-        f"({sum(1 for p in result.values() if p.method == 'call_spread')} call-spread, "
-        f"{sum(1 for p in result.values() if p.method == 'bs_fallback')} BS fallback)"
+        f"(skipped: {skipped_no_expiry} no Deribit expiry, "
+        f"{skipped_too_soon} too soon, {skipped_no_spread} illiquid call-spread)"
     )
     return result

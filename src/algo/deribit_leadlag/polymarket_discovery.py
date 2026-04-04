@@ -106,15 +106,7 @@ def _parse_outcome_prices(market: dict) -> tuple:
     return yes_price, no_price
 
 
-def _fetch_event_by_id(event_id: int) -> Optional[dict]:
-    """Fetch a single event by ID from Gamma API."""
-    try:
-        resp = requests.get(f"{GAMMA_API_URL}/events/{event_id}", timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return None
+BTC_TAG_ID = 235
 
 
 def _parse_event_markets(event: dict) -> List[ThresholdMarket]:
@@ -181,98 +173,59 @@ def _parse_event_markets(event: dict) -> List[ThresholdMarket]:
     return markets
 
 
-def discover_btc_threshold_markets(
-    seed_event_ids: Optional[List[int]] = None,
-    scan_range: int = 200,
-) -> List[ThresholdMarket]:
+def discover_btc_threshold_markets() -> List[ThresholdMarket]:
     """
     Discover active Polymarket BTC binary threshold events.
 
-    Strategy: Start from seed event IDs (known recent BTC events),
-    then scan nearby IDs to find more. This is necessary because the
-    Gamma API pagination doesn't reliably reach high-ID events.
-
-    Args:
-        seed_event_ids: Known BTC event IDs to start from. If None, uses defaults.
-        scan_range: How many IDs above/below seeds to scan.
-
-    Returns:
-        List of ThresholdMarket objects, one per strike per date.
+    Uses tag_id=235 ("Bitcoin") to fetch all BTC events in one call,
+    then filters to daily "Bitcoin above ___" events.
     """
-    # Default seeds: known BTC "above" event IDs from April 2026
-    if seed_event_ids is None:
-        seed_event_ids = [
-            336429,  # Bitcoin above ___ on April 9
-            340006,  # Bitcoin above ___ on April 10
-        ]
-
-    # Collect all event IDs to check
-    ids_to_check = set()
-
-    # Add seeds
-    for sid in seed_event_ids:
-        ids_to_check.add(sid)
-
-    # Scan around seeds to find nearby events (new dates appear with close IDs)
-    if seed_event_ids:
-        max_seed = max(seed_event_ids)
-        # Scan forward (future dates) and a bit backward
-        for offset in range(-50, scan_range):
-            ids_to_check.add(max_seed + offset)
-
-    # Also try pagination (descending order) for any we might miss
-    try:
-        resp = requests.get(
-            f"{GAMMA_API_URL}/events",
-            params={
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-                "offset": 0,
-                "order": "id",
-                "ascending": "false",
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            for event in resp.json():
-                title = event.get("title", "")
-                if _is_btc_above_event(title):
-                    ids_to_check.add(event["id"])
-    except Exception as e:
-        logger.warning(f"Pagination fetch failed: {e}")
-
-    # Fetch and parse each candidate event
     all_markets = []
-    seen_event_ids = set()
+    offset = 0
+    limit = 100
 
-    for eid in sorted(ids_to_check):
-        event = _fetch_event_by_id(eid)
-        if event is None:
-            continue
+    while True:
+        try:
+            resp = requests.get(
+                f"{GAMMA_API_URL}/events",
+                params={
+                    "tag_id": BTC_TAG_ID,
+                    "active": "true",
+                    "closed": "false",
+                    "limit": limit,
+                    "offset": offset,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+        except Exception as e:
+            logger.error(f"Gamma API error at offset {offset}: {e}")
+            break
 
-        actual_id = event.get("id")
-        if actual_id in seen_event_ids:
-            continue
-        seen_event_ids.add(actual_id)
+        if not events:
+            break
 
-        markets = _parse_event_markets(event)
-        all_markets.extend(markets)
+        for event in events:
+            all_markets.extend(_parse_event_markets(event))
+
+        if len(events) < limit:
+            break
+        offset += limit
 
     # Deduplicate by condition_id
-    seen_conditions = set()
-    unique_markets = []
+    seen = set()
+    unique = []
     for m in all_markets:
-        if m.condition_id not in seen_conditions:
-            seen_conditions.add(m.condition_id)
-            unique_markets.append(m)
+        if m.condition_id not in seen:
+            seen.add(m.condition_id)
+            unique.append(m)
 
     logger.info(
-        f"Discovered {len(unique_markets)} BTC threshold markets "
-        f"across {len(set(m.expiry_date for m in unique_markets))} dates "
-        f"(scanned {len(ids_to_check)} event IDs)"
+        f"Discovered {len(unique)} BTC threshold markets "
+        f"across {len(set(m.expiry_date for m in unique))} dates"
     )
-    return unique_markets
+    return unique
 
 
 def build_target_strikes(
