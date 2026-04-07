@@ -3,28 +3,49 @@
 trading:
   enabled: true
   dry_run: true
-  poll_interval_seconds: 30
-  market_refresh_interval_seconds: 600  # Re-discover Polymarket markets every 10 min
 
 deribit:
   base_url: "https://www.deribit.com/api/v2/public"
   currency: "BTC"
 
-signal:
-  min_edge_threshold: 0.06          # 6pp min net edge (after fees + conservative prob)
-  max_edge_threshold: 0.40          # Skip stale/erroneous
-  min_time_to_expiry_hours: 4.0     # Don't trade too close to Polymarket resolution
-  max_time_to_expiry_days: 7.0
-  min_prob: 0.03                    # Skip deep wing strikes
-  max_prob: 0.97                    # Skip deep ITM strikes
-  min_deribit_volume_24h: 0.1       # Skip stale options with zero volume
-  min_deribit_open_interest: 1.0    # Skip illiquid strikes
-  max_iv_spread: 30.0               # Skip if bid/ask IV spread > 30pp
-  min_call_spread_usd: 50.0         # Min USD between adjacent calls for digital extraction
-  signal_cooldown_seconds: 300      # Don't re-signal same market within 5 min
+deribit_ws:
+  ws_url: "wss://www.deribit.com/ws/api/v2"
+  reconnect_delay_seconds: 2.0
+  max_reconnect_delay_seconds: 60.0
+  stale_threshold_seconds: 5.0
 
-execution:
-  max_order_size_usd: 20.0
-  max_total_exposure_usd: 100.0
-  polymarket_crypto_fee_rate: 0.072 # Dynamic fee: fee_per_share = rate * p * (1-p)
-  state_file: "data/deribit_leadlag_state.json"
+signal:
+  min_call_spread_usd: 15.0
+  max_bounds_width_maker: 0.50
+  max_bounds_width_taker: 0.30
+  min_prob: 0.03
+  max_prob: 0.97
+  min_time_to_expiry_hours: 4.0
+  max_time_to_expiry_days: 7.0
+  time_adjusted_basis_haircut: 0.02
+  no_next_day_extra_haircut: 0.03
+  max_bracket_dk: 3000.0
+
+order:
+  maker_min_edge: 0.02
+  taker_min_edge: 0.15
+  emergency_exit_edge: 0.20
+  reprice_edge_threshold: 0.02
+  emergency_prob_shift: 0.03
+  polymarket_crypto_fee_rate: 0.072
+
+allocation:
+  per_bin_max_usd: 50.0
+  per_date_max_usd: 150.0
+  total_max_usd: 500.0
+  max_order_size_usd: 30.0
+
+poly_ws:
+  orderbook_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  user_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+  heartbeat_interval_seconds: 10.0
+
+strategy:
+  tick_interval_seconds: 1.5
+  position_poll_interval_seconds: 10.0
+  market_refresh_interval_seconds: 600.0

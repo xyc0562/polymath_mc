@@ -44,6 +44,10 @@ class ImpliedProb:
     forward: float
     T_years: float
 
+    @property
+    def bounds_width(self) -> float:
+        return self.prob_aggressive - self.prob_conservative
+
 
 def build_call_price_curve(
     options: List[DeribitOption],
@@ -129,7 +133,7 @@ def _find_bracketing_calls(
 def digital_prob_from_call_spread(
     curve: List[CallPrice],
     target_strike: float,
-    min_spread_usd: float = 50.0,
+    min_spread_usd: float = 15.0,
 ) -> Optional[ImpliedProb]:
     """
     Extract digital probability P(S > K) from adjacent call prices.
@@ -183,14 +187,14 @@ def digital_prob_from_call_spread(
     prob_conservative = min(prob_conservative, prob_mid)
     prob_aggressive = max(prob_aggressive, prob_mid)
 
-    # If bounds are too wide, the call-spread is unreliable (illiquid options)
+    # Log wide bounds for diagnostics but do NOT reject here —
+    # callers apply their own width thresholds (maker vs taker).
     bound_width = prob_aggressive - prob_conservative
     if bound_width > 0.30:
         logger.debug(
-            f"Call-spread bounds too wide for K={target_strike}: "
+            f"Call-spread bounds wide for K={target_strike}: "
             f"[{prob_conservative:.3f}, {prob_aggressive:.3f}] width={bound_width:.3f}"
         )
-        return None
 
     return ImpliedProb(
         prob_conservative=prob_conservative,

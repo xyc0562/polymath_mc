@@ -11,6 +11,8 @@ import requests
 
 from src.const import GAMMA_API_URL
 
+from .settlement import SettlementMeta, parse_settlement_meta
+
 logger = logging.getLogger(__name__)
 
 # Match "Bitcoin above ___" events (noon ET daily resolution)
@@ -36,6 +38,8 @@ class ThresholdMarket:
     no_price: float  # Last/indicative NO price [0, 1]
     event_id: str
     volume: float  # Total volume in USD
+    description: str = ""  # Raw description text from Gamma API
+    settlement: Optional[SettlementMeta] = None  # Parsed settlement metadata
 
 
 def _extract_strike_from_title(title: str) -> Optional[float]:
@@ -153,6 +157,7 @@ def _parse_event_markets(event: dict) -> List[ThresholdMarket]:
             continue
 
         yes_price, no_price = _parse_outcome_prices(mkt)
+        description = mkt.get("description", "")
 
         markets.append(
             ThresholdMarket(
@@ -167,6 +172,8 @@ def _parse_event_markets(event: dict) -> List[ThresholdMarket]:
                 no_price=no_price,
                 event_id=event_id,
                 volume=float(mkt.get("volume", 0) or 0),
+                description=description,
+                settlement=parse_settlement_meta(description, resolution_time) if description else None,
             )
         )
 
