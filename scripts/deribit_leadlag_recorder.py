@@ -151,11 +151,25 @@ BASIS_HAIRCUT = 0.02
 NO_NEXT_DAY_HAIRCUT = 0.03
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resolve_db_path(db_path: str) -> str:
+    """Anchor relative paths at repo root so cwd changes don't fork the DB file."""
+    if os.path.isabs(db_path):
+        return db_path
+    return os.path.join(REPO_ROOT, db_path)
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    # Set WAL before running schema so the journal mode sticks across the
+    # first transaction (and survives across restarts).
     conn = sqlite3.connect(db_path)
-    conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(SCHEMA)
+    conn.commit()
     return conn
 
 
@@ -486,18 +500,31 @@ def main():
                         help="Settlement check interval in seconds")
     args = parser.parse_args()
 
-    conn = init_db(args.db)
+    db_path = resolve_db_path(args.db)
+    conn = init_db(db_path)
     snap_count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
     pending = conn.execute("SELECT COUNT(*) FROM settlements WHERE resolved = 0").fetchone()[0]
     resolved = conn.execute("SELECT COUNT(*) FROM settlements WHERE resolved != 0").fetchone()[0]
-    logger.info(f"Database: {args.db} ({snap_count} snapshots, {resolved} resolved, {pending} pending)")
-    logger.info(f"Recording every {args.interval}s, settlement check every {args.settle_interval}s. Ctrl+C to stop.")
+    logger.info(f"Database: {db_path} ({snap_count} snapshots, {resolved} resolved, {pending} pending)")
+    logger.info(
+        f"Recording every {args.interval}s aligned to wall-clock, "
+        f"settlement check every {args.settle_interval}s. Ctrl+C to stop."
+    )
 
     last_settle_check = 0.0
 
     try:
         while True:
-            t0 = time.monotonic()
+            # Wall-clock alignment: sleep until the next exact boundary
+            # (e.g. interval=60 → wake at :00 of each minute, deterministic
+            # across restarts so successive snapshots always land on the
+            # same cadence).
+            now = time.time()
+            next_tick = (int(now) // args.interval + 1) * args.interval
+            sleep_time = next_tick - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
             try:
                 record_snapshot(conn)
             except Exception as e:
@@ -513,11 +540,6 @@ def main():
                     last_settle_check = time.monotonic()
                 except Exception as e:
                     logger.error(f"Settlement check failed: {e}", exc_info=True)
-
-            elapsed = time.monotonic() - t0
-            sleep_time = max(0, args.interval - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
     except KeyboardInterrupt:
         logger.info("Stopped by user")
     finally:
