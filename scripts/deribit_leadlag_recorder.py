@@ -65,8 +65,9 @@ CLOB_API_URL = "https://clob.polymarket.com"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    epoch_ts REAL NOT NULL,
+    ts TEXT NOT NULL,              -- canonical wall-clock tick (exact interval boundary)
+    epoch_ts REAL NOT NULL,         -- canonical epoch (matches ts)
+    fetched_at REAL,                -- actual wall time when fetches completed
     spot_price REAL
 );
 
@@ -169,6 +170,10 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    # Additive migration: add fetched_at column if this is an older DB.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if "fetched_at" not in cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN fetched_at REAL")
     conn.commit()
     return conn
 
@@ -318,11 +323,17 @@ def update_settlements_from_gamma(conn: sqlite3.Connection) -> int:
     return newly_resolved
 
 
-def record_snapshot(conn: sqlite3.Connection) -> None:
-    """Run one full snapshot cycle."""
-    now = datetime.now(timezone.utc)
-    ts = now.isoformat()
-    epoch_ts = now.timestamp()
+def record_snapshot(conn: sqlite3.Connection, tick_epoch: float) -> None:
+    """
+    Run one full snapshot cycle.
+
+    tick_epoch is the canonical wall-clock tick this snapshot represents
+    (the exact interval boundary we woke up for). The actual fetch time
+    is recorded separately in `fetched_at` for latency diagnostics.
+    """
+    canonical_dt = datetime.fromtimestamp(tick_epoch, tz=timezone.utc)
+    ts = canonical_dt.isoformat()
+    epoch_ts = tick_epoch
 
     # Fetch Polymarket markets
     try:
@@ -381,9 +392,12 @@ def record_snapshot(conn: sqlite3.Connection) -> None:
     ]
 
     # --- Insert snapshot ---
+    # fetched_at is recorded AFTER all venue fetches finish so the delta
+    # `fetched_at - epoch_ts` gives total fetch latency for this tick.
+    fetched_at = datetime.now(timezone.utc).timestamp()
     cur = conn.execute(
-        "INSERT INTO snapshots (ts, epoch_ts, spot_price) VALUES (?, ?, ?)",
-        (ts, epoch_ts, spot),
+        "INSERT INTO snapshots (ts, epoch_ts, fetched_at, spot_price) VALUES (?, ?, ?, ?)",
+        (ts, epoch_ts, fetched_at, spot),
     )
     snap_id = cur.lastrowid
 
@@ -485,10 +499,12 @@ def record_snapshot(conn: sqlite3.Connection) -> None:
     conn.commit()
 
     spot_str = f"spot=${spot:,.0f}" if spot else "spot=N/A"
+    latency_ms = (fetched_at - epoch_ts) * 1000
     logger.info(
-        f"Snapshot {snap_id}: {len(call_options)} deribit, "
-        f"{len(poly_markets)} poly, {eligible_count} adj_probs, "
-        f"books={books_recorded}/{len(poly_markets)}, {spot_str}"
+        f"Snapshot {snap_id} @ {canonical_dt.strftime('%H:%M:%S')}: "
+        f"{len(call_options)} deribit, {len(poly_markets)} poly, "
+        f"{eligible_count} adj_probs, books={books_recorded}/{len(poly_markets)}, "
+        f"{spot_str}, latency={latency_ms:.0f}ms"
     )
 
 
@@ -526,7 +542,7 @@ def main():
                 time.sleep(sleep_time)
 
             try:
-                record_snapshot(conn)
+                record_snapshot(conn, tick_epoch=float(next_tick))
             except Exception as e:
                 logger.error(f"Snapshot failed: {e}", exc_info=True)
 
