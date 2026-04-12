@@ -44,7 +44,8 @@ forecaster:
 kelly:
   enabled: true
   kappa: 0.25          # Quarter Kelly for safety
-  tau: 0.0001          # Min utility gain threshold (lowered to allow smaller trades)
+  min_buy_utility: 0.003   # Min utility gain for buys (post-sizing gate)
+  min_sell_utility: 0.004  # Min utility gain for sells (higher for hysteresis)
   w_floor: 1.0         # Minimum terminal wealth
   max_iters_per_tick: 10  # Reduced from 100 for rate limiting
   t_stop_hours: 3.0    # Stop trading 3h before settlement
@@ -97,8 +98,8 @@ kelly:
 
   # Collateral limits (start conservative)
   collateral:
-    c_event_max: 100.0   # $100 max per event
-    c_bin_max: 25.0      # $25 max per bin
+    c_event_max: 100.0   # $100 max per event (overridden by --max-per-event in live)
+    c_bin_max_ratio: 0.15 # 15% of event max per bin
 
   # WebSocket for real-time orderbook
   websocket:
