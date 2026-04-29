@@ -91,18 +91,36 @@ def build_client():
     return client
 
 
+def _has_live_orderbook(client, token_id: str) -> bool:
+    """The exchange returns 'orderbook does not exist' for tokens whose books
+    weren't migrated to V2 (or which have already settled). Probe before posting.
+    """
+    try:
+        book = client.get_order_book(token_id)
+    except Exception:
+        return False
+    if book is None:
+        return False
+    # OrderBookSummary may be a dataclass or dict; treat any non-empty side as live.
+    bids = getattr(book, "bids", None) or (book.get("bids") if isinstance(book, dict) else None)
+    asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else None)
+    return bool(bids) or bool(asks)
+
+
 def pick_token(client) -> tuple[str, float]:
     """
-    Find one active musk-event token id and its tick size.
+    Find one active musk-event token whose CLOB orderbook is live.
 
-    We use a Musk event (negRisk) because that's what the bot trades.
-    Picks the FIRST clobTokenId of the FIRST bin of an active musk event.
+    Iterates active events tagged Musk-tweet (972), skips events that
+    settle in the next 24h, and probes each token via get_order_book
+    until we find one the exchange will accept POST /order against.
     """
     import requests
+    from datetime import datetime, timezone
 
     resp = requests.get(
         "https://gamma-api.polymarket.com/events",
-        params={"tag_id": 972, "active": "true", "closed": "false", "limit": 5},
+        params={"tag_id": 972, "active": "true", "closed": "false", "limit": 25},
         timeout=10,
     )
     resp.raise_for_status()
@@ -110,9 +128,19 @@ def pick_token(client) -> tuple[str, float]:
     if not events:
         raise RuntimeError("no active musk events found")
 
+    now = datetime.now(timezone.utc)
+    candidates: list[tuple[str, str, str, str]] = []  # (event_title, mkt_q, token_id, end_date)
+
     for ev in events:
         title = ev.get("title", "")
-        if "Musk" not in title and "musk" not in title.lower():
+        if "musk" not in title.lower():
+            continue
+        end = ev.get("endDate") or ""
+        try:
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if (end_dt - now).total_seconds() < 24 * 3600:
+                continue  # too close to settlement
+        except Exception:
             continue
         for m in ev.get("markets", []):
             ids = m.get("clobTokenIds")
@@ -122,15 +150,23 @@ def pick_token(client) -> tuple[str, float]:
                 except Exception:
                     continue
             if isinstance(ids, list) and ids:
-                token_id = str(ids[0])
-                tick = client.get_tick_size(token_id)
-                logger.info(f"event:  {title}")
-                logger.info(f"market: {m.get('question', '?')[:80]}")
-                logger.info(f"token:  {token_id}")
-                logger.info(f"tick:   {tick}")
-                return token_id, float(tick)
+                candidates.append((title, m.get("question", "?"), str(ids[0]), end))
 
-    raise RuntimeError("no usable token id discovered")
+    logger.info(f"discovered {len(candidates)} candidate tokens; probing for live books…")
+    for title, q, tid, end in candidates:
+        if not _has_live_orderbook(client, tid):
+            continue
+        tick = client.get_tick_size(tid)
+        logger.info(f"event:  {title}  (ends {end})")
+        logger.info(f"market: {q[:80]}")
+        logger.info(f"token:  {tid}")
+        logger.info(f"tick:   {tick}")
+        return tid, float(tick)
+
+    raise RuntimeError(
+        "no candidate token has a live V2 orderbook — try with a specific "
+        "--token-id argument from the bot's --list-events output"
+    )
 
 
 def post_test_order(client, token_id: str, tick_size: float) -> dict:
@@ -182,6 +218,13 @@ def main() -> int:
         help="Cancel a specific order ID instead of running the round-trip "
         "(for recovery if a previous run left an order resting).",
     )
+    parser.add_argument(
+        "--token-id",
+        type=str,
+        default=None,
+        help="Skip discovery and use a specific token ID (e.g. one printed by "
+        "the bot's --list-events output).",
+    )
     args = parser.parse_args()
 
     try:
@@ -199,7 +242,15 @@ def main() -> int:
         logger.info(f"cancel response: {resp}")
         return 0
 
-    token_id, tick = pick_token(client)
+    if args.token_id:
+        token_id = args.token_id
+        tick = float(client.get_tick_size(token_id))
+        if not _has_live_orderbook(client, token_id):
+            logger.error(f"token {token_id} has no live V2 orderbook")
+            return 6
+        logger.info(f"token:  {token_id}  (tick={tick}, override)")
+    else:
+        token_id, tick = pick_token(client)
     confirm_or_exit("Post the test order?", args.yes)
 
     logger.info("===== POST =====")
