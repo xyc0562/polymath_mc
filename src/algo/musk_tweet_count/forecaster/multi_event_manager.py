@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 from zoneinfo import ZoneInfo
 
 import requests
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 # Polymarket Data API for fetching positions
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
@@ -3591,7 +3591,7 @@ class MultiEventManager:
         Returns:
             USDC balance
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
 

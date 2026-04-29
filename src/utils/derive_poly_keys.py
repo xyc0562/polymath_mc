@@ -27,7 +27,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 from src.utils.crypto_utils import load_private_key
 
