@@ -24,9 +24,9 @@ import requests
 from ruamel.yaml import YAML
 from dotenv import load_dotenv
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType
+from py_clob_client_v2.constants import POLYGON
 
 from src.utils.app_utils import get_logger
 from src.utils.crypto_utils import load_private_key
@@ -1629,7 +1629,7 @@ class PolymarketTradingBot:
     def check_balance(self) -> float:
         """Check USDC balance."""
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             balance_info = self.clob_client.get_balance_allowance(params)

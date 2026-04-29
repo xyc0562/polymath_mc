@@ -24,8 +24,8 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, PostOrdersArgs
 
 from .config import KellyConfig
 from .orderbook import OrderbookLevel, UnifiedOrderbook, compute_vwap
@@ -358,7 +358,7 @@ class OrderExecutor:
     ) -> Optional[dict]:
         """Fetch conditional token balance/allowance for a specific token_id."""
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             params = BalanceAllowanceParams(
                 asset_type=AssetType.CONDITIONAL,

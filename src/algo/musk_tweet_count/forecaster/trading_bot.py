@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 from .config import ForecasterConfig
 from .forecaster import TweetCountForecaster

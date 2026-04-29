@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 # Polymarket Data API for fetching positions
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
@@ -1056,7 +1056,7 @@ class KellyTradingBot:
             USDC balance
         """
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             # Use CLOB client to get balance (COLLATERAL = USDC)
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -1083,7 +1083,7 @@ class KellyTradingBot:
     def _fetch_conditional_balance_shares(self, token_id: str, refresh: bool = True) -> Optional[float]:
         """Fetch conditional token balance for a specific YES/NO token."""
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             params = BalanceAllowanceParams(
                 asset_type=AssetType.CONDITIONAL,

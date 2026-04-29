@@ -38,8 +38,8 @@ except ImportError:  # pragma: no cover - optional dependency
 project_root = Path(__file__).parent.parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds
 
 from src.utils.crypto_utils import load_private_key
 from src.algo.musk_tweet_count.forecaster.config import (
