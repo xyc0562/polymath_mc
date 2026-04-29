@@ -61,7 +61,7 @@ def derive_api_credentials(
 
     # Derive or retrieve API credentials
     # This will create new credentials if none exist, or return existing ones
-    creds = client.create_or_derive_api_creds()
+    creds = client.create_or_derive_api_key()
 
     return creds
 

@@ -25,7 +25,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import OrderArgs, OrderType, PostOrdersArgs
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, PostOrdersArgs, OrderPayload
 
 from .config import KellyConfig
 from .orderbook import OrderbookLevel, UnifiedOrderbook, compute_vwap
@@ -514,7 +514,7 @@ class OrderExecutor:
             logger.debug(f"Signed order created: {type(signed_order)}")
 
             # FAK = Fill and Kill (IOC) - allows partial fills, cancels unfilled remainder
-            response = self.client.post_order(signed_order, orderType=OrderType.FAK)
+            response = self.client.post_order(signed_order, order_type=OrderType.FAK)
 
             logger.info(
                 f"[{self.event_name}] Order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
@@ -568,7 +568,7 @@ class OrderExecutor:
             return True
 
         try:
-            self.client.cancel(order_id)
+            self.client.cancel_order(OrderPayload(orderID=order_id))
             logger.info(f"[{self.event_name}] Order cancelled: {order_id}")
             return True
         except Exception as e:
