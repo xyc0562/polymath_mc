@@ -25,7 +25,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import OrderArgs, OrderType, PostOrdersArgs, OrderPayload
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, PostOrdersV2Args, OrderPayload
 
 from .config import KellyConfig
 from .orderbook import OrderbookLevel, UnifiedOrderbook, compute_vwap
@@ -723,7 +723,7 @@ class OrderExecutor:
                     side=order["side"],
                 )
                 signed = self.client.create_order(order_args)
-                signed_args.append(PostOrdersArgs(order=signed, orderType=OrderType.FAK))
+                signed_args.append(PostOrdersV2Args(order=signed, orderType=OrderType.FAK))
                 signed_indices.append(i)
             except Exception as e:
                 logger.error(f"[{self.event_name}][BATCH] Failed to sign order {i}: {e}")
