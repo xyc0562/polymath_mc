@@ -91,97 +91,111 @@ def build_client():
     return client
 
 
-def _has_live_orderbook(client, token_id: str) -> bool:
-    """The exchange returns 'orderbook does not exist' for tokens whose books
-    weren't migrated to V2 (or which have already settled). Probe before posting.
+def _book_sides(book) -> tuple[list, list]:
+    """get_order_book returns a dict on v2; extract bids/asks defensively."""
+    if book is None:
+        return [], []
+    if isinstance(book, dict):
+        return book.get("bids") or [], book.get("asks") or []
+    return list(getattr(book, "bids", []) or []), list(getattr(book, "asks", []) or [])
+
+
+def _has_live_orderbook(client, token_id: str, require_both_sides: bool = True) -> bool:
+    """A 'live' V2 book has both bids AND asks (otherwise POST /order tends
+    to fail with 'the orderbook does not exist' even though GET /book is 200).
     """
     try:
         book = client.get_order_book(token_id)
     except Exception:
         return False
-    if book is None:
-        return False
-    # OrderBookSummary may be a dataclass or dict; treat any non-empty side as live.
-    bids = getattr(book, "bids", None) or (book.get("bids") if isinstance(book, dict) else None)
-    asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else None)
-    return bool(bids) or bool(asks)
+    bids, asks = _book_sides(book)
+    return (bool(bids) and bool(asks)) if require_both_sides else (bool(bids) or bool(asks))
 
 
 def pick_token(client) -> tuple[str, float]:
     """
-    Find one active musk-event token whose CLOB orderbook is live.
+    Find any high-volume market with both-sided live V2 liquidity.
 
-    Iterates active events tagged Musk-tweet (972), skips events that
-    settle in the next 24h, and probes each token via get_order_book
-    until we find one the exchange will accept POST /order against.
+    The v2 cutover left some V1 markets without a backfilled orderbook
+    (returns 404 from GET /book and 400 from POST /order), so we cannot
+    rely on the bot's own Musk universe for verification — we just want
+    *any* market that proves the v2 wire path works. Sort gamma /markets
+    by volume desc, probe books, take the first two-sided one.
     """
     import requests
-    from datetime import datetime, timezone
 
     resp = requests.get(
-        "https://gamma-api.polymarket.com/events",
-        params={"tag_id": 972, "active": "true", "closed": "false", "limit": 25},
+        "https://gamma-api.polymarket.com/markets",
+        params={
+            "active": "true",
+            "closed": "false",
+            "order": "volumeNum",
+            "ascending": "false",
+            "limit": 50,
+        },
         timeout=10,
     )
     resp.raise_for_status()
-    events = resp.json()
-    if not events:
-        raise RuntimeError("no active musk events found")
+    markets = resp.json() or []
 
-    now = datetime.now(timezone.utc)
-    candidates: list[tuple[str, str, str, str]] = []  # (event_title, mkt_q, token_id, end_date)
-
-    for ev in events:
-        title = ev.get("title", "")
-        if "musk" not in title.lower():
+    logger.info(f"probing {len(markets)} high-volume markets for two-sided V2 books…")
+    for m in markets:
+        ids = m.get("clobTokenIds")
+        if isinstance(ids, str):
+            try:
+                ids = json.loads(ids)
+            except Exception:
+                continue
+        if not isinstance(ids, list) or not ids:
             continue
-        end = ev.get("endDate") or ""
+        tid = str(ids[0])
         try:
-            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-            if (end_dt - now).total_seconds() < 24 * 3600:
-                continue  # too close to settlement
+            book = client.get_order_book(tid)
         except Exception:
             continue
-        for m in ev.get("markets", []):
-            ids = m.get("clobTokenIds")
-            if isinstance(ids, str):
-                try:
-                    ids = json.loads(ids)
-                except Exception:
-                    continue
-            if isinstance(ids, list) and ids:
-                candidates.append((title, m.get("question", "?"), str(ids[0]), end))
-
-    logger.info(f"discovered {len(candidates)} candidate tokens; probing for live books…")
-    for title, q, tid, end in candidates:
-        if not _has_live_orderbook(client, tid):
+        bids, asks = _book_sides(book)
+        if not (bids and asks):
             continue
-        tick = client.get_tick_size(tid)
-        logger.info(f"event:  {title}  (ends {end})")
-        logger.info(f"market: {q[:80]}")
+        try:
+            tick = float(client.get_tick_size(tid))
+        except Exception:
+            continue
+        best_bid = float(bids[0]["price"]) if isinstance(bids[0], dict) else None
+        best_ask = float(asks[0]["price"]) if isinstance(asks[0], dict) else None
+        logger.info(f"market: {m.get('question', '?')[:80]}")
         logger.info(f"token:  {tid}")
-        logger.info(f"tick:   {tick}")
-        return tid, float(tick)
+        logger.info(f"tick:   {tick}  best_bid={best_bid}  best_ask={best_ask}")
+        return tid, tick
 
     raise RuntimeError(
-        "no candidate token has a live V2 orderbook — try with a specific "
-        "--token-id argument from the bot's --list-events output"
+        "no high-volume market has a two-sided V2 orderbook — try --token-id "
+        "with a token that you've confirmed has resting bids+asks on Polymarket UI"
     )
 
 
-def post_test_order(client, token_id: str, tick_size: float) -> dict:
+def post_test_order(
+    client,
+    token_id: str,
+    tick_size: float,
+    best_bid: float | None,
+) -> dict:
     from py_clob_client_v2.clob_types import (
         OrderArgs,
         OrderType,
         PartialCreateOrderOptions,
     )
 
-    # Tick-aligned price well below any realistic bid. With post_only=True
-    # the order rests if and only if it doesn't cross the spread.
-    price = max(0.01, tick_size)
-    # Notional = price * size. We want >$1 to clear the exchange min.
-    # At price=0.01, size=200 → notional $2.00.
-    size = max(15.0, 2.0 / price)
+    # Place ~10 ticks below the best bid so we're guaranteed not to cross
+    # any ask. Floor at the minimum tick. post_only=True is the belt-and-
+    # suspenders: even if the price calc is wrong, the exchange rejects.
+    if best_bid and best_bid > tick_size * 20:
+        target = best_bid - tick_size * 10
+    else:
+        target = tick_size
+    # Round to tick alignment (floor) and floor at one tick.
+    price = max(tick_size, round(target / tick_size) * tick_size)
+    # ~$2 notional minimum-clear. Round size to whole shares.
+    size = max(15.0, round(2.0 / price))
     notional = price * size
 
     args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
@@ -245,17 +259,27 @@ def main() -> int:
     if args.token_id:
         token_id = args.token_id
         tick = float(client.get_tick_size(token_id))
-        if not _has_live_orderbook(client, token_id):
-            logger.error(f"token {token_id} has no live V2 orderbook")
+        try:
+            book = client.get_order_book(token_id)
+        except Exception as e:
+            logger.error(f"token {token_id}: get_order_book raised {type(e).__name__}: {e}")
             return 6
-        logger.info(f"token:  {token_id}  (tick={tick}, override)")
+        bids, asks = _book_sides(book)
+        if not (bids and asks):
+            logger.error(f"token {token_id} has no two-sided V2 orderbook")
+            return 6
+        best_bid = float(bids[0]["price"]) if isinstance(bids[0], dict) else None
+        logger.info(f"token:  {token_id}  (tick={tick}, best_bid={best_bid}, override)")
     else:
         token_id, tick = pick_token(client)
+        # Re-fetch book to grab best_bid for the price calc
+        bids, _ = _book_sides(client.get_order_book(token_id))
+        best_bid = float(bids[0]["price"]) if bids and isinstance(bids[0], dict) else None
     confirm_or_exit("Post the test order?", args.yes)
 
     logger.info("===== POST =====")
     try:
-        resp = post_test_order(client, token_id, tick)
+        resp = post_test_order(client, token_id, tick, best_bid)
     except Exception as e:
         logger.error(f"post failed: {type(e).__name__}: {e}")
         return 2
