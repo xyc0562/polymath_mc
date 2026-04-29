@@ -2,6 +2,11 @@
 Realtime twikit-based tracker for provisional tweet detection.
 """
 
+# Apply runtime patches to twikit before any twikit import in this module
+# or its dependents (e.g. the lazy `from twikit import Client` inside
+# RealtimeTracker._ensure_initialized).
+from src.utils import twikit_patches  # noqa: F401
+
 import json
 import logging
 from collections import deque
@@ -299,8 +304,9 @@ class RealtimeTweetTracker:
                 )
             else:
                 logger.warning(
-                    "Realtime tracker poll failed (%d): %s",
+                    "Realtime tracker poll failed (%d): %s: %s",
                     self._consecutive_errors,
+                    type(exc).__name__,
                     exc,
                 )
 

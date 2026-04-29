@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from getpass import getpass
 
+from src.utils import twikit_patches  # noqa: F401  (must precede `from twikit import …`)
 from twikit import Client
 
 
