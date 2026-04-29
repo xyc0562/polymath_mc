@@ -19,11 +19,13 @@ import argparse
 import asyncio
 import logging
 import signal
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+from py_clob_client_v2.constants import POLYGON
 
 from src.const import CLOB_API_URL
 from src.utils.crypto_utils import load_private_key
@@ -39,6 +41,37 @@ from .settlement import CompatibilityClass, classify_compatibility
 from .signal_comparator import build_adjusted_prob_map
 
 logger = logging.getLogger(__name__)
+
+
+PUSD_MIN_BALANCE_USD = 10.0
+
+
+def assert_sufficient_pusd(clob_client: ClobClient, min_usd: float = PUSD_MIN_BALANCE_USD) -> None:
+    """Fail fast if pUSD collateral balance is below `min_usd` (live mode only).
+
+    Polymarket CLOB V2 settles in pUSD; USDC.e is not spendable until wrapped
+    via the CollateralOnramp. Use scripts/wrap_usdce_to_pusd.py to wrap.
+    """
+    try:
+        info = clob_client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+    except Exception as e:
+        logger.warning(f"Could not query pUSD balance: {e}")
+        return
+    raw = info.get("balance") if isinstance(info, dict) else None
+    try:
+        pusd = float(raw) / 1e6
+    except (TypeError, ValueError):
+        logger.warning(f"Unparseable balance response: {info!r}")
+        return
+    logger.info(f"pUSD collateral balance: ${pusd:,.2f}")
+    if pusd < min_usd:
+        logger.error(
+            f"pUSD balance ${pusd:,.2f} < ${min_usd:,.2f}. "
+            f"Wrap USDC.e first: python -m scripts.wrap_usdce_to_pusd --check"
+        )
+        sys.exit(1)
 
 
 def setup_clob_client(private_key: str) -> ClobClient:
@@ -372,6 +405,9 @@ def main():
 
     private_key = load_private_key()
     clob_client = setup_clob_client(private_key)
+
+    if not config.dry_run:
+        assert_sufficient_pusd(clob_client)
 
     bot = LeadLagBot(config, clob_client)
 

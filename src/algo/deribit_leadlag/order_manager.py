@@ -11,8 +11,8 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, OrderPayload
 
 from .fak_utils import (
     _best_fak_price,
@@ -118,21 +118,18 @@ class OrderManager:
             logger.info(f"[DRY RUN] Would cancel {len(unique_ids)} orders")
             return unique_ids
 
-        try:
-            self._client.cancel_orders(unique_ids)
-            logger.info(f"Cancelled {len(unique_ids)} orders")
-            return unique_ids
-        except Exception as e:
-            logger.error(f"Batch cancel failed: {e}")
-            # Fallback: cancel individually
-            canceled: List[str] = []
-            for oid in unique_ids:
-                try:
-                    self._client.cancel(oid)
-                    canceled.append(oid)
-                except Exception as e2:
-                    logger.error(f"Individual cancel {oid[:8]}... failed: {e2}")
-            return canceled
+        # v2 cancel_orders takes order *hashes* not IDs; we don't track hashes,
+        # so loop with cancel_order(OrderPayload(orderID=...)) per order.
+        canceled: List[str] = []
+        for oid in unique_ids:
+            try:
+                self._client.cancel_order(OrderPayload(orderID=oid))
+                canceled.append(oid)
+            except Exception as e:
+                logger.error(f"Cancel {oid[:8]}... failed: {e}")
+        if canceled:
+            logger.info(f"Cancelled {len(canceled)}/{len(unique_ids)} orders")
+        return canceled
 
     def _execute_maker(self, action: OrderAction) -> Optional[dict]:
         """
@@ -183,8 +180,8 @@ class OrderManager:
             # Post with GTC + postOnly=True
             response = self._client.post_order(
                 signed_order,
-                orderType=OrderType.GTC,
-                postOnly=True,
+                order_type=OrderType.GTC,
+                post_only=True,
             )
 
             order_id = response.get("orderID", "unknown")
@@ -248,7 +245,7 @@ class OrderManager:
                 side=side,
             )
             signed_order = self._client.create_order(order_args)
-            response = self._client.post_order(signed_order, orderType=OrderType.FAK)
+            response = self._client.post_order(signed_order, order_type=OrderType.FAK)
 
             order_id = response.get("orderID", "unknown")
             logger.info(f"[ORDER] Taker posted: {order_id}")

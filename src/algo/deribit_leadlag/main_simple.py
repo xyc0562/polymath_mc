@@ -14,8 +14,8 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.constants import POLYGON
 
 from src.const import CLOB_API_URL
 from src.utils.crypto_utils import load_private_key

@@ -11,8 +11,8 @@ import math
 from pathlib import Path
 from typing import Dict, Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType
 
 from .config import ExecutionConfig
 from .signal_comparator import TradeSignal
@@ -96,7 +96,7 @@ class LeadLagExecutor:
             )
 
             signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order, orderType=OrderType.FAK)
+            response = self.client.post_order(signed_order, order_type=OrderType.FAK)
 
             order_id = response.get("orderID", "unknown")
             logger.info(
