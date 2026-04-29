@@ -25,7 +25,7 @@ from ruamel.yaml import YAML
 from dotenv import load_dotenv
 
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import OrderArgs, OrderType
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, OrderPayload
 from py_clob_client_v2.constants import POLYGON
 
 from src.utils.app_utils import get_logger
@@ -1687,7 +1687,7 @@ class PolymarketTradingBot:
                         logger.info(f"[DRY RUN] Would cancel order {order_id[:8]}... ({reason})")
                         cancelled.append({"order_id": order_id, "reason": reason, "dry_run": True})
                     else:
-                        self.clob_client.cancel(order_id)
+                        self.clob_client.cancel_order(OrderPayload(orderID=order_id))
                         logger.info(f"Cancelled order {order_id[:8]}... ({reason})")
                         cancelled.append({"order_id": order_id, "reason": reason})
                 except Exception as e:
