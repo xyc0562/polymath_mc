@@ -147,10 +147,26 @@ def smoke_collateral_chain() -> int:
             get_usdce_balance,
         )
 
-        rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
-        w3 = Web3(Web3.HTTPProvider(rpc))
-        if not w3.is_connected():
-            logger.warning(f"  RPC not reachable: {rpc}; skipping chain checks")
+        rpc_candidates = [
+            os.environ.get("POLYGON_RPC_URL"),
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon.llamarpc.com",
+            "https://polygon-rpc.com",
+        ]
+        w3 = None
+        for rpc in rpc_candidates:
+            if not rpc:
+                continue
+            cand = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+            try:
+                if cand.is_connected():
+                    w3 = cand
+                    logger.info(f"  RPC: {rpc}")
+                    break
+            except Exception:
+                pass
+        if w3 is None:
+            logger.warning("  no Polygon RPC reachable; skipping chain checks")
             return 0
 
         from src.utils.crypto_utils import load_private_key
@@ -171,8 +187,34 @@ def smoke_collateral_chain() -> int:
         return 1
 
 
+def _discover_one_token() -> str | None:
+    """Pick any active Polymarket token via gamma so the WS has something to subscribe to."""
+    import requests
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active": "true", "closed": "false", "limit": 5},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+    except Exception as e:
+        logger.warning(f"  could not discover a token via gamma: {e}")
+        return None
+    for m in markets:
+        ids = m.get("clobTokenIds")
+        if isinstance(ids, str):
+            try:
+                ids = json.loads(ids)
+            except Exception:
+                continue
+        if isinstance(ids, list) and ids:
+            return str(ids[0])
+    return None
+
+
 async def smoke_market_ws(seconds: float = 10.0) -> int:
-    """Open the market WS for `seconds`, count messages, log first frame."""
+    """Connect the market WS, subscribe to one token, count updates, disconnect."""
     try:
         from src.algo.musk_tweet_count.kelly.websocket_client import (
             OrderbookWebSocket,
@@ -182,27 +224,35 @@ async def smoke_market_ws(seconds: float = 10.0) -> int:
         logger.error(f"WS import failed: {type(e).__name__}: {e}")
         return 1
 
-    # Use a known liquid token: BTC will-be-above bin from gamma, but we'd need
-    # to discover one. To stay self-contained, just connect with no subscriptions
-    # and verify the connection lifecycle works. If the WS contract changed at
-    # the protocol level we'll see it.
     msgs = 0
-    first = None
+    first_token = None
 
-    async def on_msg(payload):
-        nonlocal msgs, first
+    def on_orderbook_update(token_id, orderbook):
+        nonlocal msgs, first_token
         msgs += 1
-        if first is None:
-            first = payload
+        if first_token is None:
+            first_token = token_id
 
     try:
         cfg = WebSocketConfig()
-        ws = OrderbookWebSocket(config=cfg, on_message=on_msg)
+        ws = OrderbookWebSocket(config=cfg, on_orderbook_update=on_orderbook_update)
         await ws.connect()
-        logger.info(f"  market WS connected; observing {seconds}s")
+        logger.info("  market WS connected")
+
+        token = _discover_one_token()
+        if token:
+            await ws.subscribe([token])
+            logger.info(f"  subscribed to token {token[:16]}…")
+        else:
+            logger.info("  no token discovered; observing connection lifecycle only")
+
         await asyncio.sleep(seconds)
         await ws.disconnect()
-        logger.info(f"  market WS messages: {msgs}, first keys: {list(first.keys()) if isinstance(first, dict) else type(first).__name__ if first else 'none'}")
+
+        logger.info(
+            f"  market WS messages: {msgs}, first token: "
+            f"{first_token[:16] + '…' if first_token else 'none'}"
+        )
         return 0
     except Exception as e:
         logger.error(f"market WS failed: {type(e).__name__}: {e}")
