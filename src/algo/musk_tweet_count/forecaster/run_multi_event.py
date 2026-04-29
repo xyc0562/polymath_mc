@@ -39,7 +39,7 @@ project_root = Path(__file__).parent.parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds
+from py_clob_client_v2.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
 
 from src.utils.crypto_utils import load_private_key
 from src.algo.musk_tweet_count.forecaster.config import (
@@ -478,6 +478,40 @@ def create_clob_client() -> ClobClient:
     else:
         logger.info("Using EOA wallet (signature_type=0)")
         return ClobClient(host, key=private_key, chain_id=chain_id, creds=creds)
+
+
+PUSD_MIN_BALANCE_USD = 10.0
+
+
+def assert_sufficient_pusd(clob_client: ClobClient, min_usd: float = PUSD_MIN_BALANCE_USD) -> None:
+    """
+    Fail fast if the wallet's pUSD collateral balance is below `min_usd`.
+
+    Polymarket CLOB V2 settles in pUSD; USDC.e on the wallet is not
+    spendable on the exchange until wrapped via the CollateralOnramp.
+    Wrapping is operator-driven; if balance is insufficient, this raises
+    SystemExit with a pointer at scripts/wrap_usdce_to_pusd.py.
+    """
+    try:
+        info = clob_client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+    except Exception as e:
+        logger.warning(f"Could not query pUSD balance: {e}")
+        return
+    raw = info.get("balance") if isinstance(info, dict) else None
+    try:
+        pusd = float(raw) / 1e6
+    except (TypeError, ValueError):
+        logger.warning(f"Unparseable balance response: {info!r}")
+        return
+    logger.info(f"pUSD collateral balance: ${pusd:,.2f}")
+    if pusd < min_usd:
+        logger.error(
+            f"pUSD balance ${pusd:,.2f} < ${min_usd:,.2f}. "
+            f"Wrap USDC.e first: python -m scripts.wrap_usdce_to_pusd --check"
+        )
+        sys.exit(1)
 
 
 def get_wallet_address_for_positions() -> str:
@@ -1669,6 +1703,9 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"Failed to create CLOB client: {e}")
         sys.exit(1)
+
+    if args.live:
+        assert_sufficient_pusd(clob_client)
 
     # Create configurations
     # Kelly config first (source of truth for c_event_max)
