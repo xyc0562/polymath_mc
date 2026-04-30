@@ -210,8 +210,12 @@ def fetch_clob_books(token_ids: list[str]) -> dict[str, tuple]:
             asset_id = book.get("asset_id", "")
             bids = book.get("bids", [])
             asks = book.get("asks", [])
-            best_bid = float(bids[0]["price"]) if bids else None
-            best_ask = float(asks[0]["price"]) if asks else None
+            # Polymarket /books returns bids ascending and asks descending,
+            # so bids[0] is the WORST bid and asks[0] is the WORST ask. Pick
+            # the inside quote explicitly via max/min over the price field
+            # so this stays correct regardless of any future ordering change.
+            best_bid = max((float(b["price"]) for b in bids), default=None)
+            best_ask = min((float(a["price"]) for a in asks), default=None)
             result[asset_id] = (best_bid, best_ask)
 
     return result

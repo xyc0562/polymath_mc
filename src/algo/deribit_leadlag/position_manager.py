@@ -12,16 +12,12 @@ from datetime import date
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-import requests
-
 from .config import AllocationConfig, OrderConfig, SignalConfig
 from .implied_probs import ImpliedProb
 from .polymarket_discovery import ThresholdMarket
 from .settlement import CompatibilityClass
 
 logger = logging.getLogger(__name__)
-
-POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 
 
 class DesiredAction(Enum):
@@ -102,7 +98,8 @@ class PositionManager:
 
     Lifecycle:
     1. update_markets: track eligible bins
-    2. fetch_positions / fetch_open_orders: sync from exchange APIs
+    2. set_position_snapshot / set_open_orders: inject inventory from a source
+       (LivePositionSource for production, ledger for backtest)
     3. compute_targets: derive desired inventory plus live execution plans
     4. compute_deltas: reconcile target vs actual vs pending open orders
     """
@@ -112,12 +109,10 @@ class PositionManager:
         alloc_config: AllocationConfig,
         order_config: OrderConfig,
         signal_config: SignalConfig,
-        wallet_address: str,
     ):
         self._alloc = alloc_config
         self._order = order_config
         self._signal = signal_config
-        self._wallet = wallet_address.lower() if wallet_address else ""
         self._bins: Dict[BinKey, BinState] = {}
 
     def update_markets(
@@ -143,113 +138,20 @@ class PositionManager:
                 )
         self._bins = new_bins
 
-    def fetch_positions(self, condition_ids: Optional[List[str]] = None) -> None:
-        """
-        Fetch current positions from Polymarket Data API.
-
-        Uses a single GET /positions snapshot keyed by token_id to avoid one
-        network round-trip per market during startup and periodic sync.
-        """
-        if not self._wallet:
-            logger.warning("Cannot fetch positions without wallet address")
-            return
-
+    def set_position_snapshot(
+        self,
+        yes_by_token: Dict[str, float],
+        no_by_token: Dict[str, float],
+    ) -> None:
+        """Replace per-bin holdings from a snapshot keyed by token_id."""
         for bs in self._bins.values():
-            bs.yes_position = 0.0
-            bs.no_position = 0.0
+            bs.yes_position = float(yes_by_token.get(bs.poly_market.yes_token_id, 0.0))
+            bs.no_position = float(no_by_token.get(bs.poly_market.no_token_id, 0.0))
 
-        token_to_bin = {
-            bs.poly_market.yes_token_id: (bs, "yes")
-            for bs in self._bins.values()
-        }
-        token_to_bin.update({
-            bs.poly_market.no_token_id: (bs, "no")
-            for bs in self._bins.values()
-        })
-
-        try:
-            response = requests.get(
-                f"{POLYMARKET_DATA_API}/positions",
-                params={"user": self._wallet, "sizeThreshold": 0},
-                timeout=15,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as exc:
-            logger.warning(f"Failed to fetch positions snapshot: {exc}")
-            return
-
-        if isinstance(payload, dict):
-            positions = payload.get("positions", payload.get("data", []))
-        else:
-            positions = payload
-
-        for pos in positions:
-            asset = pos.get("asset")
-            if isinstance(asset, str):
-                token_id = asset
-            elif isinstance(asset, dict):
-                token_id = asset.get("id")
-            else:
-                token_id = pos.get("token_id") or pos.get("asset_id")
-            shares = float(pos.get("shares") or pos.get("size") or 0)
-            if shares <= 0:
-                continue
-            target = token_to_bin.get(token_id)
-            if target is None:
-                continue
-            bs, side = target
-            if side == "yes":
-                bs.yes_position = shares
-            else:
-                bs.no_position = shares
-
-        logger.info(
-            "Fetched positions: %d bins, total YES=%.0f NO=%.0f",
-            len(self._bins),
-            sum(bs.yes_position for bs in self._bins.values()),
-            sum(bs.no_position for bs in self._bins.values()),
-        )
-
-    def fetch_open_orders(self, clob_client) -> None:
-        """Fetch current live orders from the CLOB client and map them into bins."""
+    def set_open_orders(self, orders_by_bin: Dict["BinKey", List[OpenOrder]]) -> None:
+        """Replace per-bin live order state from a snapshot keyed by BinKey."""
         for bs in self._bins.values():
-            bs.open_orders.clear()
-
-        token_to_bin: Dict[str, BinState] = {}
-        for bs in self._bins.values():
-            token_to_bin[bs.poly_market.yes_token_id] = bs
-            token_to_bin[bs.poly_market.no_token_id] = bs
-
-        try:
-            orders = clob_client.get_orders()
-            live_orders = [order for order in orders if order.get("status") == "LIVE"]
-        except Exception as exc:
-            logger.warning(f"Failed to fetch open orders: {exc}")
-            return
-
-        for order in live_orders:
-            token_id = order.get("asset_id", "")
-            bs = token_to_bin.get(token_id)
-            if bs is None:
-                continue
-
-            order_type = order.get("type") or order.get("order_type") or ""
-            bs.open_orders.append(
-                OpenOrder(
-                    order_id=order.get("id", ""),
-                    bin_key=bs.bin_key,
-                    side=order.get("side", "BUY"),
-                    token_id=token_id,
-                    price=float(order.get("price", 0) or 0),
-                    size=float(order.get("original_size", 0) or order.get("size", 0) or 0),
-                    posted_at=time.time(),
-                    edge_at_post=0.0,
-                    is_maker=order_type in ("GTC", "GTD"),
-                )
-            )
-
-        logger.info("Mapped %d live orders across bins", sum(len(bs.open_orders) for bs in self._bins.values()))
+            bs.open_orders = list(orders_by_bin.get(bs.bin_key, []))
 
     def compute_targets(
         self,

@@ -53,7 +53,6 @@ def _make_manager() -> PositionManager:
             no_next_day_extra_haircut=0.03,
             max_bracket_dk=3000.0,
         ),
-        wallet_address="0xabc",
     )
 
 
@@ -143,6 +142,72 @@ def test_compute_deltas_uses_live_price_and_cancels_stale_order():
 
     follow_up_actions = manager.compute_deltas()
     assert follow_up_actions == []
+
+
+def test_set_position_snapshot_replaces_holdings_by_token_id():
+    manager = _make_manager()
+    market_a = _make_market(yes_token_id="a-yes", no_token_id="a-no")
+    market_b = _make_market(yes_token_id="b-yes", no_token_id="b-no")
+    market_b = ThresholdMarket(
+        condition_id="cond-2",
+        question=market_b.question,
+        strike=62000.0,
+        expiry_date=market_b.expiry_date,
+        resolution_time_utc=market_b.resolution_time_utc,
+        yes_token_id="b-yes",
+        no_token_id="b-no",
+        yes_price=0.5,
+        no_price=0.5,
+        event_id="evt-2",
+        volume=0.0,
+        description="",
+        settlement=None,
+    )
+    key_a = BinKey(market_a.expiry_date, market_a.strike)
+    key_b = BinKey(market_b.expiry_date, market_b.strike)
+    manager.update_markets(
+        [market_a, market_b],
+        {key_a: CompatibilityClass.TIME_ADJUSTED, key_b: CompatibilityClass.TIME_ADJUSTED},
+    )
+
+    # First snapshot: A holds YES, B holds NO
+    manager.set_position_snapshot({"a-yes": 12.0}, {"b-no": 8.0})
+    assert manager.get_bins()[key_a].yes_position == 12.0
+    assert manager.get_bins()[key_a].no_position == 0.0
+    assert manager.get_bins()[key_b].yes_position == 0.0
+    assert manager.get_bins()[key_b].no_position == 8.0
+
+    # Second snapshot: A is fully closed; B flipped to YES
+    manager.set_position_snapshot({"b-yes": 5.0}, {})
+    assert manager.get_bins()[key_a].yes_position == 0.0
+    assert manager.get_bins()[key_a].no_position == 0.0
+    assert manager.get_bins()[key_b].yes_position == 5.0
+    assert manager.get_bins()[key_b].no_position == 0.0
+
+
+def test_set_open_orders_replaces_per_bin_orders():
+    manager = _make_manager()
+    market = _make_market()
+    key = BinKey(market.expiry_date, market.strike)
+    manager.update_markets([market], {key: CompatibilityClass.TIME_ADJUSTED})
+
+    order = OpenOrder(
+        order_id="oo-1",
+        bin_key=key,
+        side="BUY",
+        token_id=market.yes_token_id,
+        price=0.40,
+        size=20.0,
+        posted_at=0.0,
+        edge_at_post=0.0,
+        is_maker=True,
+    )
+    manager.set_open_orders({key: [order]})
+    assert manager.get_bins()[key].open_orders == [order]
+
+    # Empty snapshot clears the bin
+    manager.set_open_orders({})
+    assert manager.get_bins()[key].open_orders == []
 
 
 def test_large_edge_routes_to_taker_path():

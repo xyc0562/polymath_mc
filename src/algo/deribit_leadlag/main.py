@@ -37,8 +37,9 @@ from .order_manager import OrderManager
 from .poly_ws import PolymarketStreams
 from .polymarket_discovery import ThresholdMarket, discover_btc_threshold_markets
 from .position_manager import BinKey, PositionManager
+from .position_source import LivePositionSource
 from .settlement import CompatibilityClass, classify_compatibility
-from .signal_comparator import build_adjusted_prob_map
+from .strategy_tick import run_strategy_tick
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +160,8 @@ class LeadLagBot:
             alloc_config=config.allocation,
             order_config=config.order,
             signal_config=config.signal,
-            wallet_address=wallet_address,
         )
+        self._position_source = LivePositionSource(wallet_address=wallet_address)
         self._order_mgr = OrderManager(
             clob_client=clob_client,
             order_config=config.order,
@@ -245,16 +246,16 @@ class LeadLagBot:
             logger.warning("ClobClient has no API creds attached; Polymarket WS streams disabled")
 
         # Steps 2-3: Fetch current state
-        self._position_mgr.fetch_open_orders(self._client)
-        self._position_mgr.fetch_positions()
+        self._position_source.fetch_open_orders(self._position_mgr, self._client)
+        self._position_source.fetch_positions(self._position_mgr)
 
         # Step 4: Cancel ALL inherited orders
         logger.info("Cancelling all inherited orders from prior run...")
         self._order_mgr.cancel_all_orders()
 
         # Step 5: Re-fetch to confirm clean state
-        self._position_mgr.fetch_open_orders(self._client)
-        self._position_mgr.fetch_positions()
+        self._position_source.fetch_open_orders(self._position_mgr, self._client)
+        self._position_source.fetch_positions(self._position_mgr)
 
         # Step 6-7: Deribit setup
         logger.info("Fetching Deribit options snapshot...")
@@ -299,38 +300,20 @@ class LeadLagBot:
 
     def _strategy_tick(self) -> None:
         """Single strategy tick: compute probs → signals → targets → actions."""
-        now = datetime.now(timezone.utc)
-        options = self._price_store.build_deribit_options()
-
-        if not options:
-            return
-
-        # Build adjusted reference probabilities
-        adjusted_probs = build_adjusted_prob_map(
-            options=options,
-            now=now,
-            markets=self._markets,
-            signal_config=self._config.signal,
-            compatibility_map=self._compat_map,
-        )
-
-        if not adjusted_probs:
-            return
-
-        # Get live orderbooks
         orderbooks = {}
         if self._poly_streams:
             orderbooks = self._poly_streams.get_all_orderbooks()
 
-        # Compute targets and deltas
-        self._position_mgr.compute_targets(adjusted_probs, orderbooks)
-        actions = self._position_mgr.compute_deltas()
-
-        if actions:
-            report = self._order_mgr.execute_actions(actions)
-            self._position_mgr.apply_execution_report(report)
-            if report.posted_actions:
-                logger.info(f"Executed {len(report.posted_actions)} orders this tick")
+        run_strategy_tick(
+            now=datetime.now(timezone.utc),
+            options=self._price_store.build_deribit_options(),
+            markets=self._markets,
+            compat_map=self._compat_map,
+            orderbooks_by_token=orderbooks,
+            signal_config=self._config.signal,
+            position_mgr=self._position_mgr,
+            order_gateway=self._order_mgr,
+        )
 
     async def _position_poll_loop(self) -> None:
         """Periodically re-fetch positions from exchange."""
@@ -338,8 +321,8 @@ class LeadLagBot:
         while self._running:
             await asyncio.sleep(interval)
             try:
-                self._position_mgr.fetch_positions()
-                self._position_mgr.fetch_open_orders(self._client)
+                self._position_source.fetch_positions(self._position_mgr)
+                self._position_source.fetch_open_orders(self._position_mgr, self._client)
             except Exception as e:
                 logger.error(f"Position poll error: {e}", exc_info=True)
 

@@ -100,6 +100,24 @@ def _book_sides(book) -> tuple[list, list]:
     return list(getattr(book, "bids", []) or []), list(getattr(book, "asks", []) or [])
 
 
+def _inside_quotes(bids: list, asks: list) -> tuple[float | None, float | None]:
+    """Pick the inside best_bid (highest) and best_ask (lowest) from /book arrays.
+
+    Polymarket's CLOB returns bids ascending and asks descending, so bids[0] /
+    asks[0] are the WORST quotes (outer rail). Use max/min over price so this
+    stays correct regardless of any future ordering change.
+    """
+    best_bid = max(
+        (float(b["price"]) for b in bids if isinstance(b, dict) and "price" in b),
+        default=None,
+    )
+    best_ask = min(
+        (float(a["price"]) for a in asks if isinstance(a, dict) and "price" in a),
+        default=None,
+    )
+    return best_bid, best_ask
+
+
 def _has_live_orderbook(client, token_id: str, require_both_sides: bool = True) -> bool:
     """A 'live' V2 book has both bids AND asks (otherwise POST /order tends
     to fail with 'the orderbook does not exist' even though GET /book is 200).
@@ -160,8 +178,7 @@ def pick_token(client) -> tuple[str, float]:
             tick = float(client.get_tick_size(tid))
         except Exception:
             continue
-        best_bid = float(bids[0]["price"]) if isinstance(bids[0], dict) else None
-        best_ask = float(asks[0]["price"]) if isinstance(asks[0], dict) else None
+        best_bid, best_ask = _inside_quotes(bids, asks)
         logger.info(f"market: {m.get('question', '?')[:80]}")
         logger.info(f"token:  {tid}")
         logger.info(f"tick:   {tick}  best_bid={best_bid}  best_ask={best_ask}")
@@ -268,13 +285,13 @@ def main() -> int:
         if not (bids and asks):
             logger.error(f"token {token_id} has no two-sided V2 orderbook")
             return 6
-        best_bid = float(bids[0]["price"]) if isinstance(bids[0], dict) else None
+        best_bid, _ = _inside_quotes(bids, asks)
         logger.info(f"token:  {token_id}  (tick={tick}, best_bid={best_bid}, override)")
     else:
         token_id, tick = pick_token(client)
         # Re-fetch book to grab best_bid for the price calc
-        bids, _ = _book_sides(client.get_order_book(token_id))
-        best_bid = float(bids[0]["price"]) if bids and isinstance(bids[0], dict) else None
+        bids, asks = _book_sides(client.get_order_book(token_id))
+        best_bid, _ = _inside_quotes(bids, asks)
     confirm_or_exit("Post the test order?", args.yes)
 
     logger.info("===== POST =====")
