@@ -185,24 +185,40 @@ class SimulatedOrderGateway:
         if cross_price is None or cross_price <= 0 or cross_price >= 1:
             return None
 
-        return self._fill_at_price(action, fill_price=float(cross_price), order_type="taker")
+        # Taker FAK orders: production runs through `_best_fak_price` for
+        # 2dp `maker_amount` compliance. We mirror it here so the simulator
+        # rejects the same orders production would.
+        side, _, _ = self._derive_sides(action)
+        fak_price, fak_size = _best_fak_price(
+            float(cross_price), int(action.size), side, tick_size=None,
+        )
+        return self._fill_at_price(
+            action, fill_price=float(fak_price), fill_size=int(fak_size),
+            order_type="taker",
+        )
 
     def _execute_at_price(self, action: OrderAction, fill_price: float) -> Optional[dict]:
         """Optimistic maker fill at the algo's chosen post price.
 
-        Sanity checks that the post price is in (0, 1). Used by the
-        `instant_optimistic` maker policy.
+        Maker (GTC) orders are NOT subject to the FAK 2dp `maker_amount`
+        rule, so we keep `action.price` and `action.size` as-is here —
+        matching `OrderManager._execute_maker` which does not call
+        `_best_fak_price`. Sanity-check the price is in (0, 1).
         """
         if self._now is None:
             raise RuntimeError("SimulatedOrderGateway.set_clock() not called this tick")
         if fill_price <= 0 or fill_price >= 1:
             return None
-        return self._fill_at_price(action, fill_price=fill_price, order_type="maker_optimistic")
+        return self._fill_at_price(
+            action, fill_price=float(fill_price), fill_size=int(action.size),
+            order_type="maker_optimistic",
+        )
 
     def _fill_at_price(
         self,
         action: OrderAction,
         fill_price: float,
+        fill_size: int,
         order_type: str,
     ) -> Optional[dict]:
         market = _condition_id_lookup(self._position_mgr, action.bin_key)
@@ -211,26 +227,22 @@ class SimulatedOrderGateway:
 
         side, _, _ = self._derive_sides(action)
 
-        # Apply FAK 2dp mechanics. Maker posts also need 2dp compliance for
-        # the simulated fill path (mirrors what the bot would have signed).
-        fak_price, fak_size = _best_fak_price(fill_price, int(action.size), side, tick_size=None)
-
-        if fak_size < MIN_ORDER_SIZE:
+        if fill_size < MIN_ORDER_SIZE:
             return None
-        if fak_size * fak_price < MIN_ORDER_VALUE_USD:
+        if fill_size * fill_price < MIN_ORDER_VALUE_USD:
             return None
 
-        # Cap by configured max order size.
-        max_size_by_usd = int(self._max_order_size_usd / max(fak_price, 0.01))
-        fak_size = min(fak_size, max_size_by_usd)
-        if fak_size < MIN_ORDER_SIZE:
+        # Cap by configured max order size (USD-budgeted depth proxy).
+        max_size_by_usd = int(self._max_order_size_usd / max(fill_price, 0.01))
+        fill_size = min(fill_size, max_size_by_usd)
+        if fill_size < MIN_ORDER_SIZE:
             return None
 
         order_id = self._next_order_id()
         # Optimistic maker policy assumes zero exchange fees (post-only orders
         # rebate or pay nothing). Taker pays the standard fee.
         fee = (
-            compute_polymarket_fee(fak_price, self._fee_rate) * fak_size
+            compute_polymarket_fee(fill_price, self._fee_rate) * fill_size
             if order_type == "taker"
             else 0.0
         )
@@ -241,7 +253,7 @@ class SimulatedOrderGateway:
             order_id=order_id,
             token_id=action.token_id,
             side=side,
-            filled_size=float(fak_size),
+            filled_size=float(fill_size),
         )
 
         # Emit to ledger.
@@ -258,8 +270,8 @@ class SimulatedOrderGateway:
                     side=yes_or_no,
                     direction=side,
                     token_id=action.token_id,
-                    fill_price=float(fak_price),
-                    fill_size=int(fak_size),
+                    fill_price=float(fill_price),
+                    fill_size=int(fill_size),
                     fee=float(fee),
                     edge_at_post=float(action.edge),
                     order_id=order_id,
@@ -270,8 +282,8 @@ class SimulatedOrderGateway:
             "orderID": order_id,
             "status": "FILLED",
             "type": order_type,
-            "filled_size": fak_size,
-            "filled_price": fak_price,
+            "filled_size": fill_size,
+            "filled_price": fill_price,
         }
 
     @staticmethod

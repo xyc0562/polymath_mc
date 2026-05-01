@@ -87,22 +87,21 @@ def _hours_to_resolution_map(
     return out
 
 
-def _load_outcomes(db_path: str) -> Dict[Tuple[date, float], int]:
-    """Read settlement outcomes keyed by `(expiry_date, strike)`.
+def _load_outcomes(db_path: str) -> Dict[str, int]:
+    """Read definitive settlement outcomes keyed by `condition_id`.
 
-    Multiple condition_ids may share an `(expiry_date, strike)` if Polymarket
-    relisted; we collapse to the most-resolved outcome.
+    Skips rows with `resolved = 0` (unresolved or indeterminate) so the
+    ledger leaves those positions open rather than scoring them as losses.
+    Backfill the settlements table via
+    scripts/backfill_leadlag_settlements.py before relying on backtest PnL.
     """
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     rows = conn.execute(
-        "SELECT condition_id, expiry_date, strike, resolved FROM settlements"
+        "SELECT condition_id, resolved FROM settlements WHERE resolved != 0"
     ).fetchall()
     conn.close()
 
-    by_condition: Dict[str, int] = {}
-    for cid, exp, strike, resolved in rows:
-        by_condition[cid] = int(resolved)
-    return by_condition  # we look up by condition_id at settle time
+    return {cid: int(resolved) for cid, resolved in rows}
 
 
 @dataclass

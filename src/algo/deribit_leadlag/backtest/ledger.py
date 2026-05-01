@@ -145,11 +145,17 @@ class FillLedger:
         expiry_date: date,
         outcomes_by_condition: Dict[str, int],
     ) -> List[SettlementRecord]:
-        """Realize PnL for every position whose `expiry_date` matches.
+        """Realize PnL for positions whose `expiry_date` matches and whose
+        condition_id has a definitive outcome in `outcomes_by_condition`.
 
-        `outcomes_by_condition[condition_id] -> {+1, -1, 0}` from the
-        `settlements` table (resolved column). Walks current ledger
-        inventory and zeroes positions on settled expiries.
+        `outcomes_by_condition[condition_id] -> +1` (YES won) or `-1` (NO
+        won). Missing condition_ids and any 0 entries are treated as
+        unresolved: the position is LEFT IN PLACE, no SettlementRecord is
+        emitted, and a warning is logged. The analyzer's FIFO matcher will
+        skip those (cid, side) keys at end-of-run, so unresolved markets
+        don't leak into PnL as fictitious losses. Backfill the
+        `settlements` table (gamma → Binance fallback) before relying on
+        backtest PnL.
         """
         # Group ledger inventory by (condition_id, side).
         # Map token_id -> (condition_id, side, expiry_date) by replaying fill records.
@@ -159,6 +165,8 @@ class FillLedger:
             token_meta[token] = (rec.condition_id, rec.side, rec.expiry_date)
 
         records: List[SettlementRecord] = []
+        unresolved_cids: set[str] = set()
+
         # Settle YES side.
         for token, shares in list(self._yes_by_token.items()):
             meta = token_meta.get(token)
@@ -167,7 +175,10 @@ class FillLedger:
             cid, side, exp = meta
             if exp != expiry_date or side != "YES":
                 continue
-            yes_resolved = outcomes_by_condition.get(cid, 0)
+            yes_resolved = outcomes_by_condition.get(cid)
+            if yes_resolved is None or yes_resolved == 0:
+                unresolved_cids.add(cid)
+                continue  # leave position open
             payoff = shares if yes_resolved == 1 else 0.0
             records.append(
                 SettlementRecord(
@@ -190,7 +201,10 @@ class FillLedger:
             cid, side, exp = meta
             if exp != expiry_date or side != "NO":
                 continue
-            yes_resolved = outcomes_by_condition.get(cid, 0)
+            yes_resolved = outcomes_by_condition.get(cid)
+            if yes_resolved is None or yes_resolved == 0:
+                unresolved_cids.add(cid)
+                continue
             payoff = shares if yes_resolved == -1 else 0.0
             records.append(
                 SettlementRecord(
@@ -205,6 +219,15 @@ class FillLedger:
                 )
             )
             self._no_by_token.pop(token, None)
+
+        if unresolved_cids:
+            logger.warning(
+                "settle_expiry %s: %d condition_id(s) lack a definitive outcome; "
+                "leaving positions open. Backfill `settlements` table to score them. "
+                "Unresolved: %s",
+                expiry_date, len(unresolved_cids),
+                ", ".join(sorted(unresolved_cids))[:200],
+            )
 
         self._settlements.extend(records)
         return records

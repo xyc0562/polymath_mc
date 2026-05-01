@@ -29,6 +29,48 @@ def _seed_buy_yes(ledger: FillLedger, *, condition_id: str, expiry: date, strike
     ))
 
 
+def test_settle_skips_unresolved_condition_and_keeps_inventory():
+    """Regression: missing/0 outcome must NOT zero out inventory.
+
+    The previous implementation defaulted unknown condition_ids to 0 and
+    treated the position as a total loss, then popped it from the ledger.
+    That silently turned an incomplete settlements backfill into fictitious
+    losses. After the fix, the position must remain open and no
+    SettlementRecord is emitted for that condition_id.
+    """
+    ledger = FillLedger()
+    expiry = date(2026, 4, 22)
+    _seed_buy_yes(
+        ledger,
+        condition_id="cond-unresolved",
+        expiry=expiry,
+        strike=78000.0,
+        size=100,
+        price=0.55,
+        ts=datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc),
+    )
+
+    # Outcome map missing this condition_id ⇒ unresolved
+    records = ledger.settle_expiry(
+        timestamp=datetime(2026, 4, 22, 16, 0, tzinfo=timezone.utc),
+        expiry_date=expiry,
+        outcomes_by_condition={},
+    )
+    assert records == []
+    yes_after, _ = ledger.snapshot_by_token()
+    assert yes_after["cond-unresolved-yes"] == 100  # left open
+
+    # Same with explicit 0 (the legacy "indeterminate" sentinel)
+    records2 = ledger.settle_expiry(
+        timestamp=datetime(2026, 4, 22, 16, 0, tzinfo=timezone.utc),
+        expiry_date=expiry,
+        outcomes_by_condition={"cond-unresolved": 0},
+    )
+    assert records2 == []
+    yes_after2, _ = ledger.snapshot_by_token()
+    assert yes_after2["cond-unresolved-yes"] == 100  # still open
+
+
 def test_settlement_pays_winning_yes_full_dollar_and_zeros_inventory():
     ledger = FillLedger()
     expiry = date(2026, 4, 22)

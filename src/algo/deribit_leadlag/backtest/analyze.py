@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import dataclasses
 import math
 import os
 from collections import defaultdict, deque
@@ -112,7 +113,11 @@ def fifo_resolve(
     for fill in sorted_fills:
         key = (fill.condition_id, fill.side)
         if fill.direction == "BUY":
-            buys_open[key].append(fill)
+            # Push a working copy onto the FIFO. The matcher mutates
+            # `fill_size`/`fee` as sells consume it; mutating the original
+            # would corrupt fills.csv (which the CLI writes after this
+            # function runs) and make repeated calls non-idempotent.
+            buys_open[key].append(dataclasses.replace(fill))
             continue
 
         # SELL: match FIFO.

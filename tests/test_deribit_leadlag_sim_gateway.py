@@ -181,6 +181,78 @@ def test_maker_actions_filled_at_post_price_under_instant_optimistic():
     assert fills[0].fee == 0.0  # optimistic maker pays no fee
 
 
+def test_maker_fills_skip_fak_size_adjustment():
+    """Regression: optimistic-maker fills must NOT pass through `_best_fak_price`.
+
+    `_best_fak_price` is the taker-only FAK 2dp `maker_amount` rule and
+    production GTC maker orders skip it. At price 0.013 (3-decimal tick
+    grid) and size 101, the FAK path forces size to a multiple of 10
+    (size_step = 100 / gcd(130, 100) = 10) → 100 shares. The maker path
+    must preserve the requested 101 shares at the post price.
+    """
+    mgr = _make_position_mgr()
+    fills = []
+    gw = SimulatedOrderGateway(
+        mgr, fee_rate=0.072, max_order_size_usd=10000.0,
+        fill_callback=fills.append, maker_policy="instant_optimistic",
+    )
+    gw.set_clock(datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc))
+    gw.set_orderbooks({"yes-tok": SimulatedOrderbook(best_yes_bid=0.013, best_yes_ask=0.020)})
+
+    action = OrderAction(
+        bin_key=BinKey(date(2026, 4, 22), 78000.0),
+        action=DesiredAction.BUY_YES,
+        token_id="yes-tok",
+        price=0.013,
+        size=101,
+        is_maker=True,
+        edge=0.20,
+    )
+    gw.execute_actions([action])
+
+    assert len(fills) == 1
+    assert fills[0].fill_price == 0.013  # not bumped up by FAK
+    assert fills[0].fill_size == 101     # not rounded down by FAK
+
+
+def test_taker_fills_still_apply_fak_size_adjustment():
+    """Sanity check: taker FAK rounding remains in place.
+
+    Production `OrderManager._execute_taker` calls `_best_fak_price` on
+    every taker so a 101-share order at a 3-decimal price like 0.013
+    settles to 100 shares (size_step=10). The simulator must mirror that.
+    """
+    mgr = _make_position_mgr()
+    fills = []
+    gw = SimulatedOrderGateway(
+        mgr, fee_rate=0.072, max_order_size_usd=10000.0,
+        fill_callback=fills.append, maker_policy="discard",
+    )
+    gw.set_clock(datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc))
+    # Best ask at 0.013 — taker BUY crosses there.
+    gw.set_orderbooks({"yes-tok": SimulatedOrderbook(best_yes_bid=0.012, best_yes_ask=0.013)})
+
+    action = OrderAction(
+        bin_key=BinKey(date(2026, 4, 22), 78000.0),
+        action=DesiredAction.BUY_YES,
+        token_id="yes-tok",
+        price=0.020,    # algo-requested price (irrelevant for crossing)
+        size=101,
+        is_maker=False,
+        edge=0.20,
+    )
+    gw.execute_actions([action])
+
+    assert len(fills) == 1
+    # FAK rounding must have moved EITHER the price or the size from
+    # the naive (101 @ 0.013) execution we'd get without it.
+    fak_adjusted = fills[0].fill_size != 101 or fills[0].fill_price != 0.013
+    assert fak_adjusted, (
+        f"taker FAK rounding did not engage: got "
+        f"size={fills[0].fill_size} price={fills[0].fill_price}"
+    )
+
+
 def test_invalid_maker_policy_raises():
     mgr = _make_position_mgr()
     try:

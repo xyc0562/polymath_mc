@@ -184,6 +184,43 @@ def test_provider_drops_options_without_underlying_price():
         os.unlink(path)
 
 
+def test_provider_excludes_endpoint_at_end_ts():
+    """Regression: half-open interval [start_ts, end_ts).
+
+    The CLI passes `end_ts = midnight-of-(end_date+1)`. With the previous
+    `BETWEEN ... AND ...` (inclusive) query, the very first snapshot of
+    end_date+1 (at exactly 00:00:00) leaked into the run. The fix uses
+    `epoch_ts >= start AND epoch_ts < end`.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        path = f.name
+    try:
+        _seed_db(path)
+        # Append a snapshot at exactly the end_ts (boundary moment).
+        boundary_ts = datetime(2026, 4, 23, 0, 0, tzinfo=timezone.utc)
+        boundary_epoch = boundary_ts.timestamp()
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "INSERT INTO snapshots (id, ts, epoch_ts, fetched_at, spot_price) VALUES (99, ?, ?, ?, ?)",
+            (boundary_ts.isoformat(), boundary_epoch, boundary_epoch, 78200.0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Range up to (but not including) the boundary: only the original
+        # two snapshots should appear — never snapshot id=99.
+        with SqliteMarketDataProvider(
+            path,
+            start_ts=datetime(2026, 4, 22, 0, 0, tzinfo=timezone.utc),
+            end_ts=boundary_ts,  # exclusive
+        ) as p:
+            ticks = list(p.iter_snapshots())
+        assert all(t.snapshot_id != 99 for t in ticks)
+        assert len(ticks) == 2
+    finally:
+        os.unlink(path)
+
+
 def test_provider_tick_stride_subsamples():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         path = f.name

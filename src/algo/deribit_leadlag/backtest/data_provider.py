@@ -148,11 +148,15 @@ def _parse_compatibility(value: Optional[str]) -> CompatibilityClass:
 
 
 class SqliteMarketDataProvider:
-    """Iterate recorded snapshots between `start_ts` and `end_ts` (inclusive).
+    """Iterate recorded snapshots in the half-open interval [start_ts, end_ts).
 
     Opens the SQLite database read-only. The iterator does two batched
     fetches per snapshot (one for `deribit_options`, one for `polymarket_bins`)
     so end-to-end iteration is O(snapshots), not O(snapshots × markets).
+
+    The interval is intentionally half-open so passing `end_ts =
+    midnight-of-(end_date+1)` only covers `end_date`'s snapshots, not the
+    very first tick of the next day.
     """
 
     def __init__(
@@ -193,7 +197,7 @@ class SqliteMarketDataProvider:
         snap_cursor = self._conn.execute(
             """SELECT id, ts, epoch_ts, spot_price
                FROM snapshots
-               WHERE epoch_ts BETWEEN ? AND ?
+               WHERE epoch_ts >= ? AND epoch_ts < ?
                ORDER BY epoch_ts ASC""",
             (start_epoch, end_epoch),
         )
