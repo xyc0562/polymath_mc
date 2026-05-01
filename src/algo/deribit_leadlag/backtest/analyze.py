@@ -54,11 +54,30 @@ class ResolvedTrade:
     sell_fee: float
     pnl: float  # (sell − buy) * size − fees
     resolution: str  # "closed_early" | "settlement_win" | "settlement_loss"
+    # Raw YES-side probabilities at entry (always reported relative to the YES
+    # outcome). Use `model_prob_conservative_for_side` for the side-correct
+    # value to compare against `realized_payoff` in the basis-error metric.
     prob_conservative_at_entry: Optional[float]
     prob_mid_at_entry: Optional[float]
+    prob_aggressive_at_entry: Optional[float]
     bounds_width: Optional[float]
     has_next_day: Optional[bool]
     hours_to_resolution_at_entry: Optional[float]
+
+    @property
+    def model_prob_conservative_for_side(self) -> Optional[float]:
+        """Model's worst-case probability our side wins.
+
+        For a YES leg this is just `prob_conservative_at_entry` (the
+        YES-side conservative). For a NO leg, the conservative NO
+        probability is `1 - prob_aggressive_at_entry` — the worst-case
+        for our trade is when YES is most likely (aggressive).
+        """
+        if self.side == "YES":
+            return self.prob_conservative_at_entry
+        if self.prob_aggressive_at_entry is None:
+            return None
+        return 1.0 - self.prob_aggressive_at_entry
 
 
 def _yes_payoff_for_side(side: str, yes_resolved: int) -> float:
@@ -127,6 +146,7 @@ def fifo_resolve(
                     resolution="closed_early",
                     prob_conservative_at_entry=buy.prob_conservative_at_entry,
                     prob_mid_at_entry=buy.prob_mid_at_entry,
+                    prob_aggressive_at_entry=buy.prob_aggressive_at_entry,
                     bounds_width=buy.bounds_width,
                     has_next_day=buy.has_next_day,
                     hours_to_resolution_at_entry=buy.hours_to_resolution,
@@ -170,6 +190,7 @@ def fifo_resolve(
                     resolution=resolution,
                     prob_conservative_at_entry=buy.prob_conservative_at_entry,
                     prob_mid_at_entry=buy.prob_mid_at_entry,
+                    prob_aggressive_at_entry=buy.prob_aggressive_at_entry,
                     bounds_width=buy.bounds_width,
                     has_next_day=buy.has_next_day,
                     hours_to_resolution_at_entry=buy.hours_to_resolution,
@@ -258,12 +279,14 @@ def basis_errors_by_stratum(
     }
 
     for t in trades:
-        if t.prob_conservative_at_entry is None:
+        side_prob = t.model_prob_conservative_for_side
+        if side_prob is None:
             continue
         # Realized payoff for this leg: closed_early uses sell_price; settlement
-        # uses 0/1.
+        # uses 0/1. Compare against the conservative model prob FOR THE SIDE
+        # we're holding (1 - prob_aggressive_YES for NO legs).
         realized = t.sell_price
-        basis_error = realized - t.prob_conservative_at_entry
+        basis_error = realized - side_prob
 
         groups["side"][t.side].append(basis_error)
         groups["has_next_day"][str(t.has_next_day)].append(basis_error)
@@ -326,9 +349,11 @@ def write_trades_csv(path: str, trades: List[ResolvedTrade]) -> None:
             "timestamp_open", "timestamp_close", "condition_id", "expiry_date",
             "strike", "side", "size", "buy_price", "sell_price", "buy_fee", "sell_fee",
             "pnl", "resolution", "prob_conservative_at_entry", "prob_mid_at_entry",
+            "prob_aggressive_at_entry", "model_prob_conservative_for_side",
             "bounds_width", "has_next_day", "hours_to_resolution_at_entry",
         ])
         for t in trades:
+            side_prob = t.model_prob_conservative_for_side
             writer.writerow([
                 t.timestamp_open.isoformat(),
                 t.timestamp_close.isoformat(),
@@ -345,6 +370,8 @@ def write_trades_csv(path: str, trades: List[ResolvedTrade]) -> None:
                 t.resolution,
                 f"{t.prob_conservative_at_entry:.4f}" if t.prob_conservative_at_entry is not None else "",
                 f"{t.prob_mid_at_entry:.4f}" if t.prob_mid_at_entry is not None else "",
+                f"{t.prob_aggressive_at_entry:.4f}" if t.prob_aggressive_at_entry is not None else "",
+                f"{side_prob:.4f}" if side_prob is not None else "",
                 f"{t.bounds_width:.4f}" if t.bounds_width is not None else "",
                 t.has_next_day if t.has_next_day is not None else "",
                 f"{t.hours_to_resolution_at_entry:.2f}" if t.hours_to_resolution_at_entry is not None else "",
@@ -369,9 +396,9 @@ def summarize(trades: List[ResolvedTrade]) -> dict:
     n = len(trades)
 
     overall_basis = [
-        t.sell_price - t.prob_conservative_at_entry
+        t.sell_price - t.model_prob_conservative_for_side
         for t in trades
-        if t.prob_conservative_at_entry is not None
+        if t.model_prob_conservative_for_side is not None
     ]
 
     by_stratum_raw = basis_errors_by_stratum(trades)
