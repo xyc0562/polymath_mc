@@ -2311,6 +2311,73 @@ class MultiEventManager:
             except Exception as e:
                 logger.error(f"Failed to refit model for event {event_id}: {e}")
 
+    @staticmethod
+    def _compute_settlement_pnl_breakdown(
+        event_info: EventInfo,
+        bot: GASKellyTradingBot,
+        actual_count: int,
+    ) -> Tuple[float, List[Dict[str, Any]]]:
+        """Compute settlement-time P&L of currently-held positions given the
+        final tweet count.
+
+        Returns (total_pnl, per_bin_breakdown). Each breakdown entry has
+        keys: bin_index, lower, upper, is_winning_bin, yes_shares,
+        yes_avg_cost, no_shares, no_avg_cost, pnl.
+
+        This is *settlement-time* P&L — the payoff each remaining position
+        receives at settlement minus its cost basis. It does NOT include
+        cash realized from intra-event sells; that matches the convention
+        used by _build_event_capital_snapshot (idle_cash = alloc - open_cost,
+        which also ignores intra-event realized gains). Slight underestimate
+        of true wallet P&L, but consistent with the rest of the bot's
+        accounting and orders of magnitude more useful than always-zero.
+        """
+        portfolio = getattr(getattr(bot, "kelly_bot", None), "portfolio", None)
+        if portfolio is None:
+            return 0.0, []
+
+        total_pnl = 0.0
+        breakdown: List[Dict[str, Any]] = []
+
+        for bin_idx, pos in sorted(portfolio.positions.items()):
+            if bin_idx < 0 or bin_idx >= len(event_info.bins):
+                continue
+            if pos.yes_shares <= 0.01 and pos.no_shares <= 0.01:
+                continue
+
+            bin_def = event_info.bins[bin_idx]
+            lower = bin_def.get("lower_bound")
+            upper = bin_def.get("upper_bound")
+            if lower is None or upper is None:
+                continue
+
+            # Bin bounds are inclusive on both ends; the top bin uses
+            # +inf for its upper bound (e.g. "500+").
+            is_winning_bin = lower <= actual_count and (
+                upper == float("inf") or actual_count <= upper
+            )
+            yes_payoff = 1.0 if is_winning_bin else 0.0
+            no_payoff = 0.0 if is_winning_bin else 1.0
+
+            yes_pnl = pos.yes_shares * (yes_payoff - pos.yes_avg_cost)
+            no_pnl = pos.no_shares * (no_payoff - pos.no_avg_cost)
+            bin_pnl = yes_pnl + no_pnl
+            total_pnl += bin_pnl
+
+            breakdown.append({
+                "bin_index": bin_idx,
+                "lower": lower,
+                "upper": upper,
+                "is_winning_bin": is_winning_bin,
+                "yes_shares": pos.yes_shares,
+                "yes_avg_cost": pos.yes_avg_cost,
+                "no_shares": pos.no_shares,
+                "no_avg_cost": pos.no_avg_cost,
+                "pnl": bin_pnl,
+            })
+
+        return total_pnl, breakdown
+
     async def get_authoritative_count(
         self,
         event_info: EventInfo,
@@ -2922,6 +2989,72 @@ class MultiEventManager:
         finally:
             await self._cleanup_event(event_id, bot)
 
+    async def _log_settlement_pnl(
+        self,
+        event_id: str,
+        event_info: EventInfo,
+        bot: GASKellyTradingBot,
+        allocated_capital: float,
+    ) -> None:
+        """Compute and log settlement P&L of remaining positions.
+
+        Pulls the authoritative tweet count from XTracker and applies
+        binary-payoff math on each currently-held position. Logged at
+        cleanup time so every settled event has a per-bin P&L breakdown
+        instead of the structurally-zero realized_pnl from
+        capital_pool.return_capital. Failures (e.g. XTracker unreachable
+        at cleanup) degrade to a single warning line — never block
+        cleanup.
+        """
+        try:
+            actual_count, _ = await self.get_authoritative_count(event_info)
+        except Exception as e:
+            logger.warning(
+                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                f"skipped: failed to fetch authoritative count: {e}"
+            )
+            return
+
+        if actual_count is None:
+            logger.warning(
+                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                f"skipped: authoritative count unavailable"
+            )
+            return
+
+        try:
+            settlement_pnl, breakdown = self._compute_settlement_pnl_breakdown(
+                event_info, bot, actual_count
+            )
+        except Exception as e:
+            logger.error(
+                f"[EVENT][SETTLEMENT_PNL] event={event_id} failed to compute: {e}",
+                exc_info=True,
+            )
+            return
+
+        pnl_pct = (settlement_pnl / allocated_capital * 100) if allocated_capital > 0 else 0.0
+        logger.info(
+            f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+            f"short_name={event_info.short_name} actual_count={actual_count} "
+            f"settlement_pnl={self._fmt_usd(settlement_pnl)} "
+            f"({pnl_pct:+.2f}% of alloc={self._fmt_usd(allocated_capital)}) "
+            f"bins_held={len(breakdown)}"
+        )
+        for entry in breakdown:
+            bin_range = (
+                f"{entry['lower']}+"
+                if entry['upper'] == float('inf')
+                else f"{entry['lower']}-{entry['upper']}"
+            )
+            outcome = "WIN" if entry['is_winning_bin'] else "lose"
+            logger.info(
+                f"  bin {entry['bin_index']:>2} {bin_range:>10} {outcome:>4} | "
+                f"YES {entry['yes_shares']:>10.2f} @ ${entry['yes_avg_cost']:.4f} | "
+                f"NO {entry['no_shares']:>10.2f} @ ${entry['no_avg_cost']:.4f} | "
+                f"pnl={self._fmt_usd(entry['pnl'])}"
+            )
+
     async def _cleanup_event(
         self,
         event_id: str,
@@ -2977,6 +3110,13 @@ class MultiEventManager:
             else:
                 # Fallback: return initial allocation
                 final_value = allocated_capital
+
+            # Log settlement P&L of remaining positions for observability.
+            # Note: this is logged ONLY — final_value still uses
+            # allocated_capital so the CapitalPool flow is unchanged
+            # (actual on-chain reconciliation runs through _sync_capital_from_api).
+            if event_info is not None:
+                await self._log_settlement_pnl(event_id, event_info, bot, allocated_capital)
 
             # Return capital to pool (CapitalPool has its own lock)
             await self.capital_pool.return_capital(event_id, final_value)

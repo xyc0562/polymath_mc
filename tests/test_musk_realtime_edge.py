@@ -468,6 +468,252 @@ def test_no_exposure_helper_treats_missing_portfolio_as_evictable():
     assert MultiEventManager._event_has_no_exposure(active) is True
 
 
+# ---------------------------------------------------------------------------
+# Settlement P&L computation at event cleanup
+# ---------------------------------------------------------------------------
+
+
+def _make_event_info_with_bins() -> EventInfo:
+    return EventInfo(
+        event_id="ev1",
+        title="Musk count Mar 01 - Mar 08",
+        short_name="Mar 01 - Mar 08",
+        settlement_date=date(2026, 3, 8),
+        market_start_date=date(2026, 3, 1),
+        bins=[
+            {"lower_bound": 100, "upper_bound": 119, "token_id": "y0", "no_token_id": "n0"},
+            {"lower_bound": 120, "upper_bound": 139, "token_id": "y1", "no_token_id": "n1"},
+            {"lower_bound": 140, "upper_bound": 159, "token_id": "y2", "no_token_id": "n2"},
+            {"lower_bound": 500, "upper_bound": float("inf"), "token_id": "y3", "no_token_id": "n3"},
+        ],
+    )
+
+
+def _make_bot_with_positions(positions: dict) -> SimpleNamespace:
+    from src.algo.musk_tweet_count.kelly.portfolio import BinPosition
+
+    portfolio = SimpleNamespace(positions={})
+    for bin_idx, spec in positions.items():
+        portfolio.positions[bin_idx] = BinPosition(
+            bin_index=bin_idx,
+            yes_token_id=f"y{bin_idx}",
+            yes_shares=spec.get("yes_shares", 0.0),
+            no_shares=spec.get("no_shares", 0.0),
+            yes_avg_cost=spec.get("yes_avg_cost", 0.0),
+            no_avg_cost=spec.get("no_avg_cost", 0.0),
+        )
+    kelly_bot = SimpleNamespace(portfolio=portfolio)
+    return SimpleNamespace(kelly_bot=kelly_bot)
+
+
+def test_settlement_pnl_winning_yes_pays_one_minus_cost():
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        1: {"yes_shares": 100.0, "yes_avg_cost": 0.20},  # 120-139 wins
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert pnl == 80.0  # 100 * (1.0 - 0.20)
+    assert len(breakdown) == 1
+    assert breakdown[0]["is_winning_bin"] is True
+    assert breakdown[0]["pnl"] == 80.0
+
+
+def test_settlement_pnl_losing_yes_loses_cost():
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        0: {"yes_shares": 50.0, "yes_avg_cost": 0.30},  # 100-119 doesn't contain 125
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert pnl == -15.0  # 50 * (0.0 - 0.30)
+    assert breakdown[0]["is_winning_bin"] is False
+
+
+def test_settlement_pnl_winning_no_loses_one_minus_cost_inverted():
+    """NO shares on the winning bin pay $0; loss = no_shares * no_avg_cost."""
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        1: {"no_shares": 200.0, "no_avg_cost": 0.85},  # 120-139 wins
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert pnl == -170.0  # 200 * (0.0 - 0.85)
+
+
+def test_settlement_pnl_losing_no_pays_one_minus_cost():
+    """NO shares on a losing bin pay $1; gain = no_shares * (1 - no_avg_cost)."""
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        2: {"no_shares": 100.0, "no_avg_cost": 0.90},  # 140-159 doesn't contain 125
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert abs(pnl - 10.0) < 1e-9  # 100 * (1.0 - 0.90)
+
+
+def test_settlement_pnl_mixed_positions_sum_correctly():
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        0: {"yes_shares": 50.0, "yes_avg_cost": 0.10},     # loses: -5
+        1: {                                                # bin 120-139 wins
+            "yes_shares": 100.0, "yes_avg_cost": 0.30,    # +70
+            "no_shares": 20.0, "no_avg_cost": 0.80,       # -16
+        },
+        2: {"no_shares": 80.0, "no_avg_cost": 0.95},      # bin doesn't win, NO pays 1: +4
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    # -5 + 70 - 16 + 4 = 53
+    assert abs(pnl - 53.0) < 1e-9
+    assert len(breakdown) == 3
+
+
+def test_settlement_pnl_top_bin_open_ended_wins_with_high_count():
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        3: {"yes_shares": 25.0, "yes_avg_cost": 0.05},  # 500+ contains 1000
+    })
+
+    pnl, _ = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=1000,
+    )
+
+    assert abs(pnl - 23.75) < 1e-9  # 25 * (1.0 - 0.05)
+
+
+def test_settlement_pnl_skips_dust_positions():
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        0: {"yes_shares": 0.005, "yes_avg_cost": 0.10},  # below dust threshold
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=110,
+    )
+
+    assert pnl == 0.0
+    assert breakdown == []
+
+
+def test_settlement_pnl_bin_boundary_inclusive():
+    """A count equal to the bin's upper or lower bound is inside the bin."""
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        0: {"yes_shares": 10.0, "yes_avg_cost": 0.50},  # 100-119
+        2: {"yes_shares": 10.0, "yes_avg_cost": 0.50},  # 140-159
+    })
+
+    # count=119 → bin 0 wins, bin 2 loses
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=119,
+    )
+    by_bin = {entry["bin_index"]: entry for entry in breakdown}
+    assert by_bin[0]["is_winning_bin"] is True
+    assert by_bin[2]["is_winning_bin"] is False
+
+    # count=140 → bin 0 loses, bin 2 wins
+    _, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=140,
+    )
+    by_bin = {entry["bin_index"]: entry for entry in breakdown}
+    assert by_bin[0]["is_winning_bin"] is False
+    assert by_bin[2]["is_winning_bin"] is True
+
+
+def test_settlement_pnl_no_portfolio_returns_zero():
+    info = _make_event_info_with_bins()
+    bot = SimpleNamespace(kelly_bot=None)
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert pnl == 0.0
+    assert breakdown == []
+
+
+def test_settlement_pnl_skips_bin_out_of_range():
+    """Positions on bin indices not in event_info.bins are silently skipped
+    rather than crashing — defends against state drift."""
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        99: {"yes_shares": 100.0, "yes_avg_cost": 0.50},  # bin 99 doesn't exist
+        1: {"yes_shares": 10.0, "yes_avg_cost": 0.10},
+    })
+
+    pnl, breakdown = MultiEventManager._compute_settlement_pnl_breakdown(
+        info, bot, actual_count=125,
+    )
+
+    assert len(breakdown) == 1
+    assert breakdown[0]["bin_index"] == 1
+    assert abs(pnl - 9.0) < 1e-9  # 10 * (1.0 - 0.10)
+
+
+def test_log_settlement_pnl_skips_when_authoritative_count_unavailable(caplog):
+    import logging
+    manager = object.__new__(MultiEventManager)
+    manager._fmt_usd = MultiEventManager._fmt_usd
+
+    async def fake_get_count(event_info):
+        return None, None
+
+    manager.get_authoritative_count = fake_get_count
+
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({1: {"yes_shares": 100.0, "yes_avg_cost": 0.20}})
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
+
+    assert any("authoritative count unavailable" in r.message for r in caplog.records)
+
+
+def test_log_settlement_pnl_emits_pnl_log_on_success(caplog):
+    import logging
+    manager = object.__new__(MultiEventManager)
+    manager._fmt_usd = MultiEventManager._fmt_usd
+
+    async def fake_get_count(event_info):
+        return 125, datetime.now(UTC)
+
+    manager.get_authoritative_count = fake_get_count
+
+    info = _make_event_info_with_bins()
+    bot = _make_bot_with_positions({
+        1: {"yes_shares": 100.0, "yes_avg_cost": 0.20},  # bin 120-139 wins → +80
+    })
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
+
+    messages = [r.message for r in caplog.records]
+    assert any(
+        "[EVENT][SETTLEMENT_PNL]" in m
+        and "actual_count=125" in m
+        and "settlement_pnl=$80.00" in m
+        for m in messages
+    )
+    # per-bin breakdown line should appear
+    assert any("WIN" in m and "120-139" in m for m in messages)
+
+
 def test_no_exposure_helper_treats_pending_count_error_as_blocking():
     """If we can't determine pending order count we MUST refuse to evict —
     a noisy bot is way better than silently dropping a real event."""
