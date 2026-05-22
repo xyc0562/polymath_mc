@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+from typing import Optional
 
 from src.algo.musk_tweet_count.forecaster.config import ForecasterConfig
 from src.algo.musk_tweet_count.forecaster.data import ContractDayUtils, EventStore, TweetEvent
@@ -270,3 +271,230 @@ def test_authoritative_rebase_resets_regression_baseline():
 
     assert result is not None
     assert bot._last_known_count == 7
+
+
+# ---------------------------------------------------------------------------
+# Discovery reconciliation / phantom-event eviction
+# ---------------------------------------------------------------------------
+
+
+def _make_phantom_manager() -> MultiEventManager:
+    manager = object.__new__(MultiEventManager)
+    manager._events_lock = asyncio.Lock()
+    manager._active_events = {}
+    manager._pending_events = {}
+    manager._delisted_miss_count = {}
+    return manager
+
+
+def _make_active_event(
+    event_id: str,
+    short_name: str = "Mar 01 - Mar 08",
+    *,
+    yes_shares: float = 0.0,
+    no_shares: float = 0.0,
+    pending_count: int = 0,
+    cancel_recorder: Optional[list] = None,
+) -> ActiveEvent:
+    from src.algo.musk_tweet_count.kelly.portfolio import BinPosition
+
+    info = EventInfo(
+        event_id=event_id,
+        title=f"Event {event_id}",
+        short_name=short_name,
+        settlement_date=date(2026, 3, 8),
+        market_start_date=date(2026, 3, 1),
+        bins=[],
+    )
+
+    portfolio = SimpleNamespace(positions={})
+    if yes_shares > 0 or no_shares > 0:
+        portfolio.positions[0] = BinPosition(
+            bin_index=0,
+            yes_token_id="tok",
+            yes_shares=yes_shares,
+            no_shares=no_shares,
+        )
+
+    executor = SimpleNamespace(get_pending_count=lambda count=pending_count: count)
+    kelly_bot = SimpleNamespace(portfolio=portfolio, kelly_executor=executor)
+    bot = SimpleNamespace(kelly_bot=kelly_bot)
+
+    class FakeTask:
+        def __init__(self, recorder):
+            self._recorder = recorder
+
+        def cancel(self):
+            if self._recorder is not None:
+                self._recorder.append("cancelled")
+
+    return ActiveEvent(
+        info=info,
+        bot=bot,
+        task=FakeTask(cancel_recorder),
+        started_at=datetime.now(UTC),
+        allocated_capital=1000.0,
+    )
+
+
+def test_phantom_event_zero_exposure_evicted_after_two_misses():
+    manager = _make_phantom_manager()
+    cancels: list = []
+    manager._active_events = {
+        "phantom": _make_active_event("phantom", cancel_recorder=cancels),
+        "live": _make_active_event("live"),
+    }
+
+    # First discovery: phantom missing — first miss, no eviction yet.
+    asyncio.run(manager._reconcile_against_discovery({"live"}))
+    assert cancels == []
+    assert manager._delisted_miss_count["phantom"] == 1
+
+    # Second discovery: phantom still missing — eviction fires.
+    asyncio.run(manager._reconcile_against_discovery({"live"}))
+    assert cancels == ["cancelled"]
+    # Miss counter is cleared on eviction so a future re-list starts fresh.
+    assert "phantom" not in manager._delisted_miss_count
+
+
+def test_phantom_miss_counter_resets_when_event_reappears():
+    manager = _make_phantom_manager()
+    cancels: list = []
+    manager._active_events = {
+        "intermittent": _make_active_event("intermittent", cancel_recorder=cancels),
+    }
+
+    # Miss 1
+    asyncio.run(manager._reconcile_against_discovery({"other"}))
+    assert manager._delisted_miss_count["intermittent"] == 1
+
+    # Event reappears in next discovery — counter must reset, no eviction.
+    asyncio.run(manager._reconcile_against_discovery({"intermittent"}))
+    assert "intermittent" not in manager._delisted_miss_count
+    assert cancels == []
+
+    # New first miss; still no eviction (only 1 miss).
+    asyncio.run(manager._reconcile_against_discovery({"other"}))
+    assert manager._delisted_miss_count["intermittent"] == 1
+    assert cancels == []
+
+
+def test_phantom_with_positions_is_never_evicted():
+    manager = _make_phantom_manager()
+    cancels: list = []
+    manager._active_events = {
+        "held": _make_active_event(
+            "held",
+            yes_shares=100.0,
+            cancel_recorder=cancels,
+        ),
+    }
+
+    # Many consecutive misses; positions block eviction every time.
+    for _ in range(5):
+        asyncio.run(manager._reconcile_against_discovery({"other"}))
+
+    assert cancels == []
+    assert manager._delisted_miss_count["held"] == 5
+
+
+def test_phantom_with_pending_orders_is_never_evicted():
+    manager = _make_phantom_manager()
+    cancels: list = []
+    manager._active_events = {
+        "live_orders": _make_active_event(
+            "live_orders",
+            pending_count=3,
+            cancel_recorder=cancels,
+        ),
+    }
+
+    for _ in range(3):
+        asyncio.run(manager._reconcile_against_discovery({"other"}))
+
+    assert cancels == []
+
+
+def test_pending_event_missing_from_discovery_is_dropped_immediately():
+    manager = _make_phantom_manager()
+    pending_info = EventInfo(
+        event_id="pending-1",
+        title="Pending",
+        short_name="Mar 02 - Mar 09",
+        settlement_date=date(2026, 3, 9),
+        market_start_date=date(2026, 3, 2),
+        bins=[],
+    )
+    manager._pending_events = {"pending-1": pending_info}
+
+    # No active events and discovery returns a non-empty other set.
+    asyncio.run(manager._reconcile_against_discovery({"some-other-event"}))
+
+    assert "pending-1" not in manager._pending_events
+
+
+def test_reconciliation_no_op_when_all_events_present():
+    manager = _make_phantom_manager()
+    cancels: list = []
+    manager._active_events = {
+        "a": _make_active_event("a", cancel_recorder=cancels),
+        "b": _make_active_event("b", cancel_recorder=cancels),
+    }
+
+    asyncio.run(manager._reconcile_against_discovery({"a", "b"}))
+
+    assert cancels == []
+    assert manager._delisted_miss_count == {}
+
+
+def test_no_exposure_helper_treats_missing_portfolio_as_evictable():
+    info = EventInfo(
+        event_id="nascent",
+        title="Nascent",
+        short_name="Mar 03 - Mar 10",
+        settlement_date=date(2026, 3, 10),
+        market_start_date=date(2026, 3, 3),
+        bins=[],
+    )
+    bot = SimpleNamespace(kelly_bot=None)
+    active = ActiveEvent(
+        info=info,
+        bot=bot,
+        task=SimpleNamespace(),
+        started_at=datetime.now(UTC),
+        allocated_capital=0.0,
+    )
+
+    assert MultiEventManager._event_has_no_exposure(active) is True
+
+
+def test_no_exposure_helper_treats_pending_count_error_as_blocking():
+    """If we can't determine pending order count we MUST refuse to evict —
+    a noisy bot is way better than silently dropping a real event."""
+    info = EventInfo(
+        event_id="grumpy",
+        title="Grumpy",
+        short_name="Mar 03 - Mar 10",
+        settlement_date=date(2026, 3, 10),
+        market_start_date=date(2026, 3, 3),
+        bins=[],
+    )
+
+    def broken_pending_count():
+        raise RuntimeError("executor exploded")
+
+    executor = SimpleNamespace(get_pending_count=broken_pending_count)
+    kelly_bot = SimpleNamespace(
+        portfolio=SimpleNamespace(positions={}),
+        kelly_executor=executor,
+    )
+    bot = SimpleNamespace(kelly_bot=kelly_bot)
+    active = ActiveEvent(
+        info=info,
+        bot=bot,
+        task=SimpleNamespace(),
+        started_at=datetime.now(UTC),
+        allocated_capital=1000.0,
+    )
+
+    assert MultiEventManager._event_has_no_exposure(active) is False

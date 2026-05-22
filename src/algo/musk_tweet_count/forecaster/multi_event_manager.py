@@ -477,6 +477,13 @@ class MultiEventManager:
         # Completed events (for history)
         self._completed_events: List[str] = []
 
+        # Per-event count of consecutive successful discovery cycles in which
+        # the event_id failed to appear. Used by reconciliation to evict
+        # phantom active events (e.g. Polymarket re-listed the same weekly
+        # market under a new event_id and silently retired the old one).
+        # Reset to 0 every time the event is observed in a discovery result.
+        self._delisted_miss_count: Dict[str, int] = {}
+
         # Lock for event dictionaries (asyncio lock for async methods)
         self._events_lock = asyncio.Lock()
 
@@ -2508,6 +2515,112 @@ class MultiEventManager:
         duration = (event_info.settlement_date - event_info.market_start_date).days
         return self.config.min_event_duration_days <= duration <= self.config.max_event_duration_days
 
+    # Evict a delisted event only after this many consecutive successful
+    # discovery cycles fail to return it — guards against a single transient
+    # Gamma blip yanking a real event out.
+    DELISTED_EVICTION_THRESHOLD = 2
+
+    @staticmethod
+    def _event_has_no_exposure(active: ActiveEvent) -> bool:
+        """True iff the event has no live positions and no pending orders.
+
+        Used as the eviction safety gate: even if Gamma claims an event is
+        delisted, we never evict one that holds positions or has live orders —
+        the operator needs to settle/cancel those manually.
+        """
+        bot = active.bot
+        kelly_bot = getattr(bot, "kelly_bot", None)
+        portfolio = getattr(kelly_bot, "portfolio", None) if kelly_bot else None
+        if portfolio is not None:
+            for pos in portfolio.positions.values():
+                if pos.yes_shares > 0.01 or pos.no_shares > 0.01:
+                    return False
+
+        executor = getattr(kelly_bot, "kelly_executor", None) if kelly_bot else None
+        if executor is not None:
+            try:
+                if executor.get_pending_count() > 0:
+                    return False
+            except Exception:
+                # If we can't determine pending count, err on the safe side
+                # and treat as "has exposure" to avoid evicting.
+                return False
+
+        return True
+
+    async def _reconcile_against_discovery(self, discovered_ids: Set[str]) -> None:
+        """Compare current active/pending events against the latest discovery
+        result; evict zero-exposure events that have been delisted for
+        DELISTED_EVICTION_THRESHOLD consecutive cycles.
+        """
+        async with self._events_lock:
+            active_snapshot = list(self._active_events.items())
+            pending_ids = list(self._pending_events.keys())
+
+        # Reset miss counter for every active event still present in Gamma.
+        for event_id, _active in active_snapshot:
+            if event_id in discovered_ids:
+                self._delisted_miss_count.pop(event_id, None)
+
+        # Drop pending events that vanished — they have no capital or
+        # positions yet, so this is purely housekeeping.
+        async with self._events_lock:
+            for event_id in pending_ids:
+                if event_id not in discovered_ids and event_id in self._pending_events:
+                    info = self._pending_events.pop(event_id)
+                    logger.info(
+                        f"[EVENT][DELISTED_DROP_PENDING] event={event_id} "
+                        f"short_name={info.short_name} reason=missing_from_gamma_discovery"
+                    )
+
+        # Evict active events that have been missing for too long.
+        to_cancel: List[Tuple[str, ActiveEvent]] = []
+        for event_id, active in active_snapshot:
+            if event_id in discovered_ids:
+                continue
+
+            misses = self._delisted_miss_count.get(event_id, 0) + 1
+            self._delisted_miss_count[event_id] = misses
+
+            if misses < self.DELISTED_EVICTION_THRESHOLD:
+                logger.info(
+                    f"Event {event_id} ({active.info.short_name}) missing from Gamma "
+                    f"(consecutive miss {misses}/{self.DELISTED_EVICTION_THRESHOLD}); "
+                    f"deferring eviction"
+                )
+                continue
+
+            if not self._event_has_no_exposure(active):
+                logger.warning(
+                    f"Event {event_id} ({active.info.short_name}) delisted from Gamma "
+                    f"for {misses} consecutive cycles but holds open exposure "
+                    f"(positions or pending orders); keeping active so positions "
+                    f"can settle naturally"
+                )
+                continue
+
+            to_cancel.append((event_id, active))
+
+        for event_id, active in to_cancel:
+            logger.warning(
+                f"[EVENT][DELISTED_EVICT] event={event_id} "
+                f"short_name={active.info.short_name} "
+                f"reason=missing_from_gamma_discovery_{self._delisted_miss_count[event_id]}x "
+                f"exposure=none"
+            )
+            self._delisted_miss_count.pop(event_id, None)
+            try:
+                # Cancelling the event task propagates CancelledError into
+                # bot.run(), whose finally block invokes _cleanup_event —
+                # that path is responsible for releasing capital, unregistering
+                # tokens, and resubscribing the shared WS.
+                active.task.cancel()
+            except Exception as e:
+                logger.error(
+                    f"Failed to cancel task for delisted event {event_id}: {e}",
+                    exc_info=True,
+                )
+
     async def _discover_and_add_events(self) -> int:
         """
         Discover new events using the discovery callback and add them.
@@ -2527,6 +2640,19 @@ class MultiEventManager:
             if not discovered_events:
                 logger.debug("No new events discovered")
                 return 0
+
+            # Gamma returned a non-empty active set — reconcile our local state
+            # against it. Any active event that's no longer listed for
+            # DELISTED_EVICTION_THRESHOLD consecutive cycles AND has no
+            # exposure (positions or pending orders) gets evicted. This
+            # specifically handles the case where Polymarket re-lists the same
+            # weekly market under a fresh event_id (post-V2 migration was a
+            # recurring cause) — the old event_id silently drops off Gamma but
+            # the bot keeps fetching its dead orderbooks (→ 404 spam) and
+            # holds its capital allocation hostage.
+            await self._reconcile_against_discovery(
+                {e.event_id for e in discovered_events}
+            )
 
             added_count = 0
             for event_info in discovered_events:
