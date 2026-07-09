@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from src.algo.musk_tweet_count.forecaster.config import ForecasterConfig
 from src.algo.musk_tweet_count.forecaster.data import ContractDayUtils, EventStore, TweetEvent
@@ -279,11 +280,16 @@ def test_authoritative_rebase_resets_regression_baseline():
 
 
 def _make_phantom_manager() -> MultiEventManager:
+    async def _no_allocation(event_id):
+        return None
+
     manager = object.__new__(MultiEventManager)
     manager._events_lock = asyncio.Lock()
     manager._active_events = {}
     manager._pending_events = {}
     manager._delisted_miss_count = {}
+    manager._evicted_event_ids = set()
+    manager.capital_pool = SimpleNamespace(get_allocation=_no_allocation)
     return manager
 
 
@@ -415,7 +421,7 @@ def test_phantom_with_pending_orders_is_never_evicted():
     assert cancels == []
 
 
-def test_pending_event_missing_from_discovery_is_dropped_immediately():
+def test_pending_event_missing_from_discovery_dropped_after_two_misses():
     manager = _make_phantom_manager()
     pending_info = EventInfo(
         event_id="pending-1",
@@ -427,9 +433,13 @@ def test_pending_event_missing_from_discovery_is_dropped_immediately():
     )
     manager._pending_events = {"pending-1": pending_info}
 
-    # No active events and discovery returns a non-empty other set.
+    # First miss: deferred (same threshold as active events — a single
+    # transient Gamma blip must not drop a pending event).
     asyncio.run(manager._reconcile_against_discovery({"some-other-event"}))
+    assert "pending-1" in manager._pending_events
 
+    # Second consecutive miss: dropped (no capital allocation held).
+    asyncio.run(manager._reconcile_against_discovery({"some-other-event"}))
     assert "pending-1" not in manager._pending_events
 
 
@@ -670,25 +680,30 @@ def test_log_settlement_pnl_skips_when_authoritative_count_unavailable(caplog):
     import logging
     manager = object.__new__(MultiEventManager)
     manager._fmt_usd = MultiEventManager._fmt_usd
+    manager._tz = ZoneInfo("America/New_York")
 
     async def fake_get_count(event_info):
         return None, None
 
     manager.get_authoritative_count = fake_get_count
+    # Posts-store fallback also has nothing usable
+    manager.compute_count_from_posts = lambda event_info: 0
 
     info = _make_event_info_with_bins()
     bot = _make_bot_with_positions({1: {"yes_shares": 100.0, "yes_avg_cost": 0.20}})
 
     with caplog.at_level(logging.WARNING):
-        asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
+        result = asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
 
-    assert any("authoritative count unavailable" in r.message for r in caplog.records)
+    assert result is None
+    assert any("no usable count" in r.message for r in caplog.records)
 
 
 def test_log_settlement_pnl_emits_pnl_log_on_success(caplog):
     import logging
     manager = object.__new__(MultiEventManager)
     manager._fmt_usd = MultiEventManager._fmt_usd
+    manager._tz = ZoneInfo("America/New_York")
 
     async def fake_get_count(event_info):
         return 125, datetime.now(UTC)
@@ -701,8 +716,10 @@ def test_log_settlement_pnl_emits_pnl_log_on_success(caplog):
     })
 
     with caplog.at_level(logging.INFO):
-        asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
+        result = asyncio.run(manager._log_settlement_pnl("ev1", info, bot, 1000.0))
 
+    assert result is not None
+    assert abs(result - 80.0) < 1e-9
     messages = [r.message for r in caplog.records]
     assert any(
         "[EVENT][SETTLEMENT_PNL]" in m

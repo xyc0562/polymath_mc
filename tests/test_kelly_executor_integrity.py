@@ -1899,10 +1899,12 @@ def test_compute_optimal_trades_skips_blocking_sell_and_keeps_sell_priority(monk
         return after
 
     monkeypatch.setattr(executor, "_simulate_trade", fake_simulate_trade)
+    # bin 0's sized utility must be strictly below min_sell_utility (0.005
+    # default): utility exactly at the threshold passes the gate.
     monkeypatch.setattr(
         executor_module,
         "_compute_portfolio_utility_gain",
-        lambda before, after, config: {0: 0.005, 1: 0.020, 2: 0.030}[after._mock_candidate_bin],
+        lambda before, after, config: {0: 0.004, 1: 0.020, 2: 0.030}[after._mock_candidate_bin],
     )
     orderbooks = {
         0: _make_orderbook(bin_index=0, yes_bids=[(0.72, 200.0)], yes_asks=[(0.74, 200.0)]),

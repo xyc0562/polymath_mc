@@ -351,6 +351,12 @@ class KellyConfig:
     # Set to 1.0 to disable smoothing (use raw probabilities).
     prob_ema_alpha: float = 0.3
 
+    # Bypass the EMA when any bin's probability moves by at least this
+    # much between ticks: that's real information (tweet burst, boundary
+    # cross), not Monte Carlo noise (~0.005 worst-case per bin at 10k
+    # sims), and smoothing it lags fair value by ~1/alpha slow ticks.
+    prob_ema_jump_threshold: float = 0.02
+
     # Execution-only market impact controls.
     market_impact: MarketImpactConfig = field(default_factory=MarketImpactConfig)
 

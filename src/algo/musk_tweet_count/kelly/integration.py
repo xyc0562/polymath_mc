@@ -336,6 +336,46 @@ class KellyTradingBot:
         if self.kelly_executor:
             await self.kelly_executor.handle_stale_order(pending)
 
+    def _apply_prob_ema(self, probabilities: List[float]) -> List[float]:
+        """EMA-smooth the probability vector, bypassing on real jumps.
+
+        The EMA exists to dampen Monte Carlo sampling noise between ticks
+        (~0.5% per bin at 10k sims). But time-blending digital bucket
+        probabilities across an information event (tweet burst, boundary
+        cross) prices a state that never existed and lags fair value by
+        ~1/alpha slow ticks — so when any bin moves by more than
+        prob_ema_jump_threshold (default 4x worst-case MC noise), the new
+        vector passes through unsmoothed and the EMA restarts from it.
+        Backtests never modeled the EMA; passing jumps through also
+        improves live/backtest parity.
+        """
+        alpha = self.config.prob_ema_alpha
+        if alpha < 1.0 and self._ema_probabilities is not None:
+            max_jump = max(
+                (
+                    abs(p_new - p_old)
+                    for p_new, p_old in zip(probabilities, self._ema_probabilities)
+                ),
+                default=0.0,
+            )
+            if max_jump >= self.config.prob_ema_jump_threshold:
+                logger.info(
+                    f"[{self.event_name}] Prob EMA bypassed: max bin jump "
+                    f"{max_jump:.4f} >= {self.config.prob_ema_jump_threshold:.4f} "
+                    f"(real move, not MC noise)"
+                )
+            else:
+                probabilities = [
+                    alpha * p_new + (1 - alpha) * p_old
+                    for p_new, p_old in zip(probabilities, self._ema_probabilities)
+                ]
+                # Re-normalize after blending (EMA can drift slightly from sum=1)
+                total = sum(probabilities)
+                if total > 0:
+                    probabilities = [p / total for p in probabilities]
+        self._ema_probabilities = probabilities
+        return probabilities
+
     def update_probabilities(
         self,
         current_count: int,
@@ -378,17 +418,7 @@ class KellyTradingBot:
             probabilities = raw_probabilities
 
         # EMA smooth probabilities to dampen Monte Carlo noise
-        alpha = self.config.prob_ema_alpha
-        if alpha < 1.0 and self._ema_probabilities is not None:
-            probabilities = [
-                alpha * p_new + (1 - alpha) * p_old
-                for p_new, p_old in zip(probabilities, self._ema_probabilities)
-            ]
-            # Re-normalize after blending (EMA can drift slightly from sum=1)
-            total = sum(probabilities)
-            if total > 0:
-                probabilities = [p / total for p in probabilities]
-        self._ema_probabilities = probabilities
+        probabilities = self._apply_prob_ema(probabilities)
 
         if self.boundary_overlay_model is not None:
             probabilities, overlay_context = self.boundary_overlay_model(
@@ -1680,6 +1710,20 @@ class KellyTradingBot:
                     unpriced_shares=0.0, unpriced_reserve=0.0,
                 )
 
+    def _effective_event_budget(self) -> float:
+        """Event budget: c_event_max capped by the shared pool's actual grant.
+
+        portfolio.external_capital_limit carries the CapitalPool grant (set
+        at event start). When the pool granted the full max_per_event —
+        the normal case — this equals c_event_max and behavior is
+        unchanged; it only binds when the pool was short.
+        """
+        event_budget = self.config.collateral.c_event_max
+        limit = self.portfolio.external_capital_limit
+        if limit is not None:
+            event_budget = min(event_budget, limit)
+        return event_budget
+
     async def sync_positions_from_api(self, wallet_address: str) -> Tuple[float, Dict[int, float]]:
         """
         Sync portfolio state from Polymarket API.
@@ -1914,12 +1958,12 @@ class KellyTradingBot:
         # The wallet USDC balance is shared across all events and is NOT this event's capital.
         #
         # Event capital model:
-        #   event_budget = c_event_max (maximum capital for this event)
+        #   event_budget = min(c_event_max, pool grant) (maximum capital for this event)
         #   capital = event_budget - collateral_used (available for new trades)
         #   total_value = capital + collateral_used = event_budget (constant)
         #
         # This ensures Kelly utility calculations use the correct capital base.
-        event_budget = self.config.collateral.c_event_max
+        event_budget = self._effective_event_budget()
         total_collateral = self.portfolio.total_collateral_used
 
         if event_budget > 0:

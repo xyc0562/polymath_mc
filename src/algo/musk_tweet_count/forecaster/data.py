@@ -170,6 +170,10 @@ class XTrackerClient:
         self.session = requests.Session()
         self.timeout = timeout
         self._warned_missing_platform_id = False
+        # True when the most recent fetch_all_posts call failed (network error
+        # or API success=false). Lets callers distinguish "no posts" from
+        # "fetch failed" without changing the return type.
+        self.last_fetch_failed = False
 
     def fetch_all_posts(
         self,
@@ -212,6 +216,7 @@ class XTrackerClient:
             if isinstance(data, dict):
                 if not data.get("success", False):
                     logger.error(f"API returned success=false")
+                    self.last_fetch_failed = True
                     return []
                 posts = data.get("data", [])
             elif isinstance(data, list):
@@ -220,10 +225,12 @@ class XTrackerClient:
                 posts = []
 
             logger.info(f"Fetched {len(posts)} total posts")
+            self.last_fetch_failed = False
             return posts
 
         except requests.RequestException as e:
             logger.error(f"Failed to fetch posts: {e}")
+            self.last_fetch_failed = True
             return []
 
     def _parse_post(self, post: Dict) -> Optional[TweetEvent]:

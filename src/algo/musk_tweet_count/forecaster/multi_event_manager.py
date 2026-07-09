@@ -100,6 +100,7 @@ class RefreshOutcome:
     new_events: int = 0
     affected_days: Set[date] = field(default_factory=set)
     authoritative_rebase: bool = False
+    fetch_failed: bool = False
 
 
 @dataclass
@@ -252,7 +253,9 @@ class MultiEventConfig:
     # Realtime twikit polling for provisional edge detection
     realtime_tracker_enabled: bool = True
     realtime_poll_interval_seconds: float = 20.0
-    realtime_fetch_count: int = 40
+    # X returns ~20 items per timeline page regardless of a larger request;
+    # gap detection requires fetch_count to match the real page size.
+    realtime_fetch_count: int = 20
     realtime_late_tweet_grace_seconds: float = 120.0
     realtime_cookies_path: Optional[str] = None
 
@@ -483,6 +486,12 @@ class MultiEventManager:
         # market under a new event_id and silently retired the old one).
         # Reset to 0 every time the event is observed in a discovery result.
         self._delisted_miss_count: Dict[str, int] = {}
+
+        # Events evicted as Gamma-delisted (zero exposure). Unlike settled
+        # completions these MAY legitimately reappear in a later discovery
+        # (transient Gamma blip / pagination gap), so add_event() allows
+        # them back in despite being in _completed_events.
+        self._evicted_event_ids: Set[str] = set()
 
         # Lock for event dictionaries (asyncio lock for async methods)
         self._events_lock = asyncio.Lock()
@@ -828,6 +837,10 @@ class MultiEventManager:
         if user_stream.get("enabled", False) and not user_stream.get("connected", False):
             return True
         if not self.config.dry_run and not user_stream.get("enabled", False):
+            return True
+
+        orderbook_ws = health.get("orderbook_ws", {})
+        if orderbook_ws.get("enabled", False) and not orderbook_ws.get("connected", False):
             return True
 
         realtime = health.get("realtime_tracker", {})
@@ -1655,21 +1668,27 @@ class MultiEventManager:
 
         # Fetch existing positions with actual values from API
         all_positions = await self.fetch_all_positions()
+        position_value = 0.0
         position_cost = 0.0
 
-        # Use actual values from API (cost basis / initialValue)
+        # Baseline uses CURRENT market value, not cost basis. Cost basis kept
+        # tokens from settled markets (worth $0) on the books forever and
+        # inflated the pool with capital that does not exist as spendable pUSD.
         for token_id, pos_info in all_positions.items():
+            position_value += pos_info["current_value"]
             position_cost += pos_info["cost_basis"]
 
-        total_capital = usdc_balance + position_cost
+        total_capital = usdc_balance + position_value
 
         # Set capital in pool
         await self.capital_pool.set_total_from_api(total_capital)
 
         logger.info(
             f"[CAPITAL][INIT_API] usdc_idle={self._fmt_usd(usdc_balance)} "
-            f"position_cost={self._fmt_usd(position_cost)} "
-            f"baseline_total={self._fmt_usd(total_capital)}"
+            f"position_value={self._fmt_usd(position_value)} "
+            f"baseline_total={self._fmt_usd(total_capital)} "
+            f"(position_cost={self._fmt_usd(position_cost)}, "
+            f"unrealized_vs_cost={self._fmt_usd(position_value - position_cost)})"
         )
 
     async def prefetch_shared_data(self, n_days: Optional[int] = None) -> None:
@@ -1803,8 +1822,10 @@ class MultiEventManager:
 
         history = self.posts_xtracker_client.fetch_historical(n_days, self.contract_utils)
         if not history:
+            # A full-history window is never legitimately empty — treat as a
+            # failed fetch so the data freshness gate is not reset.
             logger.warning("Full refresh returned no authoritative data")
-            return RefreshOutcome()
+            return RefreshOutcome(fetch_failed=True)
 
         cutoff = self.contract_utils.get_current_contract_date() - timedelta(days=n_days)
         affected_days = {
@@ -1845,8 +1866,12 @@ class MultiEventManager:
             end_date=api_end_date,
         )
         if not events:
-            logger.warning("Incremental refresh returned no authoritative data; keeping provisional overlay")
-            return RefreshOutcome()
+            fetch_failed = getattr(self.posts_xtracker_client, "last_fetch_failed", False)
+            logger.warning(
+                "Incremental refresh returned no authoritative data; keeping provisional overlay"
+                + (" (fetch FAILED — not marking data fresh)" if fetch_failed else "")
+            )
+            return RefreshOutcome(fetch_failed=fetch_failed)
 
         events_by_day: Dict[date, List] = {d: [] for d in contract_days_to_update}
         for event in events:
@@ -1895,9 +1920,17 @@ class MultiEventManager:
             else:
                 outcome = await self._do_incremental_refresh()
 
-            self._last_refresh_contract_date = current_contract_date
+            if contract_day_changed and outcome.fetch_failed:
+                # Keep the old contract date so the next cycle retries the
+                # full refresh instead of silently downgrading to incremental.
+                logger.warning(
+                    "Full refresh after contract-day change failed; will retry next cycle"
+                )
+            else:
+                self._last_refresh_contract_date = current_contract_date
             self._last_full_refresh = now
-            self._mark_data_fresh("xtracker", now)
+            if not outcome.fetch_failed:
+                self._mark_data_fresh("xtracker", now)
             if outcome.effective_changed:
                 self._next_shared_data_version()
 
@@ -2502,9 +2535,10 @@ class MultiEventManager:
             computed, api_count, is_valid = await self.validate_counts_for_event(event_info)
             results[event_id] = (computed, api_count, is_valid)
 
-            # Update trading bot with authoritative count for dead bin detection
+            # Update trading bot with authoritative count for dead bin detection.
+            # The posts-derived count cross-confirms regressions (deletions).
             if api_count is not None:
-                bot.set_authoritative_count(api_count)
+                bot.set_authoritative_count(api_count, posts_count=computed)
 
         return results
 
@@ -2536,8 +2570,22 @@ class MultiEventManager:
                 return False
 
             if event_id in self._completed_events:
-                logger.warning(f"Event {event_id} already completed")
-                return False
+                if event_id in self._evicted_event_ids:
+                    # Evicted as Gamma-delisted, but Gamma lists it again —
+                    # the delisting was transient. Let it back in; positions
+                    # (none at eviction time) and capital re-establish through
+                    # the normal pending -> start flow.
+                    logger.warning(
+                        f"[EVENT][RELIST] event={event_id} was evicted as delisted "
+                        f"but reappeared in discovery; re-adding"
+                    )
+                    self._completed_events = [
+                        eid for eid in self._completed_events if eid != event_id
+                    ]
+                    self._evicted_event_ids.discard(event_id)
+                else:
+                    logger.warning(f"Event {event_id} already completed")
+                    return False
 
             # Check if event is still tradeable
             now = datetime.now(timezone.utc)
@@ -2624,21 +2672,52 @@ class MultiEventManager:
             active_snapshot = list(self._active_events.items())
             pending_ids = list(self._pending_events.keys())
 
-        # Reset miss counter for every active event still present in Gamma.
+        # Reset miss counter for every active/pending event still present in Gamma.
         for event_id, _active in active_snapshot:
             if event_id in discovered_ids:
                 self._delisted_miss_count.pop(event_id, None)
+        for event_id in pending_ids:
+            if event_id in discovered_ids:
+                self._delisted_miss_count.pop(event_id, None)
 
-        # Drop pending events that vanished — they have no capital or
-        # positions yet, so this is purely housekeeping.
-        async with self._events_lock:
-            for event_id in pending_ids:
-                if event_id not in discovered_ids and event_id in self._pending_events:
-                    info = self._pending_events.pop(event_id)
-                    logger.info(
-                        f"[EVENT][DELISTED_DROP_PENDING] event={event_id} "
-                        f"short_name={info.short_name} reason=missing_from_gamma_discovery"
-                    )
+        # Drop pending events that vanished — but only after the same
+        # consecutive-miss threshold as active events, and NEVER while the
+        # event holds a pool allocation (restored from on-chain positions at
+        # startup: dropping it would orphan those positions and strand the
+        # allocation in the pool forever).
+        for event_id in pending_ids:
+            if event_id in discovered_ids:
+                continue
+
+            misses = self._delisted_miss_count.get(event_id, 0) + 1
+            self._delisted_miss_count[event_id] = misses
+            if misses < self.DELISTED_EVICTION_THRESHOLD:
+                logger.info(
+                    f"Pending event {event_id} missing from Gamma "
+                    f"(consecutive miss {misses}/{self.DELISTED_EVICTION_THRESHOLD}); "
+                    f"deferring drop"
+                )
+                continue
+
+            allocation = await self.capital_pool.get_allocation(event_id)
+            if allocation is not None:
+                logger.warning(
+                    f"Pending event {event_id} delisted from Gamma for {misses} "
+                    f"consecutive cycles but holds a restored capital allocation "
+                    f"(${allocation.current_value:.2f}, likely on-chain positions); "
+                    f"keeping pending"
+                )
+                continue
+
+            async with self._events_lock:
+                info = self._pending_events.pop(event_id, None)
+            if info is not None:
+                self._delisted_miss_count.pop(event_id, None)
+                logger.info(
+                    f"[EVENT][DELISTED_DROP_PENDING] event={event_id} "
+                    f"short_name={info.short_name} "
+                    f"reason=missing_from_gamma_discovery_{misses}x"
+                )
 
         # Evict active events that have been missing for too long.
         to_cancel: List[Tuple[str, ActiveEvent]] = []
@@ -2676,6 +2755,9 @@ class MultiEventManager:
                 f"exposure=none"
             )
             self._delisted_miss_count.pop(event_id, None)
+            # Remember the eviction so add_event() lets the event back in if
+            # Gamma lists it again (delisting was transient).
+            self._evicted_event_ids.add(event_id)
             try:
                 # Cancelling the event task propagates CancelledError into
                 # bot.run(), whose finally block invokes _cleanup_event —
@@ -2881,6 +2963,14 @@ class MultiEventManager:
 
         # Setup bot (expensive, do outside lock)
         await bot.setup(event_info.bins)
+
+        # Enforce the pool grant as this event's budget cap. Without it the
+        # per-event sync budgets c_event_max regardless of what the pool
+        # actually granted (only binds when the pool is short — a full grant
+        # equals c_event_max and nothing changes).
+        if bot.kelly_bot and bot.kelly_bot.portfolio is not None:
+            bot.kelly_bot.portfolio.set_external_capital_limit(allocated_capital)
+
         if (
             bot.kelly_bot and
             bot.kelly_bot.kelly_executor is not None
@@ -2995,32 +3085,60 @@ class MultiEventManager:
         event_info: EventInfo,
         bot: GASKellyTradingBot,
         allocated_capital: float,
-    ) -> None:
+    ) -> Optional[float]:
         """Compute and log settlement P&L of remaining positions.
 
-        Pulls the authoritative tweet count from XTracker and applies
-        binary-payoff math on each currently-held position. Logged at
-        cleanup time so every settled event has a per-bin P&L breakdown
-        instead of the structurally-zero realized_pnl from
-        capital_pool.return_capital. Failures (e.g. XTracker unreachable
-        at cleanup) degrade to a single warning line — never block
-        cleanup.
+        Pulls the authoritative tweet count from XTracker (falling back to
+        the shared posts store when the tracking period has already been
+        rolled off) and applies binary-payoff math on each currently-held
+        position. Returns the settlement P&L so cleanup can feed it into
+        capital_pool.return_capital, or None when it cannot be computed
+        (e.g. cleanup before settlement). Failures degrade to a single
+        warning line — never block cleanup.
         """
+        # Only meaningful once the event is actually past settlement;
+        # shutdown/eviction cleanups of live events must not log a
+        # "settlement" P&L at a non-final count.
+        settlement_dt = datetime.combine(
+            event_info.settlement_date,
+            time(12, 0),  # Noon ET
+            tzinfo=self._tz,
+        )
+        if datetime.now(self._tz) < settlement_dt:
+            logger.info(
+                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                f"skipped: event not settled yet (cleanup before settlement)"
+            )
+            return None
+
+        count_source = "trackings"
         try:
             actual_count, _ = await self.get_authoritative_count(event_info)
         except Exception as e:
             logger.warning(
                 f"[EVENT][SETTLEMENT_PNL] event={event_id} "
-                f"skipped: failed to fetch authoritative count: {e}"
+                f"trackings count fetch failed ({e}); falling back to posts store"
             )
-            return
+            actual_count = None
 
         if actual_count is None:
-            logger.warning(
-                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
-                f"skipped: authoritative count unavailable"
-            )
-            return
+            # XTracker drops the tracking period around settlement time —
+            # fall back to the count derived from the shared posts store.
+            count_source = "posts_store"
+            try:
+                actual_count = self.compute_count_from_posts(event_info)
+            except Exception as e:
+                logger.warning(
+                    f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                    f"skipped: posts-store fallback failed: {e}"
+                )
+                return None
+            if actual_count <= 0:
+                logger.warning(
+                    f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                    f"skipped: no usable count (trackings unavailable, posts store empty)"
+                )
+                return None
 
         try:
             settlement_pnl, breakdown = self._compute_settlement_pnl_breakdown(
@@ -3031,12 +3149,13 @@ class MultiEventManager:
                 f"[EVENT][SETTLEMENT_PNL] event={event_id} failed to compute: {e}",
                 exc_info=True,
             )
-            return
+            return None
 
         pnl_pct = (settlement_pnl / allocated_capital * 100) if allocated_capital > 0 else 0.0
         logger.info(
             f"[EVENT][SETTLEMENT_PNL] event={event_id} "
             f"short_name={event_info.short_name} actual_count={actual_count} "
+            f"count_source={count_source} "
             f"settlement_pnl={self._fmt_usd(settlement_pnl)} "
             f"({pnl_pct:+.2f}% of alloc={self._fmt_usd(allocated_capital)}) "
             f"bins_held={len(breakdown)}"
@@ -3054,6 +3173,8 @@ class MultiEventManager:
                 f"NO {entry['no_shares']:>10.2f} @ ${entry['no_avg_cost']:.4f} | "
                 f"pnl={self._fmt_usd(entry['pnl'])}"
             )
+
+        return settlement_pnl
 
     async def _cleanup_event(
         self,
@@ -3095,28 +3216,36 @@ class MultiEventManager:
                     position_value += pos.yes_shares * pos.yes_avg_cost
                     position_value += pos.no_shares * pos.no_avg_cost
 
-                # Final value = original allocation
-                # (In reality, P&L only happens at settlement when positions resolve)
-                # For early termination, just return the allocated amount
                 final_value = allocated_capital if allocated_capital > 0 else position_value
-
                 cleanup_basis = "alloc_budget" if allocated_capital > 0 else "fallback_open_cost"
-                logger.info(
-                    f"[CAPITAL][RELEASE] event={event_id} cleanup_basis={cleanup_basis} "
-                    f"alloc_budget={self._fmt_usd(allocated_capital)} "
-                    f"open_cost={self._fmt_usd(position_value)} "
-                    f"returned={self._fmt_usd(final_value)}"
-                )
             else:
                 # Fallback: return initial allocation
+                position_value = 0.0
                 final_value = allocated_capital
+                cleanup_basis = "alloc_budget"
 
-            # Log settlement P&L of remaining positions for observability.
-            # Note: this is logged ONLY — final_value still uses
-            # allocated_capital so the CapitalPool flow is unchanged
-            # (actual on-chain reconciliation runs through _sync_capital_from_api).
+            # Settlement P&L of remaining positions. When computable (event
+            # actually settled and a final count is available), it adjusts
+            # final_value so CapitalPool history records real per-event
+            # settlement P&L instead of a structurally-zero realized_pnl.
+            # Intra-week trading P&L still reconciles through the periodic
+            # _sync_capital_from_api pass.
+            settlement_pnl = None
             if event_info is not None:
-                await self._log_settlement_pnl(event_id, event_info, bot, allocated_capital)
+                settlement_pnl = await self._log_settlement_pnl(
+                    event_id, event_info, bot, allocated_capital
+                )
+
+            if settlement_pnl is not None and allocated_capital > 0:
+                final_value = max(0.0, allocated_capital + settlement_pnl)
+                cleanup_basis = "alloc_plus_settlement_pnl"
+
+            logger.info(
+                f"[CAPITAL][RELEASE] event={event_id} cleanup_basis={cleanup_basis} "
+                f"alloc_budget={self._fmt_usd(allocated_capital)} "
+                f"open_cost={self._fmt_usd(position_value)} "
+                f"returned={self._fmt_usd(final_value)}"
+            )
 
             # Return capital to pool (CapitalPool has its own lock)
             await self.capital_pool.return_capital(event_id, final_value)
@@ -3769,13 +3898,32 @@ class MultiEventManager:
             Dict mapping token_id -> {shares, value, avg_price}
         """
         try:
-            response = requests.get(
-                f"{POLYMARKET_DATA_API}/positions",
-                params={"user": self.wallet_address.lower(), "sizeThreshold": 0},
-                timeout=30,
-            )
-            response.raise_for_status()
-            positions_data = response.json()
+            # Paginate: the Data API caps each page (default 100), and the
+            # wallet accumulates positions from settled markets over time.
+            page_limit = 500
+            positions_data: list = []
+            offset = 0
+            while True:
+                response = requests.get(
+                    f"{POLYMARKET_DATA_API}/positions",
+                    params={
+                        "user": self.wallet_address.lower(),
+                        "sizeThreshold": 0,
+                        "limit": page_limit,
+                        "offset": offset,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                page = response.json()
+                if isinstance(page, dict):
+                    page = page.get("positions", page.get("data", []))
+                if not isinstance(page, list) or not page:
+                    break
+                positions_data.extend(page)
+                if len(page) < page_limit:
+                    break
+                offset += page_limit
 
             # Debug: log raw response structure
             logger.info(f"Positions API raw response type: {type(positions_data).__name__}, len={len(positions_data) if hasattr(positions_data, '__len__') else 'N/A'}")
@@ -3784,8 +3932,6 @@ class MultiEventManager:
                     sample = positions_data[0]
                     logger.info(f"Positions API first item type: {type(sample).__name__}")
                     logger.info(f"Positions API first item: {str(sample)[:500]}")
-                elif isinstance(positions_data, dict):
-                    logger.info(f"Positions API dict keys: {list(positions_data.keys())[:10]}")
 
             positions = {}
 
@@ -3807,12 +3953,17 @@ class MultiEventManager:
                 # Extract both cost basis and current market value
                 avg_price = float(pos.get("avgPrice", 0))
                 initial_value = float(pos.get("initialValue", 0))
-                current_value = float(pos.get("currentValue", 0))
 
                 # Cost basis: what we actually spent (for allocation limit tracking)
                 cost_basis = initial_value if initial_value > 0 else (size * avg_price)
-                # Current value: what it's worth now (for portfolio value tracking)
-                market_value = current_value if current_value > 0 else (size * avg_price)
+                # Current value: what it's worth now (for portfolio value tracking).
+                # Trust the API's currentValue even when it is 0 — resolved
+                # losing tokens are genuinely worth $0. Fall back to cost only
+                # when the field is missing entirely.
+                if pos.get("currentValue") is not None:
+                    market_value = float(pos["currentValue"])
+                else:
+                    market_value = size * avg_price
 
                 return token_id, {
                     "shares": size,

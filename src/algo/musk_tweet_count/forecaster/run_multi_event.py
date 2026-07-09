@@ -581,19 +581,33 @@ def parse_counting_dates_from_title(title: str) -> Tuple[Optional[date], Optiona
     Returns:
         Tuple of (start_date, end_date) as date objects, or (None, None) if not parsed
     """
-    # Pattern: "Month Day - Month Day, Year"
+    # Pattern with both years: "Month Day, Year - Month Day, Year"
+    # (cross-year events, e.g. "December 29, 2026 - January 5, 2027")
+    dual_year_pattern = r"(\w+)\s+(\d{1,2}),?\s*(\d{4})\s*[-–]\s*(\w+)\s+(\d{1,2}),?\s*(\d{4})"
+    # Pattern with single trailing year: "Month Day - Month Day, Year"
     pattern = r"(\w+)\s+(\d{1,2})\s*[-–]\s*(\w+)\s+(\d{1,2}),?\s*(\d{4})"
-    match = re.search(pattern, title)
 
-    if not match:
+    dual_match = re.search(dual_year_pattern, title)
+    match = None if dual_match else re.search(pattern, title)
+
+    if not dual_match and not match:
         return None, None
 
     try:
-        start_month_str = match.group(1)
-        start_day = int(match.group(2))
-        end_month_str = match.group(3)
-        end_day = int(match.group(4))
-        year = int(match.group(5))
+        if dual_match:
+            start_month_str = dual_match.group(1)
+            start_day = int(dual_match.group(2))
+            start_year = int(dual_match.group(3))
+            end_month_str = dual_match.group(4)
+            end_day = int(dual_match.group(5))
+            year = int(dual_match.group(6))
+        else:
+            start_month_str = match.group(1)
+            start_day = int(match.group(2))
+            start_year = None
+            end_month_str = match.group(3)
+            end_day = int(match.group(4))
+            year = int(match.group(5))
 
         month_map = {
             "january": 1, "february": 2, "march": 3, "april": 4,
@@ -609,8 +623,18 @@ def parse_counting_dates_from_title(title: str) -> Tuple[Optional[date], Optiona
         if not start_month or not end_month:
             return None, None
 
-        start_date = date(year, start_month, start_day)
+        if start_year is None:
+            # Single trailing year applies to the end date; a cross-year
+            # window (e.g. "December 29 - January 5, 2027") starts the
+            # year before.
+            start_year = year - 1 if start_month > end_month else year
+
+        start_date = date(start_year, start_month, start_day)
         end_date = date(year, end_month, end_day)
+
+        if start_date > end_date:
+            logger.debug(f"Parsed inverted date range from '{title}'")
+            return None, None
 
         return start_date, end_date
 
@@ -1016,7 +1040,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--realtime-fetch-count",
         type=int,
         default=None,
-        help="Number of tweets to fetch per twikit poll (default: from config, 40).",
+        help="Number of tweets to fetch per twikit poll (default: from config, 20).",
     )
     parser.add_argument(
         "--realtime-late-tweet-grace",

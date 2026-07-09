@@ -1,51 +1,753 @@
 {
-  "scraped_at": "2026-03-23T11:16:12.305595",
-  "num_events": 5,
+  "scraped_at": "2026-07-09T13:54:53.553548",
+  "num_events": 83,
   "events": [
     {
-      "event_id": "263375",
-      "title": "Elon Musk # tweets March 14 - March 16, 2026?",
-      "short_name": "Mar 14 - Mar 16",
-      "start_date": "2026-03-12",
-      "end_date": "2026-03-16",
+      "event_id": "286710",
+      "title": "Elon Musk # tweets March 21 - March 23, 2026?",
+      "short_name": "Mar 21 - Mar 23",
+      "start_date": "2026-03-19",
+      "end_date": "2026-03-23",
       "num_bins": 10,
-      "directory": "2026-03-16_Mar_14_-_Mar_16"
+      "directory": "2026-03-23_Mar_21_-_Mar_23"
     },
     {
-      "event_id": "251243",
-      "title": "Elon Musk # tweets March 10 - March 17, 2026?",
-      "short_name": "Mar 10 - Mar 17",
-      "start_date": "2026-03-07",
-      "end_date": "2026-03-17",
-      "num_bins": 30,
-      "directory": "2026-03-17_Mar_10_-_Mar_17"
-    },
-    {
-      "event_id": "269739",
-      "title": "Elon Musk # tweets March 16 - March 18, 2026?",
-      "short_name": "Mar 16 - Mar 18",
-      "start_date": "2026-03-14",
-      "end_date": "2026-03-18",
-      "num_bins": 10,
-      "directory": "2026-03-18_Mar_16_-_Mar_18"
-    },
-    {
-      "event_id": "257217",
-      "title": "Elon Musk # tweets March 13 - March 20, 2026?",
-      "short_name": "Mar 13 - Mar 20",
+      "event_id": "257216",
+      "title": "Elon Musk # tweets March 17 - March 24, 2026?",
+      "short_name": "Mar 17 - Mar 24",
       "start_date": "2026-03-09",
-      "end_date": "2026-03-20",
+      "end_date": "2026-03-24",
       "num_bins": 30,
-      "directory": "2026-03-20_Mar_13_-_Mar_20"
+      "directory": "2026-03-24_Mar_17_-_Mar_24"
     },
     {
-      "event_id": "276532",
-      "title": "Elon Musk # tweets March 19 - March 21, 2026?",
-      "short_name": "Mar 19 - Mar 21",
-      "start_date": "2026-03-16",
-      "end_date": "2026-03-21",
+      "event_id": "293374",
+      "title": "Elon Musk # tweets March 23 - March 25, 2026?",
+      "short_name": "Mar 23 - Mar 25",
+      "start_date": "2026-03-21",
+      "end_date": "2026-03-25",
       "num_bins": 10,
-      "directory": "2026-03-21_Mar_19_-_Mar_21"
+      "directory": "2026-03-25_Mar_23_-_Mar_25"
+    },
+    {
+      "event_id": "278377",
+      "title": "Elon Musk # tweets March 20 - March 27, 2026?",
+      "short_name": "Mar 20 - Mar 27",
+      "start_date": "2026-03-17",
+      "end_date": "2026-03-27",
+      "num_bins": 30,
+      "directory": "2026-03-27_Mar_20_-_Mar_27"
+    },
+    {
+      "event_id": "300283",
+      "title": "Elon Musk # tweets March 26 - March 28, 2026?",
+      "short_name": "Mar 26 - Mar 28",
+      "start_date": "2026-03-23",
+      "end_date": "2026-03-28",
+      "num_bins": 10,
+      "directory": "2026-03-28_Mar_26_-_Mar_28"
+    },
+    {
+      "event_id": "310565",
+      "title": "Elon Musk # tweets March 28 - March 30, 2026?",
+      "short_name": "Mar 28 - Mar 30",
+      "start_date": "2026-03-26",
+      "end_date": "2026-03-30",
+      "num_bins": 10,
+      "directory": "2026-03-30_Mar_28_-_Mar_30"
+    },
+    {
+      "event_id": "291733",
+      "title": "Elon Musk # tweets March 24 - March 31, 2026?",
+      "short_name": "Mar 24 - Mar 31",
+      "start_date": "2026-03-21",
+      "end_date": "2026-03-31",
+      "num_bins": 30,
+      "directory": "2026-03-31_Mar_24_-_Mar_31"
+    },
+    {
+      "event_id": "318277",
+      "title": "Elon Musk # tweets March 30 - April 1, 2026?",
+      "short_name": "Mar 30 - Apr 1",
+      "start_date": "2026-03-28",
+      "end_date": "2026-04-01",
+      "num_bins": 10,
+      "directory": "2026-04-01_Mar_30_-_Apr_1"
+    },
+    {
+      "event_id": "184873",
+      "title": "Elon Musk musk # tweets in March 2026?",
+      "short_name": "Elon Musk musk # tweets in Mar",
+      "start_date": "2026-01-24",
+      "end_date": "2026-04-01",
+      "num_bins": 51,
+      "directory": "2026-04-01_Elon_Musk_musk_#_tweets_in_Mar"
+    },
+    {
+      "event_id": "301949",
+      "title": "Elon Musk # tweets March 27 - April 3, 2026?",
+      "short_name": "Mar 27 - Apr 3",
+      "start_date": "2026-03-24",
+      "end_date": "2026-04-03",
+      "num_bins": 30,
+      "directory": "2026-04-03_Mar_27_-_Apr_3"
+    },
+    {
+      "event_id": "325751",
+      "title": "Elon Musk # tweets April 2 - April 4, 2026?",
+      "short_name": "Apr 2 - Apr 4",
+      "start_date": "2026-03-30",
+      "end_date": "2026-04-04",
+      "num_bins": 10,
+      "directory": "2026-04-04_Apr_2_-_Apr_4"
+    },
+    {
+      "event_id": "336418",
+      "title": "Elon Musk # tweets April 4 - April 6, 2026?",
+      "short_name": "Apr 4 - Apr 6",
+      "start_date": "2026-04-02",
+      "end_date": "2026-04-06",
+      "num_bins": 10,
+      "directory": "2026-04-06_Apr_4_-_Apr_6"
+    },
+    {
+      "event_id": "316317",
+      "title": "Elon Musk # tweets March 31 - April 7, 2026?",
+      "short_name": "Mar 31 - Apr 7",
+      "start_date": "2026-03-28",
+      "end_date": "2026-04-07",
+      "num_bins": 30,
+      "directory": "2026-04-07_Mar_31_-_Apr_7"
+    },
+    {
+      "event_id": "343551",
+      "title": "Elon Musk # tweets April 6 - April 8, 2026?",
+      "short_name": "Apr 6 - Apr 8",
+      "start_date": "2026-04-04",
+      "end_date": "2026-04-08",
+      "num_bins": 10,
+      "directory": "2026-04-08_Apr_6_-_Apr_8"
+    },
+    {
+      "event_id": "327486",
+      "title": "Elon Musk # tweets April 3 - April 10, 2026?",
+      "short_name": "Apr 3 - Apr 10",
+      "start_date": "2026-03-31",
+      "end_date": "2026-04-10",
+      "num_bins": 30,
+      "directory": "2026-04-10_Apr_3_-_Apr_10"
+    },
+    {
+      "event_id": "350722",
+      "title": "Elon Musk # tweets April 9 - April 11, 2026?",
+      "short_name": "Apr 9 - Apr 11",
+      "start_date": "2026-04-06",
+      "end_date": "2026-04-11",
+      "num_bins": 10,
+      "directory": "2026-04-11_Apr_9_-_Apr_11"
+    },
+    {
+      "event_id": "361215",
+      "title": "Elon Musk # tweets April 11 - April 13, 2026?",
+      "short_name": "Apr 11 - Apr 13",
+      "start_date": "2026-04-09",
+      "end_date": "2026-04-13",
+      "num_bins": 10,
+      "directory": "2026-04-13_Apr_11_-_Apr_13"
+    },
+    {
+      "event_id": "341756",
+      "title": "Elon Musk # tweets April 7 - April 14, 2026?",
+      "short_name": "Apr 7 - Apr 14",
+      "start_date": "2026-04-04",
+      "end_date": "2026-04-14",
+      "num_bins": 30,
+      "directory": "2026-04-14_Apr_7_-_Apr_14"
+    },
+    {
+      "event_id": "368074",
+      "title": "Elon Musk # tweets April 13 - April 15, 2026?",
+      "short_name": "Apr 13 - Apr 15",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-15",
+      "num_bins": 10,
+      "directory": "2026-04-15_Apr_13_-_Apr_15"
+    },
+    {
+      "event_id": "352573",
+      "title": "Elon Musk # tweets April 10 - April 17, 2026?",
+      "short_name": "Apr 10 - Apr 17",
+      "start_date": "2026-04-07",
+      "end_date": "2026-04-17",
+      "num_bins": 30,
+      "directory": "2026-04-17_Apr_10_-_Apr_17"
+    },
+    {
+      "event_id": "375345",
+      "title": "Elon Musk # tweets April 16 - April 18, 2026?",
+      "short_name": "Apr 16 - Apr 18",
+      "start_date": "2026-04-13",
+      "end_date": "2026-04-18",
+      "num_bins": 10,
+      "directory": "2026-04-18_Apr_16_-_Apr_18"
+    },
+    {
+      "event_id": "385678",
+      "title": "Elon Musk # tweets April 18 - April 20, 2026?",
+      "short_name": "Apr 18 - Apr 20",
+      "start_date": "2026-04-16",
+      "end_date": "2026-04-20",
+      "num_bins": 10,
+      "directory": "2026-04-20_Apr_18_-_Apr_20"
+    },
+    {
+      "event_id": "366428",
+      "title": "Elon Musk # tweets April 14 - April 21, 2026?",
+      "short_name": "Apr 14 - Apr 21",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-21",
+      "num_bins": 30,
+      "directory": "2026-04-21_Apr_14_-_Apr_21"
+    },
+    {
+      "event_id": "392539",
+      "title": "Elon Musk # tweets April 20 - April 22, 2026?",
+      "short_name": "Apr 20 - Apr 22",
+      "start_date": "2026-04-18",
+      "end_date": "2026-04-22",
+      "num_bins": 10,
+      "directory": "2026-04-22_Apr_20_-_Apr_22"
+    },
+    {
+      "event_id": "377129",
+      "title": "Elon Musk # tweets April 17 - April 24, 2026?",
+      "short_name": "Apr 17 - Apr 24",
+      "start_date": "2026-04-14",
+      "end_date": "2026-04-24",
+      "num_bins": 30,
+      "directory": "2026-04-24_Apr_17_-_Apr_24"
+    },
+    {
+      "event_id": "399799",
+      "title": "Elon Musk # tweets April 23 - April 25, 2026?",
+      "short_name": "Apr 23 - Apr 25",
+      "start_date": "2026-04-20",
+      "end_date": "2026-04-25",
+      "num_bins": 10,
+      "directory": "2026-04-25_Apr_23_-_Apr_25"
+    },
+    {
+      "event_id": "410259",
+      "title": "Elon Musk # tweets April 25 - April 27, 2026?",
+      "short_name": "Apr 25 - Apr 27",
+      "start_date": "2026-04-23",
+      "end_date": "2026-04-27",
+      "num_bins": 10,
+      "directory": "2026-04-27_Apr_25_-_Apr_27"
+    },
+    {
+      "event_id": "390784",
+      "title": "Elon Musk # tweets April 21 - April 28, 2026?",
+      "short_name": "Apr 21 - Apr 28",
+      "start_date": "2026-04-18",
+      "end_date": "2026-04-28",
+      "num_bins": 30,
+      "directory": "2026-04-28_Apr_21_-_Apr_28"
+    },
+    {
+      "event_id": "417097",
+      "title": "Elon Musk # tweets April 27 - April 29, 2026?",
+      "short_name": "Apr 27 - Apr 29",
+      "start_date": "2026-04-25",
+      "end_date": "2026-04-29",
+      "num_bins": 10,
+      "directory": "2026-04-29_Apr_27_-_Apr_29"
+    },
+    {
+      "event_id": "401636",
+      "title": "Elon Musk # tweets April 24 - May 1, 2026?",
+      "short_name": "Apr 24 - May 1",
+      "start_date": "2026-04-21",
+      "end_date": "2026-05-01",
+      "num_bins": 30,
+      "directory": "2026-05-01_Apr_24_-_May_1"
+    },
+    {
+      "event_id": "226988",
+      "title": "Elon Musk musk # tweets in April 2026?",
+      "short_name": "Elon Musk musk # tweets in Apr",
+      "start_date": "2026-02-24",
+      "end_date": "2026-05-01",
+      "num_bins": 66,
+      "directory": "2026-05-01_Elon_Musk_musk_#_tweets_in_Apr"
+    },
+    {
+      "event_id": "424458",
+      "title": "Elon Musk # tweets April 30 - May 2, 2026?",
+      "short_name": "Apr 30 - May 2",
+      "start_date": "2026-04-27",
+      "end_date": "2026-05-02",
+      "num_bins": 10,
+      "directory": "2026-05-02_Apr_30_-_May_2"
+    },
+    {
+      "event_id": "434898",
+      "title": "Elon Musk # tweets May 2 - May 4, 2026?",
+      "short_name": "May 2 - May 4",
+      "start_date": "2026-04-30",
+      "end_date": "2026-05-04",
+      "num_bins": 10,
+      "directory": "2026-05-04_May_2_-_May_4"
+    },
+    {
+      "event_id": "415391",
+      "title": "Elon Musk # tweets April 28 - May 5, 2026?",
+      "short_name": "Apr 28 - May 5",
+      "start_date": "2026-04-25",
+      "end_date": "2026-05-05",
+      "num_bins": 26,
+      "directory": "2026-05-05_Apr_28_-_May_5"
+    },
+    {
+      "event_id": "441595",
+      "title": "Elon Musk # tweets May 4 - May 6, 2026?",
+      "short_name": "May 4 - May 6",
+      "start_date": "2026-05-02",
+      "end_date": "2026-05-06",
+      "num_bins": 10,
+      "directory": "2026-05-06_May_4_-_May_6"
+    },
+    {
+      "event_id": "426166",
+      "title": "Elon Musk # tweets May 1 - May 8, 2026?",
+      "short_name": "May 1 - May 8",
+      "start_date": "2026-04-28",
+      "end_date": "2026-05-08",
+      "num_bins": 26,
+      "directory": "2026-05-08_May_1_-_May_8"
+    },
+    {
+      "event_id": "448310",
+      "title": "Elon Musk # tweets May 7 - May 9, 2026?",
+      "short_name": "May 7 - May 9",
+      "start_date": "2026-05-04",
+      "end_date": "2026-05-09",
+      "num_bins": 10,
+      "directory": "2026-05-09_May_7_-_May_9"
+    },
+    {
+      "event_id": "458897",
+      "title": "Elon Musk # tweets May 9 - May 11, 2026?",
+      "short_name": "May 9 - May 11",
+      "start_date": "2026-05-07",
+      "end_date": "2026-05-11",
+      "num_bins": 10,
+      "directory": "2026-05-11_May_9_-_May_11"
+    },
+    {
+      "event_id": "439910",
+      "title": "Elon Musk # tweets May 5 - May 12, 2026?",
+      "short_name": "May 5 - May 12",
+      "start_date": "2026-05-02",
+      "end_date": "2026-05-12",
+      "num_bins": 26,
+      "directory": "2026-05-12_May_5_-_May_12"
+    },
+    {
+      "event_id": "467401",
+      "title": "Elon Musk # tweets May 11 - May 13, 2026?",
+      "short_name": "May 11 - May 13",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-13",
+      "num_bins": 10,
+      "directory": "2026-05-13_May_11_-_May_13"
+    },
+    {
+      "event_id": "450140",
+      "title": "Elon Musk # tweets May 8 - May 15, 2026?",
+      "short_name": "May 8 - May 15",
+      "start_date": "2026-05-05",
+      "end_date": "2026-05-15",
+      "num_bins": 26,
+      "directory": "2026-05-15_May_8_-_May_15"
+    },
+    {
+      "event_id": "474275",
+      "title": "Elon Musk # tweets May 14 - May 16, 2026?",
+      "short_name": "May 14 - May 16",
+      "start_date": "2026-05-11",
+      "end_date": "2026-05-16",
+      "num_bins": 10,
+      "directory": "2026-05-16_May_14_-_May_16"
+    },
+    {
+      "event_id": "485146",
+      "title": "Elon Musk # tweets May 16 - May 18, 2026?",
+      "short_name": "May 16 - May 18",
+      "start_date": "2026-05-14",
+      "end_date": "2026-05-18",
+      "num_bins": 10,
+      "directory": "2026-05-18_May_16_-_May_18"
+    },
+    {
+      "event_id": "465139",
+      "title": "Elon Musk # tweets May 12 - May 19, 2026?",
+      "short_name": "May 12 - May 19",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-19",
+      "num_bins": 26,
+      "directory": "2026-05-19_May_12_-_May_19"
+    },
+    {
+      "event_id": "491920",
+      "title": "Elon Musk # tweets May 18 - May 20, 2026?",
+      "short_name": "May 18 - May 20",
+      "start_date": "2026-05-16",
+      "end_date": "2026-05-20",
+      "num_bins": 10,
+      "directory": "2026-05-20_May_18_-_May_20"
+    },
+    {
+      "event_id": "506537",
+      "title": "Elon Musk # tweets May 18 - May 20, 2026?",
+      "short_name": "May 18 - May 20",
+      "start_date": "2026-05-20",
+      "end_date": "2026-05-20",
+      "num_bins": 10,
+      "directory": "2026-05-20_May_18_-_May_20"
+    },
+    {
+      "event_id": "476064",
+      "title": "Elon Musk # tweets May 15 - May 22, 2026?",
+      "short_name": "May 15 - May 22",
+      "start_date": "2026-05-12",
+      "end_date": "2026-05-22",
+      "num_bins": 26,
+      "directory": "2026-05-22_May_15_-_May_22"
+    },
+    {
+      "event_id": "510092",
+      "title": "Elon Musk # tweets May 23 - May 25, 2026?",
+      "short_name": "May 23 - May 25",
+      "start_date": "2026-05-21",
+      "end_date": "2026-05-25",
+      "num_bins": 10,
+      "directory": "2026-05-25_May_23_-_May_25"
+    },
+    {
+      "event_id": "490187",
+      "title": "Elon Musk # tweets May 19 - May 26, 2026?",
+      "short_name": "May 19 - May 26",
+      "start_date": "2026-05-16",
+      "end_date": "2026-05-26",
+      "num_bins": 26,
+      "directory": "2026-05-26_May_19_-_May_26"
+    },
+    {
+      "event_id": "506536",
+      "title": "Elon Musk # tweets May 19 - May 26, 2026?",
+      "short_name": "May 19 - May 26",
+      "start_date": "2026-05-20",
+      "end_date": "2026-05-26",
+      "num_bins": 26,
+      "directory": "2026-05-26_May_19_-_May_26"
+    },
+    {
+      "event_id": "517277",
+      "title": "Elon Musk # tweets May 25 - May 27, 2026?",
+      "short_name": "May 25 - May 27",
+      "start_date": "2026-05-23",
+      "end_date": "2026-05-27",
+      "num_bins": 10,
+      "directory": "2026-05-27_May_25_-_May_27"
+    },
+    {
+      "event_id": "514882",
+      "title": "Elon Musk # tweets May 22 - May 29, 2026?",
+      "short_name": "May 22 - May 29",
+      "start_date": "2026-05-22",
+      "end_date": "2026-05-29",
+      "num_bins": 26,
+      "directory": "2026-05-29_May_22_-_May_29"
+    },
+    {
+      "event_id": "523920",
+      "title": "Elon Musk # tweets May 28 - May 30, 2026?",
+      "short_name": "May 28 - May 30",
+      "start_date": "2026-05-25",
+      "end_date": "2026-05-30",
+      "num_bins": 10,
+      "directory": "2026-05-30_May_28_-_May_30"
+    },
+    {
+      "event_id": "534841",
+      "title": "Elon Musk # tweets May 30 - June 1, 2026?",
+      "short_name": "May 30 - Jun 1",
+      "start_date": "2026-05-28",
+      "end_date": "2026-06-01",
+      "num_bins": 10,
+      "directory": "2026-06-01_May_30_-_Jun_1"
+    },
+    {
+      "event_id": "301948",
+      "title": "Elon Musk musk # tweets in May 2026?",
+      "short_name": "Elon Musk musk # tweets in May",
+      "start_date": "2026-03-24",
+      "end_date": "2026-06-01",
+      "num_bins": 66,
+      "directory": "2026-06-01_Elon_Musk_musk_#_tweets_in_May"
+    },
+    {
+      "event_id": "515567",
+      "title": "Elon Musk # tweets May 26 - June 2, 2026?",
+      "short_name": "May 26 - Jun 2",
+      "start_date": "2026-05-23",
+      "end_date": "2026-06-02",
+      "num_bins": 26,
+      "directory": "2026-06-02_May_26_-_Jun_2"
+    },
+    {
+      "event_id": "541689",
+      "title": "Elon Musk # tweets June 1 - June 3, 2026?",
+      "short_name": "Jun 1 - Jun 3",
+      "start_date": "2026-05-30",
+      "end_date": "2026-06-03",
+      "num_bins": 10,
+      "directory": "2026-06-03_Jun_1_-_Jun_3"
+    },
+    {
+      "event_id": "525678",
+      "title": "Elon Musk # tweets May 29 - June 5, 2026?",
+      "short_name": "May 29 - Jun 5",
+      "start_date": "2026-05-26",
+      "end_date": "2026-06-05",
+      "num_bins": 26,
+      "directory": "2026-06-05_May_29_-_Jun_5"
+    },
+    {
+      "event_id": "548451",
+      "title": "Elon Musk # tweets June 4 - June 6, 2026?",
+      "short_name": "Jun 4 - Jun 6",
+      "start_date": "2026-06-01",
+      "end_date": "2026-06-06",
+      "num_bins": 10,
+      "directory": "2026-06-06_Jun_4_-_Jun_6"
+    },
+    {
+      "event_id": "559048",
+      "title": "Elon Musk # tweets June 6 - June 8, 2026?",
+      "short_name": "Jun 6 - Jun 8",
+      "start_date": "2026-06-04",
+      "end_date": "2026-06-08",
+      "num_bins": 10,
+      "directory": "2026-06-08_Jun_6_-_Jun_8"
+    },
+    {
+      "event_id": "540037",
+      "title": "Elon Musk # tweets June 2 - June 9, 2026?",
+      "short_name": "Jun 2 - Jun 9",
+      "start_date": "2026-05-30",
+      "end_date": "2026-06-09",
+      "num_bins": 26,
+      "directory": "2026-06-09_Jun_2_-_Jun_9"
+    },
+    {
+      "event_id": "566154",
+      "title": "Elon Musk # tweets June 8 - June 10, 2026?",
+      "short_name": "Jun 8 - Jun 10",
+      "start_date": "2026-06-06",
+      "end_date": "2026-06-10",
+      "num_bins": 10,
+      "directory": "2026-06-10_Jun_8_-_Jun_10"
+    },
+    {
+      "event_id": "550185",
+      "title": "Elon Musk # tweets June 5 - June 12, 2026?",
+      "short_name": "Jun 5 - Jun 12",
+      "start_date": "2026-06-02",
+      "end_date": "2026-06-12",
+      "num_bins": 26,
+      "directory": "2026-06-12_Jun_5_-_Jun_12"
+    },
+    {
+      "event_id": "573063",
+      "title": "Elon Musk # tweets June 11 - June 13, 2026?",
+      "short_name": "Jun 11 - Jun 13",
+      "start_date": "2026-06-08",
+      "end_date": "2026-06-13",
+      "num_bins": 10,
+      "directory": "2026-06-13_Jun_11_-_Jun_13"
+    },
+    {
+      "event_id": "584099",
+      "title": "Elon Musk # tweets June 13 - June 15, 2026?",
+      "short_name": "Jun 13 - Jun 15",
+      "start_date": "2026-06-11",
+      "end_date": "2026-06-15",
+      "num_bins": 10,
+      "directory": "2026-06-15_Jun_13_-_Jun_15"
+    },
+    {
+      "event_id": "564322",
+      "title": "Elon Musk # tweets June 9 - June 16, 2026?",
+      "short_name": "Jun 9 - Jun 16",
+      "start_date": "2026-06-06",
+      "end_date": "2026-06-16",
+      "num_bins": 26,
+      "directory": "2026-06-16_Jun_9_-_Jun_16"
+    },
+    {
+      "event_id": "591093",
+      "title": "Elon Musk # tweets June 15 - June 17, 2026?",
+      "short_name": "Jun 15 - Jun 17",
+      "start_date": "2026-06-13",
+      "end_date": "2026-06-17",
+      "num_bins": 10,
+      "directory": "2026-06-17_Jun_15_-_Jun_17"
+    },
+    {
+      "event_id": "574934",
+      "title": "Elon Musk # tweets June 12 - June 19, 2026?",
+      "short_name": "Jun 12 - Jun 19",
+      "start_date": "2026-06-09",
+      "end_date": "2026-06-19",
+      "num_bins": 26,
+      "directory": "2026-06-19_Jun_12_-_Jun_19"
+    },
+    {
+      "event_id": "597985",
+      "title": "Elon Musk # tweets June 18 - June 20, 2026?",
+      "short_name": "Jun 18 - Jun 20",
+      "start_date": "2026-06-15",
+      "end_date": "2026-06-20",
+      "num_bins": 10,
+      "directory": "2026-06-20_Jun_18_-_Jun_20"
+    },
+    {
+      "event_id": "608768",
+      "title": "Elon Musk # tweets June 20 - June 22, 2026?",
+      "short_name": "Jun 20 - Jun 22",
+      "start_date": "2026-06-18",
+      "end_date": "2026-06-22",
+      "num_bins": 10,
+      "directory": "2026-06-22_Jun_20_-_Jun_22"
+    },
+    {
+      "event_id": "589435",
+      "title": "Elon Musk # tweets June 16 - June 23, 2026?",
+      "short_name": "Jun 16 - Jun 23",
+      "start_date": "2026-06-13",
+      "end_date": "2026-06-23",
+      "num_bins": 26,
+      "directory": "2026-06-23_Jun_16_-_Jun_23"
+    },
+    {
+      "event_id": "615698",
+      "title": "Elon Musk # tweets June 22 - June 24, 2026?",
+      "short_name": "Jun 22 - Jun 24",
+      "start_date": "2026-06-20",
+      "end_date": "2026-06-24",
+      "num_bins": 10,
+      "directory": "2026-06-24_Jun_22_-_Jun_24"
+    },
+    {
+      "event_id": "599761",
+      "title": "Elon Musk # tweets June 19 - June 26, 2026?",
+      "short_name": "Jun 19 - Jun 26",
+      "start_date": "2026-06-16",
+      "end_date": "2026-06-26",
+      "num_bins": 26,
+      "directory": "2026-06-26_Jun_19_-_Jun_26"
+    },
+    {
+      "event_id": "622559",
+      "title": "Elon Musk # tweets June 25 - June 27, 2026?",
+      "short_name": "Jun 25 - Jun 27",
+      "start_date": "2026-06-22",
+      "end_date": "2026-06-27",
+      "num_bins": 10,
+      "directory": "2026-06-27_Jun_25_-_Jun_27"
+    },
+    {
+      "event_id": "633587",
+      "title": "Elon Musk # tweets June 27 - June 29, 2026?",
+      "short_name": "Jun 27 - Jun 29",
+      "start_date": "2026-06-25",
+      "end_date": "2026-06-29",
+      "num_bins": 10,
+      "directory": "2026-06-29_Jun_27_-_Jun_29"
+    },
+    {
+      "event_id": "614048",
+      "title": "Elon Musk # tweets June 23 - June 30, 2026?",
+      "short_name": "Jun 23 - Jun 30",
+      "start_date": "2026-06-20",
+      "end_date": "2026-06-30",
+      "num_bins": 26,
+      "directory": "2026-06-30_Jun_23_-_Jun_30"
+    },
+    {
+      "event_id": "641223",
+      "title": "Elon Musk # tweets June 29 - July 1, 2026?",
+      "short_name": "Jun 29 - Jul 1",
+      "start_date": "2026-06-27",
+      "end_date": "2026-07-01",
+      "num_bins": 10,
+      "directory": "2026-07-01_Jun_29_-_Jul_1"
+    },
+    {
+      "event_id": "577696",
+      "title": "Elon Musk # tweets in June 2026?",
+      "short_name": "Elon Musk # tweets in June 202",
+      "start_date": "2026-06-09",
+      "end_date": "2026-07-01",
+      "num_bins": 32,
+      "directory": "2026-07-01_Elon_Musk_#_tweets_in_June_202"
+    },
+    {
+      "event_id": "624403",
+      "title": "Elon Musk # tweets June 26 - July 3, 2026?",
+      "short_name": "Jun 26 - Jul 3",
+      "start_date": "2026-06-23",
+      "end_date": "2026-07-03",
+      "num_bins": 26,
+      "directory": "2026-07-03_Jun_26_-_Jul_3"
+    },
+    {
+      "event_id": "648184",
+      "title": "Elon Musk # tweets July 2 - July 4, 2026?",
+      "short_name": "Jul 2 - Jul 4",
+      "start_date": "2026-06-29",
+      "end_date": "2026-07-04",
+      "num_bins": 10,
+      "directory": "2026-07-04_Jul_2_-_Jul_4"
+    },
+    {
+      "event_id": "659150",
+      "title": "Elon Musk # tweets July 4 - July 6, 2026?",
+      "short_name": "Jul 4 - Jul 6",
+      "start_date": "2026-07-02",
+      "end_date": "2026-07-06",
+      "num_bins": 10,
+      "directory": "2026-07-06_Jul_4_-_Jul_6"
+    },
+    {
+      "event_id": "639340",
+      "title": "Elon Musk # tweets June 30 - July 7, 2026?",
+      "short_name": "Jun 30 - Jul 7",
+      "start_date": "2026-06-27",
+      "end_date": "2026-07-07",
+      "num_bins": 26,
+      "directory": "2026-07-07_Jun_30_-_Jul_7"
+    },
+    {
+      "event_id": "666466",
+      "title": "Elon Musk # tweets July 6 - July 8, 2026?",
+      "short_name": "Jul 6 - Jul 8",
+      "start_date": "2026-07-04",
+      "end_date": "2026-07-08",
+      "num_bins": 10,
+      "directory": "2026-07-08_Jul_6_-_Jul_8"
     }
   ]
 }

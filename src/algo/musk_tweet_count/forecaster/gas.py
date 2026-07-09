@@ -61,9 +61,6 @@ class GASRegimeModel:
             self.f = np.log(max(np.mean(daily_counts), 1.0))
             return
 
-        # Initial guesses
-        x0 = np.array([self.config.omega_init, self.config.alpha_init, self.config.beta_init])
-
         # Bounds: ω ∈ (-2, 2), α ∈ (alpha_min, alpha_max), β ∈ (beta_min, beta_max)
         bounds = [
             (-2.0, 2.0),
@@ -73,25 +70,67 @@ class GASRegimeModel:
 
         counts = np.array(daily_counts, dtype=np.float64)
 
-        result = optimize.minimize(
-            self._negloglik,
-            x0,
-            args=(counts, k),
-            method="L-BFGS-B",
-            bounds=bounds,
-        )
+        # Multi-start MLE. A single start can land on the max_log_intensity
+        # plateau: at e.g. (ω=2, β=0.999) the filtered state pegs at the cap
+        # for every day, the likelihood goes flat in all three parameters,
+        # and L-BFGS-B reports success with a forecast of exp(cap)/day.
+        # Moment-matched starts anchor ω to the sample mean at several
+        # persistence levels so at least one start is in the sane basin.
+        log_mean = np.log(max(np.mean(counts), 1.0))
+        starts = [
+            np.array([self.config.omega_init, self.config.alpha_init, self.config.beta_init]),
+        ]
+        for beta0 in (0.7, 0.9, 0.97):
+            for alpha0 in (0.05, 0.2):
+                starts.append(np.array([
+                    np.clip((1.0 - beta0) * log_mean, bounds[0][0], bounds[0][1]),
+                    np.clip(alpha0, self.config.alpha_min, self.config.alpha_max),
+                    np.clip(beta0, self.config.beta_min, self.config.beta_max),
+                ]))
 
-        if result.success:
-            self.omega, self.alpha, self.beta = result.x
+        best_params = None
+        best_nll = np.inf
+        for x0 in starts:
+            result = optimize.minimize(
+                self._negloglik,
+                x0,
+                args=(counts, k),
+                method="L-BFGS-B",
+                bounds=bounds,
+            )
+            if not np.isfinite(result.fun):
+                continue
+            if self._is_degenerate_fit(result.x, counts, k):
+                continue
+            if result.fun < best_nll:
+                best_nll = result.fun
+                best_params = result.x
+
+        if best_params is not None:
+            self.omega, self.alpha, self.beta = best_params
         else:
-            logger.warning(f"GAS MLE optimization did not converge: {result.message}")
-            # Use result anyway if it improved
-            if result.fun < self._negloglik(x0, counts, k):
-                self.omega, self.alpha, self.beta = result.x
+            # Every start converged onto the degenerate plateau (or failed):
+            # keep the configured defaults with ω anchored to the sample
+            # mean so forecasts stay near observed intensity.
+            logger.warning(
+                "GAS MLE degenerate/failed from all starts; "
+                "falling back to moment-anchored defaults"
+            )
+            self.alpha = self.config.alpha_init
+            self.beta = self.config.beta_init
+            self.omega = (1.0 - self.beta) * log_mean
 
         # Run filter forward with fitted parameters to get final state
         f_values = self._run_filter(self.omega, self.alpha, self.beta, counts, k)
-        self.f = f_values[-1]
+
+        # Absorb the final observation: _run_filter's state sequence only
+        # incorporates counts[0..n-2] (counts[n-1] enters the likelihood but
+        # never the state). Advance one step so self.f is the filtered
+        # intensity for the day AFTER the last training day.
+        last_f = f_values[-1]
+        mu_last = max(np.exp(min(last_f, self.config.max_log_intensity)), 1e-6)
+        last_score = (counts[-1] - mu_last) / mu_last
+        self.f = self.omega + self.beta * last_f + self.alpha * last_score
 
         # Apply cap
         self.f = min(self.f, self.config.max_log_intensity)
@@ -107,6 +146,26 @@ class GASRegimeModel:
             f"k={k:.2f}, f_T={self.f:.3f} (μ={np.exp(self.f):.1f}), "
             f"f̄={f_bar:.3f} (μ̄={np.exp(f_bar):.1f})"
         )
+
+    def _is_degenerate_fit(
+        self,
+        params: np.ndarray,
+        counts: np.ndarray,
+        k: float,
+    ) -> bool:
+        """Detect plateau/corner solutions that forecast the intensity cap.
+
+        A fit is degenerate when its filtered state spends a large fraction
+        of the sample pinned at max_log_intensity — there the likelihood is
+        locally flat in (ω, α, β) and the optimizer stops on the plateau
+        with success=True while forecasting exp(max_log_intensity)/day.
+        """
+        omega, alpha, beta = params
+        f_values = self._run_filter(omega, alpha, beta, counts, k)
+        capped_frac = np.mean(
+            f_values >= self.config.max_log_intensity - 1e-9
+        )
+        return bool(capped_frac > 0.5)
 
     def _negloglik(self, params: np.ndarray, counts: np.ndarray, k: float) -> float:
         """Negative log-likelihood for scipy.optimize.minimize."""

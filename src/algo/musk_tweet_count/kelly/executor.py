@@ -161,6 +161,95 @@ def _best_fak_price(
     return best_price, best_size
 
 
+class OrderManagerBreaker:
+    """Shared circuit breaker for CLOB HTTP 425 "order manager not ready".
+
+    The 425 is an exchange-global condition (Polymarket's order manager
+    warming up after their own restarts) — every executor hits it at once
+    and retrying individual orders is futile. One module-level instance is
+    shared by all executors: after a submission fails 425 twice (initial
+    attempt + one short retry), submissions are paused with exponential
+    backoff; the first submission after expiry acts as the probe. Live log
+    2026-07-01 04:21-04:45 UTC: ~630 futile submissions at ~42/min that
+    this reduces to ~a dozen probes.
+    """
+
+    RETRY_DELAY_SECONDS = 1.5
+    INITIAL_BACKOFF_SECONDS = 10.0
+    MAX_BACKOFF_SECONDS = 120.0
+    REMINDER_INTERVAL_SECONDS = 60.0
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self._not_ready_until = 0.0
+        self._backoff = 0.0
+        self._consecutive_failures = 0
+        self._last_reminder = 0.0
+
+    @staticmethod
+    def is_not_ready_error(exc: Exception) -> bool:
+        if getattr(exc, "status_code", None) == 425:
+            return True
+        return "status_code=425" in str(exc)
+
+    def is_open(self) -> bool:
+        return time.monotonic() < self._not_ready_until
+
+    def seconds_remaining(self) -> float:
+        return max(0.0, self._not_ready_until - time.monotonic())
+
+    def note_skip(self, event_name: str) -> None:
+        """Throttled reminder while submissions are being skipped."""
+        now = time.monotonic()
+        if now - self._last_reminder >= self.REMINDER_INTERVAL_SECONDS:
+            self._last_reminder = now
+            logger.warning(
+                f"[{event_name}][ORDER_MGR] breaker open "
+                f"({self.seconds_remaining():.0f}s left, "
+                f"{self._consecutive_failures} consecutive 425s); "
+                f"skipping order submission"
+            )
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._backoff <= 0:
+            self._backoff = self.INITIAL_BACKOFF_SECONDS
+        else:
+            self._backoff = min(self._backoff * 2, self.MAX_BACKOFF_SECONDS)
+        self._not_ready_until = time.monotonic() + self._backoff
+        logger.warning(
+            f"[ORDER_MGR] order manager not ready (HTTP 425); pausing all "
+            f"order submissions {self._backoff:.0f}s "
+            f"(consecutive={self._consecutive_failures})"
+        )
+
+    def record_success(self) -> None:
+        if self._consecutive_failures > 0:
+            logger.warning(
+                f"[ORDER_MGR] order manager recovered after "
+                f"{self._consecutive_failures} consecutive 425s"
+            )
+        self.reset()
+
+    def status(self) -> dict:
+        return {
+            "open": self.is_open(),
+            "seconds_remaining": round(self.seconds_remaining(), 1),
+            "consecutive_failures": self._consecutive_failures,
+            "backoff_seconds": self._backoff,
+        }
+
+
+# One breaker per process: the not-ready condition is exchange-global.
+ORDER_MANAGER_BREAKER = OrderManagerBreaker()
+
+# Maximum age of the last successful portfolio sync before a FAILED sync
+# halts the tick instead of planning on stale state (sits between the 90s
+# stale-overlay grace and the 180s forced API recovery).
+SYNC_STALENESS_HALT_SECONDS = 120.0
+
 
 @dataclass
 class ExecutionResult:
@@ -453,6 +542,36 @@ class OrderExecutor:
         except Exception:
             return "0.01"
 
+    def _submit_with_not_ready_retry(self, post: Callable[[], Any]) -> Any:
+        """Run a CLOB submission callable with 425-aware handling.
+
+        On a 425 ("order manager not ready, please retry") the submission
+        is retried once after a short delay — the server explicitly asks
+        for a retry and brief blips resolve within a second or two. If the
+        retry also 425s, the shared breaker opens and pauses all
+        submissions with exponential backoff. Non-425 errors propagate
+        unchanged.
+        """
+        try:
+            result = post()
+        except Exception as e:
+            if not ORDER_MANAGER_BREAKER.is_not_ready_error(e):
+                raise
+            logger.warning(
+                f"[{self.event_name}][ORDER_MGR] order manager not ready "
+                f"(425); retrying once in "
+                f"{ORDER_MANAGER_BREAKER.RETRY_DELAY_SECONDS}s"
+            )
+            time.sleep(ORDER_MANAGER_BREAKER.RETRY_DELAY_SECONDS)
+            try:
+                result = post()
+            except Exception as retry_exc:
+                if ORDER_MANAGER_BREAKER.is_not_ready_error(retry_exc):
+                    ORDER_MANAGER_BREAKER.record_failure()
+                raise
+        ORDER_MANAGER_BREAKER.record_success()
+        return result
+
     def place_limit_order(
         self,
         token_id: str,
@@ -478,6 +597,11 @@ class OrderExecutor:
                 f"token={token_id[:16]}..., price={price:.4f}, size={size:.2f}"
             )
             return {"order_id": "dry_run_order", "status": "simulated"}
+
+        if ORDER_MANAGER_BREAKER.is_open():
+            ORDER_MANAGER_BREAKER.note_skip(self.event_name)
+            self._last_error = "order manager not ready (breaker open)"
+            return None
 
         try:
             # Let py-clob-client handle price rounding based on market tick size.
@@ -514,7 +638,9 @@ class OrderExecutor:
             logger.debug(f"Signed order created: {type(signed_order)}")
 
             # FAK = Fill and Kill (IOC) - allows partial fills, cancels unfilled remainder
-            response = self.client.post_order(signed_order, order_type=OrderType.FAK)
+            response = self._submit_with_not_ready_retry(
+                lambda: self.client.post_order(signed_order, order_type=OrderType.FAK)
+            )
 
             logger.info(
                 f"[{self.event_name}] Order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
@@ -607,6 +733,13 @@ class OrderExecutor:
         # Returns one result per input order (aligned 1:1 with input list)
         SKIP_RESULT = {"orderID": None, "errorMsg": "", "_skipped": True}
         results = [dict(SKIP_RESULT) for _ in orders]  # Default: all skipped
+
+        if ORDER_MANAGER_BREAKER.is_open():
+            ORDER_MANAGER_BREAKER.note_skip(self.event_name)
+            self._last_error = "order manager not ready (breaker open)"
+            for r in results:
+                r["errorMsg"] = "order manager not ready (breaker open)"
+            return results
         signed_args = []
         signed_indices = []  # Which input indices have signed orders
         # Track remaining exchange-visible sellable balance per token within this batch.
@@ -737,7 +870,9 @@ class OrderExecutor:
             logger.info(
                 f"[{self.event_name}][BATCH] Submitting {len(signed_args)} orders in one API call"
             )
-            response = self.client.post_orders(signed_args)
+            response = self._submit_with_not_ready_retry(
+                lambda: self.client.post_orders(signed_args)
+            )
             logger.info(f"[{self.event_name}][BATCH] Response: {response}")
 
             # Map API responses back to original order indices
@@ -956,6 +1091,12 @@ class KellyExecutor:
 
         # Integrity state is event-local and runtime-only.
         self._integrity_state = IntegrityState()
+
+        # Last successful sync_portfolio() wall-clock time. When a sync
+        # fails, planning may continue on the last-synced base + overlay
+        # only while the last success is younger than
+        # SYNC_STALENESS_HALT_SECONDS; beyond that the tick halts.
+        self._last_successful_sync_time: Optional[float] = None
 
         self._recent_tracking_ttl_seconds = 30.0 * 60.0
         self._recent_tracking_cap = 10_000
@@ -2541,6 +2682,7 @@ class KellyExecutor:
                 try:
                     await self.sync_portfolio()
                     effective_portfolio = self._integrate_api_sync()
+                    self._last_successful_sync_time = time.time()
                     logger.info(
                         f"[{self.event_name}][KELLY] iter={iteration} Synced from API: "
                         f"base_capital=${self.api_base_portfolio.capital:.2f}, "
@@ -2549,8 +2691,29 @@ class KellyExecutor:
                         f"overlay_entries={len(self._overlay_ledger)}"
                     )
                 except Exception as e:
-                    logger.warning(f"[{self.event_name}] Failed to sync portfolio: {e}")
-                    effective_portfolio = self.api_base_portfolio._copy()
+                    # Never plan on the bare API base here: it predates any
+                    # confirmed-but-unreconciled fills in the overlay, so the
+                    # planner would re-buy positions it already holds.
+                    now = time.time()
+                    last_ok = self._last_successful_sync_time
+                    sync_age = None if last_ok is None else now - last_ok
+                    if (
+                        sync_age is None
+                        or sync_age > SYNC_STALENESS_HALT_SECONDS
+                    ):
+                        logger.warning(
+                            f"[{self.event_name}] iter={iteration}: portfolio sync failed ({e}) "
+                            f"and last successful sync is "
+                            f"{'unavailable' if sync_age is None else f'{sync_age:.0f}s old'} "
+                            f"(halt threshold {SYNC_STALENESS_HALT_SECONDS:.0f}s); halting tick"
+                        )
+                        break
+                    logger.warning(
+                        f"[{self.event_name}] iter={iteration}: portfolio sync failed ({e}); "
+                        f"planning on last-synced base ({sync_age:.0f}s old) + "
+                        f"confirmed-fill overlay ({len(self._overlay_ledger)} entries)"
+                    )
+                    effective_portfolio = self._build_effective_portfolio()
 
             if self._integrity_state.frozen:
                 logger.warning(

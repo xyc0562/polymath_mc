@@ -207,19 +207,52 @@ def fetch_musk_events(
     logger.info("Fetching Musk tweet events from Gamma API...")
 
     events = []
-    params = {
+    # Gamma's /events defaults changed post-V2: without an explicit closed
+    # filter + ordering it returns old/unrelated tag-972 events first and
+    # settled Musk weeklies never appear within one page. Request newest
+    # settled events first and paginate.
+    page_limit = 300
+    base_params = {
         "tag_id": MUSK_TWEET_TAG_ID,
-        "limit": 300,  # Fetch more to get all events
+        "limit": page_limit,
+        "order": "endDate",
+        "ascending": "false",
     }
-    # Note: Gamma API doesn't have an 'active' filter, we filter manually below
+    if closed_only:
+        base_params["closed"] = "true"
+    elif active_only:
+        base_params["closed"] = "false"
 
+    data = []
+    offset = 0
+    max_pages = 50
     try:
-        response = requests.get(f"{GAMMA_API_URL}/events", params=params)
-        response.raise_for_status()
-        data = response.json()
+        for _ in range(max_pages):
+            response = requests.get(
+                f"{GAMMA_API_URL}/events",
+                params={**base_params, "offset": offset},
+            )
+            response.raise_for_status()
+            page = response.json()
+            if not isinstance(page, list) or not page:
+                break
+            data.extend(page)
+            # Stop paging once the whole page is older than the requested
+            # window (results are endDate-descending). NOTE: do not stop on
+            # a short page — the server clamps `limit` (e.g. to 100), so
+            # short pages are not a reliable end-of-data signal; advance by
+            # the ACTUAL page size instead.
+            if start_date is not None:
+                page_ends = [e.get("endDate", "") for e in page if e.get("endDate")]
+                if page_ends and all(
+                    end_str[:10] < start_date.isoformat() for end_str in page_ends
+                ):
+                    break
+            offset += len(page)
     except Exception as e:
         logger.error(f"Failed to fetch events: {e}")
-        return []
+        if not data:
+            return []
 
     for event_data in data:
         title = event_data.get("title", "")

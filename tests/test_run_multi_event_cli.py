@@ -1,9 +1,11 @@
 import pytest
+from datetime import date
 from pathlib import Path
 
 from src.algo.musk_tweet_count.forecaster.run_multi_event import (
     build_collateral_config,
     parse_args,
+    parse_counting_dates_from_title,
 )
 from src.algo.musk_tweet_count.kelly.config import CollateralConfig
 
@@ -259,3 +261,46 @@ def test_parse_args_uses_updated_unbox_start_default():
     args = parse_args([])
 
     assert args.unbox_start_hours_to_settlement == 12.0
+
+
+def test_parse_counting_dates_same_year():
+    start, end = parse_counting_dates_from_title(
+        "Elon Musk # of tweets June 2 - June 9, 2026?"
+    )
+
+    assert start == date(2026, 6, 2)
+    assert end == date(2026, 6, 9)
+
+
+def test_parse_counting_dates_cross_year_single_trailing_year():
+    start, end = parse_counting_dates_from_title(
+        "Elon Musk # of tweets December 29 - January 5, 2027?"
+    )
+
+    assert start == date(2026, 12, 29)
+    assert end == date(2027, 1, 5)
+
+
+def test_parse_counting_dates_cross_year_dual_years():
+    start, end = parse_counting_dates_from_title(
+        "Elon Musk # of tweets December 29, 2026 - January 5, 2027?"
+    )
+
+    assert start == date(2026, 12, 29)
+    assert end == date(2027, 1, 5)
+
+
+def test_parse_counting_dates_dual_years_same_year():
+    start, end = parse_counting_dates_from_title(
+        "Elon Musk # of tweets June 2, 2026 - June 9, 2026?"
+    )
+
+    assert start == date(2026, 6, 2)
+    assert end == date(2026, 6, 9)
+
+
+def test_parse_counting_dates_unparseable_returns_none():
+    start, end = parse_counting_dates_from_title("Elon Musk # of tweets in July?")
+
+    assert start is None
+    assert end is None
