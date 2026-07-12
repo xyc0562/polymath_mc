@@ -181,8 +181,12 @@ class MarketConsensusConfig:
     gap_gamma: float = 1.5
     gap_floor: float = 0.80
 
-    # Global minimum model weight after combining alpha terms.
-    min_model_weight: float = 0.30
+    # Global minimum model weight after combining alpha terms — a floor on the
+    # model's blend weight that mainly bites near settlement (low hours
+    # remaining). 0.15 (more late-stage market deference) beat 0.30 on a
+    # full-history backtest: ~37% lower drawdown for ~5% less return.
+    # See research/2026-07_drawdown_and_forecast_bias.md.
+    min_model_weight: float = 0.15
 
     # Quote quality gates for the trusted-bin subset.
     min_coverage_ratio: float = 0.0
@@ -265,6 +269,93 @@ class LateBoundaryTakeProfitConfig:
     trigger_price: float = 0.80
     min_sell_fraction: float = 0.70
     max_sell_fraction: float = 0.90
+
+
+@dataclass
+class MakerConfig:
+    """
+    Passive maker-quote configuration (resting GTD bids).
+
+    Maker mode rests BUY orders on bins the Kelly optimizer already wants
+    to accumulate, at passive prices inside the spread. Adverse selection
+    is controlled by hard gates calibrated on the 2026-07 markout study:
+    quiet activity state only, never in the final hours before settlement,
+    minimum spread, and kill-on-signal cancellation the moment any new
+    post (countable or reply activity) is detected.
+    """
+
+    # "off" = disabled, "shadow" = compute and log quotes without posting,
+    # "live" = post real GTD orders.
+    mode: str = "off"
+
+    # Seconds from placement to exchange-side GTD expiration. This is the
+    # crash-safety floor: no resting order outlives it without any action
+    # from us. Polymarket enforces a ~60s security buffer on GTD
+    # expirations, so effective resting time is roughly ttl - 60s.
+    ttl_seconds: float = 360.0
+
+    # After a kill-switch cancel (new post, gap, dispute, prob jump), do
+    # not re-quote for this long even if gates pass again.
+    requote_cooldown_seconds: float = 120.0
+
+    # Fraction of the event's capital allocation that may rest in open
+    # maker orders at any one time.
+    budget_fraction: float = 0.15
+
+    # Per-quote collateral cap in USD.
+    max_quote_usd: float = 150.0
+
+    # Skip quotes whose collateral would be below this (dust orders are
+    # churn without meaningful capture).
+    min_quote_usd: float = 10.0
+
+    # Only quote bins whose YES spread is at least this wide (capture
+    # must dominate residual toxicity; quiet drift measured ~0.1-0.4c).
+    min_spread: float = 0.03
+
+    # Activity gates: quiet = no post in quiet_window_seconds AND fewer
+    # than storm_count posts in storm_window_seconds.
+    quiet_window_seconds: float = 1200.0
+    storm_window_seconds: float = 1800.0
+    storm_count: int = 5
+
+    # Hard no-quote zone before settlement (final-12h drift measured
+    # 5-10x the earlier-week quiet baseline).
+    no_quote_final_hours: float = 12.0
+
+    # Quotable price zone; outside it books are too degenerate.
+    quote_zone_min: float = 0.05
+    quote_zone_max: float = 0.95
+
+    # Reject quoting when the orderbook snapshot is older than this.
+    max_book_age_seconds: float = 45.0
+
+    # Reject quoting when the activity tracker's last successful poll is
+    # older than this (blind tracker = fail closed).
+    activity_staleness_seconds: float = 90.0
+
+    # Directory for the durable, structured JSONL maker-event log (one file
+    # per event). Empty disables it — the dataclass default is empty so unit
+    # tests stay hermetic; the run entrypoint sets a real directory so live
+    # and shadow runs are recorded by default.
+    event_log_dir: str = ""
+
+    # Forward-markout horizons in seconds: after each (would-)fill, the mid
+    # of the quoted token is sampled at each of these offsets and written to
+    # the event log, so realized adverse selection is measured directly.
+    markout_horizons_seconds: Tuple[float, ...] = (300.0, 900.0, 1800.0)
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in ("shadow", "live")
+
+    @property
+    def shadow(self) -> bool:
+        return self.mode == "shadow"
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("off", "shadow", "live"):
+            raise ValueError(f"MakerConfig.mode must be off/shadow/live, got {self.mode!r}")
 
 
 @dataclass
@@ -375,6 +466,9 @@ class KellyConfig:
     # Late-boundary majority YES take-profit guard
     late_boundary_take_profit: LateBoundaryTakeProfitConfig = field(default_factory=LateBoundaryTakeProfitConfig)
 
+    # Passive maker quoting (resting GTD bids)
+    maker: MakerConfig = field(default_factory=MakerConfig)
+
     # Late-stage same-bin rotation path for boxed inventory.
     use_unbox_rotations: bool = False
     unbox_start_hours_to_settlement: float = 12.0
@@ -406,6 +500,7 @@ class KellyConfig:
         robust_kelly_data = data.pop("robust_kelly", {})
         market_buy_guard_data = data.pop("market_buy_guard", {})
         late_boundary_take_profit_data = data.pop("late_boundary_take_profit", {})
+        maker_data = data.pop("maker", {})
 
         # Backward compatibility: convert old c_bin_max (absolute) to c_bin_max_ratio
         if "c_bin_max" in collateral_data and "c_bin_max_ratio" not in collateral_data:
@@ -439,6 +534,7 @@ class KellyConfig:
             robust_kelly=RobustKellyConfig(**robust_kelly_data),
             market_buy_guard=MarketBuyGuardConfig(**market_buy_guard_data),
             late_boundary_take_profit=LateBoundaryTakeProfitConfig(**late_boundary_take_profit_data),
+            maker=MakerConfig(**maker_data),
             **data,
         )
 

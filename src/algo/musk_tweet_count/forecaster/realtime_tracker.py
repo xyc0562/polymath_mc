@@ -48,6 +48,16 @@ class RealtimePollResult:
     events: List[TweetEvent]
     gap_detected: bool = False
     newest_timestamp: Optional[datetime] = None
+    # Non-countable activity (Musk's replies to OTHER accounts). These do
+    # NOT count toward settlement and must never enter the EventStore —
+    # but they prove he is at the keyboard, which makes them a leading
+    # indicator for countable posts (session-state covariate). Logged for
+    # the session-model study; consumers may ignore this field.
+    activity_events: List[TweetEvent] = None
+
+    def __post_init__(self):
+        if self.activity_events is None:
+            self.activity_events = []
 
 
 class RealtimeTweetTracker:
@@ -189,26 +199,27 @@ class RealtimeTweetTracker:
             return timestamp.replace(tzinfo=timezone.utc)
         return timestamp
 
-    def _tweet_to_event(self, tweet) -> Optional[TweetEvent]:
-        created_at = getattr(tweet, "created_at_datetime", None)
-        if created_at is None:
-            return None
-
-        # Resolution rule (per market terms): replies do NOT count toward
-        # settlement UNLESS Musk is replying to his own thread. The
-        # "Replies" timeline we poll is a superset that includes replies
-        # to other accounts — emitting those would inflate the provisional
-        # count during reply sessions, exactly when it matters most. Keep
-        # top-level posts/retweets/quotes and self-replies; drop replies
-        # to others; drop replies whose target is unknown (a missed
-        # self-reply costs minutes until the next authoritative sync, a
-        # phantom count causes wrong trades).
+    @staticmethod
+    def _is_countable(tweet) -> bool:
+        """Resolution rule (per market terms): replies do NOT count toward
+        settlement UNLESS Musk is replying to his own thread. The
+        "Replies" timeline we poll is a superset that includes replies to
+        other accounts — counting those would inflate the provisional
+        count during reply sessions, exactly when it matters most. Keep
+        top-level posts/retweets/quotes and self-replies; treat replies
+        whose target is unknown as non-countable (a missed self-reply
+        costs minutes until the next authoritative sync, a phantom count
+        causes wrong trades).
+        """
         legacy = getattr(tweet, "_legacy", None) or {}
         reply_to_user = legacy.get("in_reply_to_user_id_str")
         if reply_to_user is not None:
-            if str(reply_to_user) != MUSK_USER_ID:
-                return None
-        elif legacy.get("in_reply_to_status_id_str") is not None:
+            return str(reply_to_user) == MUSK_USER_ID
+        return legacy.get("in_reply_to_status_id_str") is None
+
+    def _tweet_to_event(self, tweet) -> Optional[TweetEvent]:
+        created_at = getattr(tweet, "created_at_datetime", None)
+        if created_at is None:
             return None
 
         event_type = "retweet" if getattr(tweet, "retweeted_tweet", None) is not None else "tweet"
@@ -307,6 +318,7 @@ class RealtimeTweetTracker:
                 cutoff = self._watermark - timedelta(seconds=self.late_tweet_grace_seconds)
 
             events: List[TweetEvent] = []
+            activity_events: List[TweetEvent] = []
             for tweet in tweets:
                 event = self._tweet_to_event(tweet)
                 if event is None:
@@ -318,7 +330,20 @@ class RealtimeTweetTracker:
 
                 if event.event_id:
                     self._remember_id(event.event_id)
-                events.append(event)
+                if self._is_countable(tweet):
+                    events.append(event)
+                else:
+                    # Non-countable reply to another account: never enters
+                    # the count, but is a live session-state signal.
+                    activity_events.append(event)
+
+            if activity_events:
+                logger.info(
+                    "[ACTIVITY] %d non-countable repl%s detected (session signal), newest=%s",
+                    len(activity_events),
+                    "y" if len(activity_events) == 1 else "ies",
+                    activity_events[-1].timestamp.isoformat(),
+                )
 
             if self._watermark is None or newest_timestamp > self._watermark:
                 self._watermark = newest_timestamp
@@ -327,7 +352,11 @@ class RealtimeTweetTracker:
             self._backoff_until = None
             self._last_cookie_error = None
             self._last_cookie_error_label = None
-            return RealtimePollResult(events=events, newest_timestamp=newest_timestamp)
+            return RealtimePollResult(
+                events=events,
+                newest_timestamp=newest_timestamp,
+                activity_events=activity_events,
+            )
 
         except Exception as exc:
             self._consecutive_errors += 1

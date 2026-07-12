@@ -16,14 +16,14 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
 ET = ZoneInfo("America/New_York")
 
 
-def _make_event_info(settlement_date: date) -> EventInfo:
+def _make_event_info(settlement_date: date, bins=None) -> EventInfo:
     return EventInfo(
         event_id="123",
         title="Elon Musk # of tweets test",
         short_name="Test Event",
         settlement_date=settlement_date,
         market_start_date=settlement_date - timedelta(days=7),
-        bins=[],
+        bins=bins if bins is not None else [],
     )
 
 
@@ -189,9 +189,11 @@ def test_fetch_all_positions_paginates(monkeypatch):
 # ---------- settlement P&L: settled-guard + posts fallback + return value ----------
 
 
-def _settlement_stub(now_offset_days: int, trackings_count, posts_count=None):
+def _settlement_stub(now_offset_days: int, trackings_count, posts_count=None,
+                     resolution_bin=None):
     """Build a stub manager whose 'now' is settlement_date + offset."""
-    calls = {"trackings": 0, "posts": 0, "breakdown": 0}
+    calls = {"trackings": 0, "posts": 0, "resolution": 0, "breakdown": 0,
+             "last_count": None}
 
     async def get_authoritative_count(event_info):
         calls["trackings"] += 1
@@ -201,14 +203,20 @@ def _settlement_stub(now_offset_days: int, trackings_count, posts_count=None):
         calls["posts"] += 1
         return posts_count
 
+    def _winning_bin_from_resolution(event_info):
+        calls["resolution"] += 1
+        return resolution_bin
+
     def _compute_settlement_pnl_breakdown(event_info, bot, actual_count):
         calls["breakdown"] += 1
+        calls["last_count"] = actual_count
         return -123.45, []
 
     stub = SimpleNamespace(
         _tz=ET,
         get_authoritative_count=get_authoritative_count,
         compute_count_from_posts=compute_count_from_posts,
+        _winning_bin_from_resolution=_winning_bin_from_resolution,
         _compute_settlement_pnl_breakdown=_compute_settlement_pnl_breakdown,
         _fmt_usd=lambda v: f"${v:.2f}",
         _calls=calls,
@@ -230,9 +238,10 @@ def test_settlement_pnl_skipped_before_settlement():
     assert stub._calls["trackings"] == 0
 
 
-def test_settlement_pnl_uses_trackings_count_when_available():
+def test_settlement_pnl_falls_back_to_trackings_when_unresolved():
+    # Market not yet marked resolved on Gamma (UMA lag) -> use official count.
     yesterday = datetime.now(ET).date() - timedelta(days=1)
-    stub = _settlement_stub(0, trackings_count=222)
+    stub = _settlement_stub(0, trackings_count=222, resolution_bin=None)
     event_info = _make_event_info(yesterday)
 
     result = asyncio.run(
@@ -240,6 +249,7 @@ def test_settlement_pnl_uses_trackings_count_when_available():
     )
 
     assert result == -123.45
+    assert stub._calls["resolution"] == 1  # tried first
     assert stub._calls["posts"] == 0
 
 
@@ -256,9 +266,37 @@ def test_settlement_pnl_falls_back_to_posts_store():
     assert stub._calls["posts"] == 1
 
 
-def test_settlement_pnl_skipped_when_no_usable_count():
+def test_settlement_pnl_prefers_market_resolution():
+    # Market resolution is the primary authority: even when trackings has a
+    # count, the resolved winning bin is used and the count sources are not
+    # consulted. The winning bin drives the count fed to breakdown.
     yesterday = datetime.now(ET).date() - timedelta(days=1)
-    stub = _settlement_stub(0, trackings_count=None, posts_count=0)
+    stub = _settlement_stub(0, trackings_count=999, posts_count=500,
+                            resolution_bin=2)
+    bins = [
+        {"lower_bound": 0, "upper_bound": 19},
+        {"lower_bound": 20, "upper_bound": 39},
+        {"lower_bound": 40, "upper_bound": 59},  # winning bin -> count 40
+    ]
+    event_info = _make_event_info(yesterday, bins=bins)
+
+    result = asyncio.run(
+        MultiEventManager._log_settlement_pnl(stub, "123", event_info, None, 3000.0)
+    )
+
+    assert result == -123.45
+    assert stub._calls["resolution"] == 1
+    assert stub._calls["trackings"] == 0  # not consulted; resolution won
+    assert stub._calls["posts"] == 0
+    # Count handed to breakdown must land inside the winning bin's range.
+    assert 40 <= stub._calls["last_count"] <= 59
+
+
+def test_settlement_pnl_skipped_when_all_sources_unavailable():
+    # Trackings + posts empty AND market unresolved -> still skips cleanly.
+    yesterday = datetime.now(ET).date() - timedelta(days=1)
+    stub = _settlement_stub(0, trackings_count=None, posts_count=0,
+                            resolution_bin=None)
     event_info = _make_event_info(yesterday)
 
     result = asyncio.run(
@@ -266,4 +304,27 @@ def test_settlement_pnl_skipped_when_no_usable_count():
     )
 
     assert result is None
+    assert stub._calls["resolution"] == 1
     assert stub._calls["breakdown"] == 0
+
+
+def test_winning_bin_from_markets_parses_gamma_resolution():
+    # Gamma encodes clobTokenIds/outcomePrices as JSON strings; winner YES ~1.0.
+    bins = [
+        {"token_id": "tokA"},
+        {"token_id": "tokB"},
+        {"token_id": "tokC"},
+    ]
+    markets = [
+        {"clobTokenIds": '["tokA","tokA_no"]', "outcomePrices": '["0", "1"]'},
+        {"clobTokenIds": '["tokB","tokB_no"]', "outcomePrices": '["1", "0"]'},
+        {"clobTokenIds": '["tokC","tokC_no"]', "outcomePrices": '["0", "1"]'},
+    ]
+    assert MultiEventManager._winning_bin_from_markets(markets, bins) == 1
+
+    # Unresolved market (mid prices) -> no winner.
+    open_markets = [
+        {"clobTokenIds": '["tokA","tokA_no"]', "outcomePrices": '["0.4", "0.6"]'},
+        {"clobTokenIds": '["tokB","tokB_no"]', "outcomePrices": '["0.5", "0.5"]'},
+    ]
+    assert MultiEventManager._winning_bin_from_markets(open_markets, bins) is None
