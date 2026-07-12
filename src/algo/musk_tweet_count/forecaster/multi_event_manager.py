@@ -15,6 +15,7 @@ Key features:
 import asyncio
 import logging
 import traceback
+import json
 from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta, timezone
@@ -27,6 +28,8 @@ from py_clob_client_v2.client import ClobClient
 
 # Polymarket Data API for fetching positions
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+# Gamma API for market metadata + post-settlement resolution (outcomePrices).
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
 
 from .config import ForecasterConfig
 from .trading_bot import GASKellyTradingBot, TradingBotConfig
@@ -34,6 +37,7 @@ from .data import EventStore, ContractDayUtils, XTrackerClient as PostsXTrackerC
 from .realtime_tracker import RealtimeTweetTracker, RealtimePollResult
 from ..notifications import SlackNotifier
 from ..musk_tweet_count import XTrackerClient as TrackingsXTrackerClient
+from ..kelly.activity_state import ActivityStateTracker
 from ..kelly.config import KellyConfig, EventTradingRulesConfig
 from ..kelly.capital_pool import CapitalPool, CapitalPoolConfig
 from ..kelly.user_stream import UserStreamClient, FillEvent, PendingOrder, OrderStatus
@@ -440,6 +444,17 @@ class MultiEventManager:
                 fetch_count=self.config.realtime_fetch_count,
                 late_tweet_grace_seconds=self.config.realtime_late_tweet_grace_seconds,
             )
+
+        # Shared activity-state tracker for maker-quote gating, fed by the
+        # realtime tracker's dual stream (countable posts + reply activity).
+        # Seeded conservatively at "now": quoting cannot start until a full
+        # quiet window has been observed after process start.
+        maker_cfg = self.kelly_config.maker
+        self.activity_tracker = ActivityStateTracker(
+            quiet_window_seconds=maker_cfg.quiet_window_seconds,
+            storm_window_seconds=maker_cfg.storm_window_seconds,
+            storm_count=maker_cfg.storm_count,
+        )
 
         # Global UserStreamClient for fill confirmations (shared across all bots)
         # This is more efficient than one UserStreamClient per bot since
@@ -2024,12 +2039,44 @@ class MultiEventManager:
 
         return inserted, affected_days, rollover_outcome
 
+    def _kill_maker_quotes(self, reason: str) -> None:
+        """Kill-on-signal: cancel all resting maker quotes across events.
+
+        Fires the moment the realtime tracker reports any new post
+        (countable or reply activity) or a gap — before ticks are queued,
+        so quotes die before the model even reprices.
+        """
+        for active in list(self._active_events.values()):
+            kelly_bot = getattr(active.bot, "kelly_bot", None)
+            quote_manager = getattr(kelly_bot, "quote_manager", None) if kelly_bot else None
+            if quote_manager is None:
+                continue
+            try:
+                quote_manager.kill(reason)
+            except Exception as e:
+                logger.error(
+                    f"[{active.info.short_name}] maker kill ({reason}) failed: {e}",
+                    exc_info=True,
+                )
+
     async def poll_realtime_tracker(self) -> RealtimePollResult:
         """Poll the realtime tracker once and apply any provisional events."""
         if not self.realtime_tracker:
             return RealtimePollResult(events=[])
 
         result = await self.realtime_tracker.poll_once()
+
+        # Feed the activity tracker (maker gating) from the dual stream and
+        # kill resting quotes on any signal, before anything else runs.
+        if self.realtime_tracker.consecutive_errors == 0:
+            self.activity_tracker.note_poll()
+        activity_events = getattr(result, "activity_events", None) or []
+        for event in list(result.events) + list(activity_events):
+            self.activity_tracker.note_event(event.timestamp.timestamp())
+        if result.gap_detected:
+            self._kill_maker_quotes("realtime_gap")
+        elif result.events or activity_events:
+            self._kill_maker_quotes("realtime_post")
 
         cookie_err = self.realtime_tracker.last_cookie_error
         if cookie_err:
@@ -2472,6 +2519,67 @@ class MultiEventManager:
             current_date += timedelta(days=1)
 
         return total
+
+    @staticmethod
+    def _winning_bin_from_markets(
+        markets: List[dict], bins: List[dict]
+    ) -> Optional[int]:
+        """Return the index of the bin whose YES token resolved to a winner.
+
+        Pure parsing of Gamma market dicts: a resolved market carries
+        ``outcomePrices`` where the YES leg is ~1.0 for the winning bin.
+        Bins are matched to markets by YES clob token id. Returns None if
+        nothing has resolved (event still open) or bins can't be matched.
+        """
+        resolved: Dict[str, float] = {}  # yes clob token id -> resolved price
+        for m in markets:
+            toks = m.get("clobTokenIds")
+            if isinstance(toks, str):
+                try:
+                    toks = json.loads(toks)
+                except (ValueError, TypeError):
+                    toks = []
+            prices = m.get("outcomePrices")
+            if isinstance(prices, str):
+                try:
+                    prices = json.loads(prices)
+                except (ValueError, TypeError):
+                    prices = []
+            if toks and prices:
+                try:
+                    resolved[str(toks[0])] = float(prices[0])
+                except (ValueError, TypeError, IndexError):
+                    pass
+
+        for i, bin_def in enumerate(bins):
+            token = str(bin_def.get("token_id") or "")
+            if token and resolved.get(token, 0.0) > 0.99:
+                return i
+        return None
+
+    def _winning_bin_from_resolution(self, event_info: EventInfo) -> Optional[int]:
+        """Fetch the event's resolved outcome from Gamma and return the winning
+        bin index, or None if unresolved/unreachable.
+
+        This is the authoritative settlement source: it is exactly what pays
+        out, and unlike the XTracker tracking period it does not disappear
+        after settlement. Used only as a fallback for settlement P&L when the
+        count-based sources are unavailable.
+        """
+        try:
+            resp = requests.get(
+                f"{GAMMA_API_URL}/events/{event_info.event_id}", timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(
+                f"[EVENT][SETTLEMENT_PNL] market resolution fetch failed for "
+                f"{event_info.short_name}: {e}"
+            )
+            return None
+        markets = data.get("markets", []) if isinstance(data, dict) else []
+        return self._winning_bin_from_markets(markets, event_info.bins)
 
     async def validate_counts_for_event(
         self,
@@ -2971,6 +3079,11 @@ class MultiEventManager:
         if bot.kelly_bot and bot.kelly_bot.portfolio is not None:
             bot.kelly_bot.portfolio.set_external_capital_limit(allocated_capital)
 
+        # Inject the shared activity tracker into the maker quote manager;
+        # without it the maker gates fail closed and nothing is quoted.
+        if bot.kelly_bot and bot.kelly_bot.quote_manager is not None:
+            bot.kelly_bot.quote_manager.activity_tracker = self.activity_tracker
+
         if (
             bot.kelly_bot and
             bot.kelly_bot.kelly_executor is not None
@@ -3111,34 +3224,53 @@ class MultiEventManager:
             )
             return None
 
-        count_source = "trackings"
-        try:
-            actual_count, _ = await self.get_authoritative_count(event_info)
-        except Exception as e:
-            logger.warning(
-                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
-                f"trackings count fetch failed ({e}); falling back to posts store"
-            )
-            actual_count = None
+        actual_count = None
+        count_source = None
 
-        if actual_count is None:
-            # XTracker drops the tracking period around settlement time —
-            # fall back to the count derived from the shared posts store.
+        # Primary authority: the market's own resolution. It is exactly what
+        # pays out, so it is the ground truth for the winning bin — and unlike
+        # the XTracker tracking period it stays available after settlement.
+        # Any count inside the winning bin drives the same payoff in
+        # _compute_settlement_pnl_breakdown.
+        win_bin = self._winning_bin_from_resolution(event_info)
+        if win_bin is not None and 0 <= win_bin < len(event_info.bins):
+            lower = event_info.bins[win_bin].get("lower_bound")
+            if lower is not None:
+                count_source = "market_resolution"
+                actual_count = int(lower)
+
+        # Fallbacks for when the market has not been marked resolved on Gamma
+        # yet (UMA lag right at settlement) or Gamma is unreachable: the
+        # official trackings count, then the shared posts store.
+        if actual_count is None or actual_count <= 0:
+            count_source = "trackings"
+            try:
+                actual_count, _ = await self.get_authoritative_count(event_info)
+            except Exception as e:
+                logger.warning(
+                    f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                    f"trackings count fetch failed ({e}); falling back to posts store"
+                )
+                actual_count = None
+
+        if actual_count is None or actual_count <= 0:
             count_source = "posts_store"
             try:
                 actual_count = self.compute_count_from_posts(event_info)
             except Exception as e:
                 logger.warning(
                     f"[EVENT][SETTLEMENT_PNL] event={event_id} "
-                    f"skipped: posts-store fallback failed: {e}"
+                    f"posts-store fallback failed: {e}"
                 )
-                return None
-            if actual_count <= 0:
-                logger.warning(
-                    f"[EVENT][SETTLEMENT_PNL] event={event_id} "
-                    f"skipped: no usable count (trackings unavailable, posts store empty)"
-                )
-                return None
+                actual_count = None
+
+        if actual_count is None or actual_count <= 0:
+            logger.warning(
+                f"[EVENT][SETTLEMENT_PNL] event={event_id} "
+                f"skipped: no usable count (market unresolved, trackings + "
+                f"posts store empty)"
+            )
+            return None
 
         try:
             settlement_pnl, breakdown = self._compute_settlement_pnl_breakdown(

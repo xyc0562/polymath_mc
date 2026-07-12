@@ -182,6 +182,7 @@ def _build_base_configs_from_yaml(
         "unbox_multi_bin_net_utility_cap": kelly_config.unbox_multi_bin_net_utility_cap,
         "unbox_turnover_penalty": kelly_config.unbox_turnover_penalty,
         "unbox_bin_cooldown_seconds": kelly_config.unbox_bin_cooldown_seconds,
+        "maker_mode": kelly_config.maker.mode,
         "consensus_mode": _consensus_mode_from_config(kelly_config.market_consensus),
         "consensus_time_tau": kelly_config.market_consensus.time_tau,
         "consensus_gap_scale": kelly_config.market_consensus.gap_scale,
@@ -378,7 +379,7 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 MUSK_TWEET_TAG_ID = 972
 
 
-def setup_logging(verbose: bool = False) -> None:
+def setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> None:
     """Configure logging with compact format."""
     level = logging.DEBUG if verbose else logging.INFO
 
@@ -414,6 +415,12 @@ def setup_logging(verbose: bool = False) -> None:
 
     logging.root.handlers = []
     logging.root.addHandler(handler)
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(CompactFormatter())
+        logging.root.addHandler(file_handler)
+
     logging.root.setLevel(level)
 
     # Reduce noise from libraries
@@ -1063,6 +1070,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Fractional Kelly multiplier (default: from YAML config)",
     )
     parser.add_argument(
+        "--maker-mode",
+        choices=["off", "shadow", "live"],
+        default=cli_defaults.get("maker_mode", "off"),
+        help="Passive maker quoting: off, shadow (log quotes without posting), "
+             "or live (rest real GTD bids). Default: from YAML config, else off",
+    )
+    parser.add_argument(
+        "--maker-event-dir",
+        default=cli_defaults.get("maker_event_dir", "data/maker_events"),
+        help="Directory for the structured JSONL maker-event log (quotes, "
+             "would-fills, forward markout, gate changes). One file per event. "
+             "Empty string disables. Default: data/maker_events",
+    )
+    parser.add_argument(
         "--kelly-fraction",
         type=float,
         default=cli_defaults.get("kelly_fraction", KellyConfig.kelly_fraction),
@@ -1641,6 +1662,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Enable verbose logging",
     )
     parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Also write the full run log to this file (stdout is otherwise "
+             "the only sink). Recommended for shadow/live maker runs.",
+    )
+    parser.add_argument(
         "--list-events",
         action="store_true",
         help="List all active Musk tweet events with IDs and exit",
@@ -1655,7 +1682,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 async def main() -> None:
     """Main entry point."""
     args = parse_args()
-    setup_logging(args.verbose)
+    setup_logging(args.verbose, args.log_file)
     load_dotenv()
     manager: Optional[MultiEventManager] = None
     slack_notifier: Optional[SlackNotifier] = None
@@ -1815,7 +1842,15 @@ async def main() -> None:
         unbox_multi_bin_net_utility_cap=args.unbox_multi_bin_net_utility_cap,
         unbox_turnover_penalty=args.unbox_turnover_penalty,
         unbox_bin_cooldown_seconds=args.unbox_bin_cooldown_seconds,
+        maker=replace(
+            base_kelly_config.maker,
+            mode=args.maker_mode,
+            event_log_dir=args.maker_event_dir,
+        ),
     )
+
+    if kelly_config.maker.enabled:
+        logger.info(f"Maker quoting: mode={kelly_config.maker.mode}")
 
     # Kelly collateral cap is the source of truth for both Kelly sizing and
     # the manager's per-event allocation limit.

@@ -701,6 +701,107 @@ class OrderExecutor:
             logger.error(f"[{self.event_name}] Cancel failed: {e}")
             return False
 
+    def cancel_orders(self, order_ids: List[str]) -> bool:
+        """Batch-cancel open orders. Failure is tolerable: GTD expiry is
+        the safety floor, so a failed cancel only delays removal."""
+        if not order_ids:
+            return True
+        if self.dry_run:
+            logger.info(f"[{self.event_name}][DRY RUN] Would cancel {len(order_ids)} order(s)")
+            return True
+
+        try:
+            self.client.cancel_orders(list(order_ids))
+            logger.info(f"[{self.event_name}] Cancelled {len(order_ids)} order(s)")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.event_name}] Batch cancel failed: {e}")
+            return False
+
+    def get_open_orders(self) -> Optional[List[dict]]:
+        """Fetch all open orders for the account.
+
+        Returns None on API error (callers must fail closed), [] when
+        there are genuinely no open orders.
+        """
+        try:
+            return self.client.get_open_orders()
+        except Exception as e:
+            logger.error(f"[{self.event_name}] get_open_orders failed: {e}")
+            return None
+
+    def place_gtd_order(
+        self,
+        token_id: str,
+        side: str,  # "BUY" or "SELL"
+        price: float,
+        size: float,
+        ttl_seconds: float,
+    ) -> Optional[dict]:
+        """
+        Place a resting GTD (good-till-date) limit order.
+
+        The exchange-side expiration is the crash-safety floor for maker
+        quotes: the order dies at now + ttl_seconds with no action from
+        us. Polymarket enforces a ~60s security buffer on GTD
+        expirations, so effective resting time is roughly ttl - 60s.
+        """
+        if self.dry_run:
+            logger.info(
+                f"[{self.event_name}][DRY RUN] Would place GTD {side}: "
+                f"token={token_id[:16]}..., price={price:.4f}, size={size:.2f}, ttl={ttl_seconds:.0f}s"
+            )
+            # Unique id: the QuoteManager registry keys on order_id
+            return {"orderID": f"dry_run_gtd_{time.time_ns()}", "status": "simulated"}
+
+        if ORDER_MANAGER_BREAKER.is_open():
+            ORDER_MANAGER_BREAKER.note_skip(self.event_name)
+            self._last_error = "order manager not ready (breaker open)"
+            return None
+
+        try:
+            rounded_size = math.floor(size)
+
+            if price <= 0 or price >= 1:
+                logger.warning(f"[{self.event_name}] Invalid GTD price: {price:.4f}")
+                return None
+            if side == "SELL":
+                if rounded_size < 1:
+                    logger.warning(f"[{self.event_name}] GTD sell size {rounded_size} below minimum 1 share")
+                    return None
+            else:
+                if rounded_size < MIN_ORDER_SIZE and rounded_size * price < MIN_ORDER_VALUE_USD:
+                    logger.warning(
+                        f"[{self.event_name}] GTD buy size {rounded_size} below {MIN_ORDER_SIZE} shares "
+                        f"and value ${rounded_size * price:.2f} below ${MIN_ORDER_VALUE_USD}"
+                    )
+                    return None
+
+            expiration = int(time.time() + ttl_seconds)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=rounded_size,
+                side=side,
+                expiration=expiration,
+            )
+            signed_order = self.client.create_order(order_args)
+
+            response = self._submit_with_not_ready_retry(
+                lambda: self.client.post_order(signed_order, order_type=OrderType.GTD)
+            )
+
+            logger.info(
+                f"[{self.event_name}][MAKER] GTD order placed: {side} {rounded_size:.0f} @ {price:.4f}, "
+                f"expires_in={ttl_seconds:.0f}s, order_id={response.get('orderID', 'unknown')}"
+            )
+            return response
+
+        except Exception as e:
+            logger.error(f"[{self.event_name}] GTD order failed: {e}")
+            self._last_error = str(e)
+            return None
+
     def place_batch_orders(
         self,
         orders: List[dict],
@@ -1110,6 +1211,14 @@ class KellyExecutor:
         self._unbox_cycle_id: int = 0
         self._unbox_cycle_noted: bool = False
         self._late_boundary_take_profit_context: Optional[LateBoundaryTakeProfitContext] = None
+
+        # Maker-quote integration (set by QuoteManager.attach). The
+        # collateral provider returns USDC locked in open resting orders
+        # so the taker path cannot double-spend it; the pre-trade hook
+        # cancels same-bin resting quotes before any taker submission to
+        # prevent self-trades.
+        self.maker_collateral_provider: Optional[Callable[[], float]] = None
+        self.maker_pre_trade_hook: Optional[Callable[[int], Any]] = None
 
     def _check_rate_limit(self) -> bool:
         """
@@ -2291,6 +2400,19 @@ class KellyExecutor:
                 )
                 return self.api_base_portfolio._copy()
 
+        # USDC resting in open maker orders is locked at the exchange and
+        # must not be spendable by the taker path. Clamp at zero: a fill
+        # that reached the overlay but not yet the maker registry briefly
+        # double-counts, which only errs toward spending less.
+        if self.maker_collateral_provider is not None:
+            try:
+                locked = float(self.maker_collateral_provider())
+            except Exception as e:
+                logger.error(f"[{self.event_name}] maker collateral provider failed: {e}")
+                locked = 0.0
+            if locked > 0:
+                effective.capital = max(0.0, effective.capital - locked)
+
         return effective
 
     def _integrate_api_sync(self) -> Portfolio:
@@ -2459,6 +2581,19 @@ class KellyExecutor:
             token_id = self._get_token_id_for_action(trade)
             if not token_id:
                 continue
+
+            # Self-trade guard: cancel any resting maker quote on this bin
+            # before a taker order can cross it (a taker SELL would hit our
+            # own resting bid; an unbox BUY can mint against the opposite
+            # side's resting bid).
+            if self.maker_pre_trade_hook is not None:
+                try:
+                    await self.maker_pre_trade_hook(trade.bin_index)
+                except Exception as e:
+                    logger.error(
+                        f"[{self.event_name}] maker pre-trade hook failed on bin "
+                        f"{trade.bin_index}: {e}"
+                    )
 
             side = "BUY" if trade.action in (TradeAction.BUY_YES, TradeAction.BUY_NO) else "SELL"
             requested_limit = trade.limit_price if trade.limit_price > 0 else trade.price

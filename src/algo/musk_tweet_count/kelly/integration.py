@@ -33,6 +33,7 @@ from .executor import KellyExecutor, OrderExecutor, ExecutionResult, TickResult
 from .websocket_client import OrderbookManager, OrderbookWebSocket, WebSocketConfig
 from .kelly_math import identify_dead_bins, renormalize_probabilities
 from .market_signals import compute_market_consensus_blend
+from .quote_manager import QuoteManager
 from .take_profit import LateBoundaryTakeProfitContext
 from .user_stream import UserStreamClient, FillEvent, PendingOrder
 
@@ -140,6 +141,7 @@ class KellyTradingBot:
         self.portfolio: Optional[Portfolio] = None
         self.kelly_executor: Optional[KellyExecutor] = None
         self.user_stream: Optional[UserStreamClient] = None
+        self.quote_manager: Optional[QuoteManager] = None
 
         # State
         self._running = False
@@ -271,6 +273,26 @@ class KellyTradingBot:
             self.user_stream.on_fill = self._handle_fill
             self.user_stream.on_stale_order = self._handle_stale_order
 
+        # Passive maker quoting (resting GTD bids). The activity tracker
+        # is injected by MultiEventManager after startup; until then the
+        # QuoteManager's gates fail closed and nothing is quoted.
+        if self.config.maker.enabled:
+            self.quote_manager = QuoteManager(
+                maker_config=self.config.maker,
+                kelly_config=self.config,
+                order_executor=self.order_executor,
+                kelly_executor=self.kelly_executor,
+                portfolio=self.portfolio,
+                token_ids=self.bin_token_ids,
+                no_token_ids=self.bin_no_token_ids,
+                event_name=self.event_name,
+                user_stream=self.user_stream,
+            )
+            self.quote_manager.attach()
+            logger.info(
+                f"[{self.event_name}] Maker quoting enabled (mode={self.config.maker.mode})"
+            )
+
         self._setup_complete = True
         logger.info(f"[{self.event_name}] Kelly bot setup complete")
 
@@ -278,6 +300,12 @@ class KellyTradingBot:
         """Shutdown the Kelly trading bot."""
         logger.info(f"[{self.event_name}] Shutting down Kelly bot")
         self._running = False
+
+        if self.quote_manager:
+            try:
+                await self.quote_manager.cancel_all("shutdown")
+            except Exception as e:
+                logger.error(f"[{self.event_name}] Maker cancel-all on shutdown failed: {e}")
 
         if self.kelly_executor:
             self.kelly_executor.stop()
@@ -364,6 +392,11 @@ class KellyTradingBot:
                     f"{max_jump:.4f} >= {self.config.prob_ema_jump_threshold:.4f} "
                     f"(real move, not MC noise)"
                 )
+                # A real model jump means resting quotes are stale — kill
+                # them now rather than waiting for the end-of-tick reconcile.
+                quote_manager = getattr(self, "quote_manager", None)
+                if quote_manager is not None:
+                    quote_manager.kill("prob_jump")
             else:
                 probabilities = [
                     alpha * p_new + (1 - alpha) * p_old
@@ -562,6 +595,21 @@ class KellyTradingBot:
             # Run Kelly optimization tick
             result = await self.kelly_executor.run_tick(hours_to_settlement, verbose=verbose)
 
+            # Maker reconcile runs after the taker path, on the post-trade
+            # portfolio and the books fetched at tick start. A failure here
+            # must never break the taker tick: kill quotes and move on.
+            if self.quote_manager is not None:
+                try:
+                    await self.quote_manager.reconcile(
+                        orderbooks=orderbooks,
+                        hours_to_settlement=hours_to_settlement,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.event_name}] Maker reconcile failed: {e}", exc_info=True
+                    )
+                    self.quote_manager.kill("reconcile_error")
+
             return result
 
     async def run_continuous(
@@ -740,6 +788,9 @@ class KellyTradingBot:
         if self.user_stream:
             status["user_stream"]["connected"] = self.user_stream._ws is not None
             status["user_stream"]["pending_tracked"] = self.user_stream.get_pending_orders_count()
+
+        if self.quote_manager:
+            status["maker"] = self.quote_manager.get_status()
 
         return status
 

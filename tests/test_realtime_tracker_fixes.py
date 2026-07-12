@@ -105,9 +105,10 @@ def test_new_tweet_after_gap_is_detected_incrementally():
     assert tracker.watermark == T0 + timedelta(seconds=1100)
 
 
-def test_reply_to_other_account_is_not_counted():
+def test_reply_to_other_account_is_activity_not_count():
     """Resolution rule: replies only count when Musk replies to his own
-    thread. A reply session aimed at other accounts must emit nothing."""
+    thread. Replies to others must not enter the count — but surface as
+    activity events (session-state signal)."""
     batch = [
         _tweet(10, "top-level"),
         _tweet(20, "reply-other", reply_to_user="12345", reply_to_status="999"),
@@ -119,10 +120,11 @@ def test_reply_to_other_account_is_not_counted():
     result = asyncio.run(tracker.poll_once())
 
     assert [e.event_id for e in result.events] == ["top-level", "self-thread"]
+    assert [e.event_id for e in result.activity_events] == ["reply-other"]
 
 
-def test_reply_with_unknown_target_is_dropped():
-    # in_reply_to_status set but user id missing -> conservative drop
+def test_reply_with_unknown_target_is_activity():
+    # in_reply_to_status set but user id missing -> conservative: not counted
     batch = [_tweet(10, "mystery-reply", reply_to_status="997")]
     client = FakeTwikitClient([batch])
     tracker = _make_tracker(client)
@@ -130,6 +132,19 @@ def test_reply_with_unknown_target_is_dropped():
     result = asyncio.run(tracker.poll_once())
 
     assert result.events == []
+    assert [e.event_id for e in result.activity_events] == ["mystery-reply"]
+
+
+def test_activity_events_are_deduped_across_polls():
+    batch = [_tweet(10, "reply-other", reply_to_user="12345", reply_to_status="999")]
+    client = FakeTwikitClient([batch, list(batch)])
+    tracker = _make_tracker(client)
+
+    first = asyncio.run(tracker.poll_once())
+    second = asyncio.run(tracker.poll_once())
+
+    assert [e.event_id for e in first.activity_events] == ["reply-other"]
+    assert second.activity_events == []
 
 
 def test_tweet_without_legacy_payload_is_kept():

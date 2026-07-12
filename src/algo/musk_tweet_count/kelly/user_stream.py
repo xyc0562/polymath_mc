@@ -58,6 +58,14 @@ class PendingOrder:
     created_at: float = field(default_factory=time.time)
     filled_size: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
+    # Per-order staleness override in seconds. Resting maker (GTD) orders
+    # legitimately outlive the FAK default; set this to TTL + grace so the
+    # stale janitor only fires after exchange-side expiration.
+    stale_after: Optional[float] = None
+    # True for resting (GTD maker) orders: a CONFIRMED partial fill must
+    # not stop tracking, because the remainder is still live on the book
+    # and later fills need to stay attributable.
+    resting: bool = False
     _seen_fills: set = field(default_factory=set, repr=False)  # Dedup keys for partial fills
 
 
@@ -459,91 +467,153 @@ class UserStreamClient:
             logger.debug(f"[UserWS] Unknown event: {data}")
 
     async def _handle_trade_event(self, data: Dict[str, Any]) -> None:
-        """Handle trade fill event."""
+        """Handle trade fill event.
+
+        A trade event describes the TAKER's trade at the top level; when one
+        of OUR resting (maker) orders is on the passive side, our order id
+        and matched portion live in the maker_orders entries. One FillEvent
+        is dispatched per involved order of ours: the taker fill exactly as
+        before, plus one per recognized maker entry.
+        """
         try:
-            order_id = data.get("taker_order_id") or data.get("order_id")
             status_str = data.get("status", "")
+            status = OrderStatus(status_str) if status_str else OrderStatus.MATCHED
+            timestamp = datetime.now(timezone.utc)
 
             # Extract unique match/trade ID for deduplication
             # Polymarket sends id/match_id on trade events
-            match_id = data.get("id") or data.get("match_id") or ""
+            trade_id = data.get("id") or data.get("match_id") or ""
 
-            fill = FillEvent(
-                order_id=order_id,
-                token_id=data.get("asset_id", ""),
-                side=data.get("side", ""),
-                price=float(data.get("price", 0)),
-                size=float(data.get("size", 0)),
-                status=OrderStatus(status_str) if status_str else OrderStatus.MATCHED,
-                timestamp=datetime.now(timezone.utc),
-                match_id=match_id,
-            )
-
-            # Log prominently so fills are visible in logs
-            logger.info(
-                f"[FILL RECEIVED] order={order_id[:16] if order_id else 'N/A'}..., "
-                f"side={fill.side}, size={fill.size:.2f} @ {fill.price:.4f}, "
-                f"status={fill.status.value}, token={fill.token_id[:16] if fill.token_id else 'N/A'}..."
-            )
-
-            # Update pending order
-            # Fill deduplication: same fill arrives multiple times with escalating statuses
-            # (MATCHED -> MINED -> CONFIRMED). We also handle genuine partial fills where
-            # different chunks fill at different times (distinct match_id or size).
-            async with self._pending_lock:
-                if order_id and order_id in self._pending_orders:
-                    pending = self._pending_orders[order_id]
-
-                    # Token ID validation: ensure fill belongs to this order's market
-                    if fill.token_id and pending.token_id and fill.token_id != pending.token_id:
-                        logger.warning(
-                            f"Token mismatch for order {order_id[:16]}...: "
-                            f"fill token={fill.token_id[:16]}... != pending token={pending.token_id[:16]}..."
-                        )
-                        # Still update status but don't count fill size
-                        pending.status = fill.status
-                    else:
-                        # Dedup key: use match_id if available, fall back to (size, price) tuple
-                        if fill.match_id:
-                            dedup_key = fill.match_id
-                        else:
-                            dedup_key = (fill.size, fill.price)
-
-                        if dedup_key not in pending._seen_fills:
-                            # Genuinely new fill — accumulate
-                            pending._seen_fills.add(dedup_key)
-                            pending.filled_size += fill.size
-                            logger.debug(
-                                f"New fill for order {order_id[:16]}...: +{fill.size:.2f} shares "
-                                f"(total filled: {pending.filled_size:.2f}/{pending.size:.2f})"
-                            )
-                        else:
-                            # Status escalation of already-counted fill
-                            logger.debug(
-                                f"Status update for order {order_id[:16]}...: "
-                                f"{pending.status.value} -> {fill.status.value}"
-                            )
-
-                        pending.status = fill.status
-
-                    # Remove if fully filled or terminal status
-                    if (pending.filled_size >= pending.size or
-                        fill.status in (OrderStatus.CONFIRMED, OrderStatus.FAILED)):
-                        del self._pending_orders[order_id]
-
-            # Callback
-            if self.on_fill:
-                self._fill_count += 1
-                logger.debug(f"[FILL ROUTING] Invoking on_fill callback for order {order_id[:16] if order_id else 'N/A'}...")
-                self.on_fill(fill)
-            else:
-                logger.warning(
-                    f"[FILL DROPPED] No on_fill callback set! Fill for order {order_id[:16] if order_id else 'N/A'}... "
-                    f"will not be processed. This indicates a configuration issue."
+            taker_order_id = data.get("taker_order_id") or data.get("order_id")
+            fills = [
+                FillEvent(
+                    order_id=taker_order_id,
+                    token_id=data.get("asset_id", ""),
+                    side=data.get("side", ""),
+                    price=float(data.get("price", 0)),
+                    size=float(data.get("size", 0)),
+                    status=status,
+                    timestamp=timestamp,
+                    match_id=trade_id,
                 )
+            ]
+
+            # Maker-side attribution: the top-level size/price describe the
+            # taker's trade (possibly spanning several makers). Our portion
+            # is the maker entry's matched amount. Ownership check = the
+            # order is tracked as pending; counterparty entries are skipped.
+            for entry in data.get("maker_orders") or []:
+                if not isinstance(entry, dict):
+                    continue
+                maker_order_id = entry.get("order_id") or ""
+                if not maker_order_id or maker_order_id == taker_order_id:
+                    continue
+                async with self._pending_lock:
+                    pending = self._pending_orders.get(maker_order_id)
+                if pending is None:
+                    logger.debug(
+                        f"Skipping counterparty maker entry {maker_order_id[:16]}..."
+                    )
+                    continue
+                matched = float(entry.get("matched_amount") or entry.get("size") or 0)
+                if matched <= 0:
+                    logger.warning(
+                        f"Maker entry for our order {maker_order_id[:16]}... has no "
+                        f"matched amount; skipping (payload keys: {sorted(entry.keys())})"
+                    )
+                    continue
+                fills.append(
+                    FillEvent(
+                        order_id=maker_order_id,
+                        token_id=entry.get("asset_id") or pending.token_id,
+                        side=pending.side,
+                        price=float(entry.get("price") or data.get("price") or 0),
+                        size=matched,
+                        status=status,
+                        timestamp=timestamp,
+                        # The trade id is shared by every fill in this trade;
+                        # suffix our order id so two of our orders filled by
+                        # one taker sweep don't dedup each other away.
+                        match_id=f"{trade_id}:{maker_order_id}" if trade_id else "",
+                    )
+                )
+
+            for fill in fills:
+                await self._dispatch_fill(fill)
 
         except Exception as e:
             logger.error(f"Error handling trade event: {e}", exc_info=True)
+
+    async def _dispatch_fill(self, fill: FillEvent) -> None:
+        """Update pending-order tracking for a fill and invoke the callback."""
+        order_id = fill.order_id
+
+        # Log prominently so fills are visible in logs
+        logger.info(
+            f"[FILL RECEIVED] order={order_id[:16] if order_id else 'N/A'}..., "
+            f"side={fill.side}, size={fill.size:.2f} @ {fill.price:.4f}, "
+            f"status={fill.status.value}, token={fill.token_id[:16] if fill.token_id else 'N/A'}..."
+        )
+
+        # Update pending order
+        # Fill deduplication: same fill arrives multiple times with escalating statuses
+        # (MATCHED -> MINED -> CONFIRMED). We also handle genuine partial fills where
+        # different chunks fill at different times (distinct match_id or size).
+        async with self._pending_lock:
+            if order_id and order_id in self._pending_orders:
+                pending = self._pending_orders[order_id]
+
+                # Token ID validation: ensure fill belongs to this order's market
+                if fill.token_id and pending.token_id and fill.token_id != pending.token_id:
+                    logger.warning(
+                        f"Token mismatch for order {order_id[:16]}...: "
+                        f"fill token={fill.token_id[:16]}... != pending token={pending.token_id[:16]}..."
+                    )
+                    # Still update status but don't count fill size
+                    pending.status = fill.status
+                else:
+                    # Dedup key: use match_id if available, fall back to (size, price) tuple
+                    if fill.match_id:
+                        dedup_key = fill.match_id
+                    else:
+                        dedup_key = (fill.size, fill.price)
+
+                    if dedup_key not in pending._seen_fills:
+                        # Genuinely new fill — accumulate
+                        pending._seen_fills.add(dedup_key)
+                        pending.filled_size += fill.size
+                        logger.debug(
+                            f"New fill for order {order_id[:16]}...: +{fill.size:.2f} shares "
+                            f"(total filled: {pending.filled_size:.2f}/{pending.size:.2f})"
+                        )
+                    else:
+                        # Status escalation of already-counted fill
+                        logger.debug(
+                            f"Status update for order {order_id[:16]}...: "
+                            f"{pending.status.value} -> {fill.status.value}"
+                        )
+
+                    pending.status = fill.status
+
+                # Remove if fully filled or terminal. A resting (GTD maker)
+                # order survives a CONFIRMED partial fill: the remainder is
+                # still live at the exchange, and later fills must still be
+                # attributable via this registry.
+                if (pending.filled_size >= pending.size or
+                    fill.status == OrderStatus.FAILED or
+                    (fill.status == OrderStatus.CONFIRMED and not pending.resting)):
+                    del self._pending_orders[order_id]
+
+        # Callback
+        if self.on_fill:
+            self._fill_count += 1
+            logger.debug(f"[FILL ROUTING] Invoking on_fill callback for order {order_id[:16] if order_id else 'N/A'}...")
+            self.on_fill(fill)
+        else:
+            logger.warning(
+                f"[FILL DROPPED] No on_fill callback set! Fill for order {order_id[:16] if order_id else 'N/A'}... "
+                f"will not be processed. This indicates a configuration issue."
+            )
 
     async def _handle_order_event(self, data: Dict[str, Any]) -> None:
         """Handle order update event."""
@@ -600,7 +670,12 @@ class UserStreamClient:
         async with self._pending_lock:
             for order_id, pending in list(self._pending_orders.items()):
                 age = now - pending.created_at
-                if age > self.stale_order_timeout_seconds:
+                timeout = (
+                    pending.stale_after
+                    if pending.stale_after is not None
+                    else self.stale_order_timeout_seconds
+                )
+                if age > timeout:
                     stale_orders.append(pending)
 
         for pending in stale_orders:
