@@ -46,6 +46,23 @@ class ActivityStateTracker:
             self._last_event_ts = ts
         self._prune()
 
+    def set_events(self, timestamps, now: Optional[float] = None) -> None:
+        """Replace the recent-event window with an authoritative snapshot.
+
+        Idempotent, unlike note_event (append): calling this repeatedly with
+        the same recent window does not inflate the storm counter. Used to
+        feed the gate from the XTracker authoritative post store, which
+        replaces whole contract-days on each refresh. Only advances
+        _last_event_ts (never rewinds), preserving the fail-closed startup
+        seed and any newer event a faster source already recorded.
+        """
+        now = now if now is not None else time.time()
+        cutoff = now - self.storm_window_seconds
+        recent = sorted(ts for ts in timestamps if ts >= cutoff)
+        self._events = deque(recent)
+        if recent and recent[-1] > self._last_event_ts:
+            self._last_event_ts = recent[-1]
+
     def note_poll(self, now: Optional[float] = None) -> None:
         """Record that the realtime tracker completed a successful poll."""
         self._last_poll_ts = now if now is not None else time.time()

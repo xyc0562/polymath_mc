@@ -1770,6 +1770,39 @@ class MultiEventManager:
         if source == "xtracker":
             self._last_xtracker_refresh_time = ts
 
+    def _update_maker_activity_from_store(self, now: Optional[datetime] = None) -> None:
+        """Heartbeat + refresh the maker activity gate from the XTracker store.
+
+        Replaces the twikit realtime feed (dead since X rotated the
+        UserTweetsAndReplies GraphQL query-hash on 2026-07-12), which left the
+        maker gate permanently `activity_tracker_stale`. Driven off the main
+        loop's ~5s XTracker sync poll: marks the gate fresh (note_poll) and
+        rebuilds its recent-post window from the authoritative store
+        (set_events, idempotent). Fails closed — if the XTracker sync endpoint
+        is unreachable this is not called, so the gate stales out on its own.
+
+        Difference vs twikit: XTracker carries only settlement-countable posts,
+        not non-countable replies-to-others, so the activity signal is slightly
+        narrower — acceptable for gating (countable posts drive the price moves
+        the gate protects against), and the ~seconds XTracker latency is well
+        inside the 20-min quiet / 30-min storm windows.
+        """
+        tracker = getattr(self, "activity_tracker", None)
+        if tracker is None:
+            return
+        now = now or datetime.now(self._tz)
+        now_ts = now.timestamp()
+        cutoff_ts = now_ts - tracker.storm_window_seconds
+        contract_today = self.contract_utils.get_current_contract_date()
+        timestamps: List[float] = []
+        for contract_day in (contract_today - timedelta(days=1), contract_today):
+            for event in self.shared_event_store.get_contract_day_events(contract_day):
+                ts = event.timestamp.timestamp()
+                if ts >= cutoff_ts:
+                    timestamps.append(ts)
+        tracker.set_events(timestamps, now=now_ts)
+        tracker.note_poll(now_ts)
+
     def _next_shared_data_version(self) -> int:
         self.shared_data_version += 1
         return self.shared_data_version
@@ -3490,6 +3523,12 @@ class MultiEventManager:
 
                 if current_sync is not None:
                     self._sync_poll_errors = 0  # Reset on success
+
+                    # Heartbeat the maker activity gate off the robust XTracker
+                    # sync poll (the twikit realtime feed is dead). A reachable
+                    # sync endpoint keeps the gate fresh every ~5s; an
+                    # unreachable one lets it stale out (fail closed).
+                    self._update_maker_activity_from_store(now=datetime.now(self._tz))
 
                     if current_sync != self._last_known_sync:
                         # Sync changed — but XTracker's sync is not atomic,

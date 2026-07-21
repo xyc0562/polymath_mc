@@ -199,6 +199,45 @@ def test_tracker_poll_staleness():
     assert tracker.seconds_since_poll(now + 30) == pytest.approx(30.0)
 
 
+def test_tracker_set_events_is_idempotent():
+    # XTracker replaces whole days each refresh; repeatedly feeding the same
+    # recent window must NOT inflate the storm counter (unlike note_event).
+    tracker = ActivityStateTracker(
+        quiet_window_seconds=1200.0, storm_window_seconds=1800.0, storm_count=5
+    )
+    now = time.time()
+    window = [now - i * 60 for i in range(4)]  # 4 posts in the last 4 min
+    for _ in range(10):
+        tracker.set_events(window, now=now)
+    # Still 4 (< storm_count 5) -> active, not a false storm from accumulation.
+    assert len(tracker._events) == 4
+    assert tracker.state(now) == "active"
+
+
+def test_tracker_set_events_drops_stale_and_detects_quiet():
+    tracker = ActivityStateTracker(
+        quiet_window_seconds=1200.0, storm_window_seconds=1800.0, storm_count=5
+    )
+    # Evaluate past the fail-closed startup seed (a fresh tracker is "active"
+    # until a full quiet window elapses under observation).
+    seed = tracker._last_event_ts
+    later = seed + 1300
+    # A post well outside the 30-min storm window is replaced out; with no
+    # recent posts and the quiet window elapsed, the state is quiet.
+    tracker.set_events([seed - 3000], now=later)
+    assert len(tracker._events) == 0
+    assert tracker.state(later) == "quiet"
+
+
+def test_tracker_set_events_detects_storm():
+    tracker = ActivityStateTracker(
+        quiet_window_seconds=1200.0, storm_window_seconds=1800.0, storm_count=5
+    )
+    now = time.time()
+    tracker.set_events([now - i * 60 for i in range(6)], now=now)  # 6 in 6 min
+    assert tracker.state(now) == "storm"
+
+
 # ----------------------------------------------------------------------
 # OrderExecutor GTD wrappers
 # ----------------------------------------------------------------------
