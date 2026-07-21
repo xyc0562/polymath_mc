@@ -1024,6 +1024,34 @@ def test_shadow_reconcile_emits_structured_events(tmp_path):
     assert "fill_mid" in filled and "rested_seconds" in filled
 
 
+def test_shadow_emits_no_quotes_diag_when_gate_open(tmp_path):
+    # Gate open (healthy fixture) but every bin fails a quote filter: bin 0's
+    # spread is too tight, bins 1-2 have no book. The reason histogram is
+    # emitted so an empty desired-set is diagnosable — the signal that was
+    # missing when the shadow ran 11 days and placed zero quotes.
+    qm, _, _, _ = make_qm(mode="shadow", maker_kwargs={"event_log_dir": str(tmp_path)})
+    tight = {0: _book(0, 0.42, 0.44, token="yes-0")}  # spread 0.02 < min_spread 0.03
+    _reconcile(qm, tight)
+    _reconcile(qm, tight)  # identical histogram -> deduped, no second emit
+    qm.event_log.close()
+
+    diags = [r for r in _read_events(qm.event_log.path) if r["type"] == "no_quotes"]
+    assert len(diags) == 1
+    reasons = diags[0]["reasons"]
+    assert reasons.get("spread_below_min", 0) >= 1
+    assert reasons.get("no_orderbook", 0) == 2
+    assert "quoted" not in reasons
+
+
+def test_no_quotes_diag_not_emitted_when_quote_placed(tmp_path):
+    # When a quote IS produced, the diagnostic must stay silent.
+    qm, _, _, _ = make_qm(mode="shadow", maker_kwargs={"event_log_dir": str(tmp_path)})
+    _reconcile(qm, _standard_books())
+    qm.event_log.close()
+    diags = [r for r in _read_events(qm.event_log.path) if r["type"] == "no_quotes"]
+    assert diags == []
+
+
 def test_forward_markout_sampling_records_horizon_mids(tmp_path):
     qm, _, _, _ = make_qm(mode="shadow", maker_kwargs={"event_log_dir": str(tmp_path)})
     t0 = 1_000_000.0

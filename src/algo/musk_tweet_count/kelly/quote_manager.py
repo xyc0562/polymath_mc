@@ -135,6 +135,13 @@ class QuoteManager:
         self._last_gate_failure: Optional[str] = None
         self._shadow_would_fills: int = 0
 
+        # Per-reconcile histogram of why bins/sides did NOT produce a quote,
+        # populated by compute_desired_quotes. Emitted (deduped) when the gate
+        # is open but the desired set is empty — the diagnostic that was
+        # missing when the shadow ran 11 days and placed zero quotes.
+        self._last_quote_diag: Dict[str, int] = {}
+        self._last_quote_diag_emitted: Optional[tuple] = None
+
         # Durable structured record + forward-markout tracking. The event log
         # is a no-op when no directory is configured (default in tests).
         self.event_log = MakerEventLog(
@@ -417,8 +424,12 @@ class QuoteManager:
         tick_str: str,
         budget_remaining: float,
         capital_remaining: float,
-    ) -> Optional[DesiredQuote]:
-        """Build the passive-entry quote for one side of one bin, or None."""
+    ) -> Tuple[Optional[DesiredQuote], str]:
+        """Build the passive-entry quote for one side of one bin.
+
+        Returns (quote, "") on success or (None, reason) so the caller can
+        aggregate why no quote was produced.
+        """
         cfg = self.config
         tick = float(tick_str)
 
@@ -428,18 +439,18 @@ class QuoteManager:
             else self.no_token_ids.get(bin_index)
         )
         if not token_id:
-            return None
+            return None, "no_token"
 
         view = self._bin_book_view(orderbook, action)
         if view is None:
-            return None
+            return None, "no_book_view"
         best_bid, best_ask = view
 
         # Same entry-price ceiling as the taker path: friction-adjusted
         # fair value. Quoting above it would be a trade Kelly rejects.
         threshold = compute_buy_yes_threshold(fair, self.kelly_config.edge_buffer)
         if threshold <= 0:
-            return None
+            return None, "threshold_nonpositive"
 
         # Improve the touch by one tick, but never beyond the threshold
         # and never crossing (strictly below the ask). The epsilon keeps
@@ -450,11 +461,11 @@ class QuoteManager:
         if price < best_bid - 1e-9:
             # The touch already outbids our max acceptable price; resting
             # behind it would never fill at useful frequency.
-            return None
+            return None, "touch_above_max_price"
         if not (cfg.quote_zone_min <= price <= cfg.quote_zone_max):
-            return None
+            return None, "outside_quote_zone"
         if price >= best_ask:
-            return None
+            return None, "price_crosses_ask"
 
         # Screening utility at the quote price: identical test to taker
         # candidate generation, just at our passive price.
@@ -465,7 +476,7 @@ class QuoteManager:
             after = effective.simulate_buy_no(bin_index, screen_shares, price)
         utility = _compute_portfolio_utility_gain(effective, after, self.kelly_config)
         if utility < self.kelly_config.min_buy_utility:
-            return None
+            return None, "below_min_utility"
 
         # Sizing: capped by per-quote max, per-bin collateral remaining,
         # and the running budget/capital room the caller tracks across the
@@ -484,10 +495,10 @@ class QuoteManager:
             max(0.0, capital_remaining),
         )
         if dollars < max(cfg.min_quote_usd, MIN_ORDER_VALUE_USD):
-            return None
+            return None, "below_min_size_dollars"
         size = int(math.floor(dollars / price))
         if size < 1:
-            return None
+            return None, "size_lt_1"
 
         return DesiredQuote(
             bin_index=bin_index,
@@ -499,7 +510,7 @@ class QuoteManager:
             screening_utility=utility,
             best_bid=best_bid,
             best_ask=best_ask,
-        )
+        ), ""
 
     def _event_allocation(self) -> float:
         limit = self.portfolio.external_capital_limit
@@ -518,6 +529,10 @@ class QuoteManager:
         now = now if now is not None else time.time()
         cfg = self.config
         desired: List[DesiredQuote] = []
+        diag: Dict[str, int] = {}
+
+        def note(reason: str) -> None:
+            diag[reason] = diag.get(reason, 0) + 1
 
         effective = self.kelly_executor._build_effective_portfolio()
         # The replayed base carries stale probabilities; planning uses the
@@ -526,6 +541,7 @@ class QuoteManager:
         effective.dead_bins = list(self.portfolio.dead_bins)
 
         if not effective.probabilities:
+            self._last_quote_diag = {"no_probabilities": 1}
             return []
 
         # Plan the post-reconcile target state: currently-resting quotes
@@ -537,17 +553,21 @@ class QuoteManager:
         dead = set(effective.dead_bins)
         for bin_index, yes_token in self.token_ids.items():
             if bin_index in dead or bin_index >= len(effective.probabilities):
+                note("bin_dead_or_oob")
                 continue
             orderbook = orderbooks.get(bin_index)
             if orderbook is None:
+                note("no_orderbook")
                 continue
             if (
                 orderbook.last_updated is None
                 or now - orderbook.last_updated > cfg.max_book_age_seconds
             ):
+                note("book_stale")
                 continue
             spread = orderbook.yes_spread
             if spread is None or spread < cfg.min_spread:
+                note("spread_below_min")
                 continue
 
             fair_yes = effective.probabilities[bin_index]
@@ -558,7 +578,7 @@ class QuoteManager:
                 (TradeAction.BUY_YES, fair_yes),
                 (TradeAction.BUY_NO, 1.0 - fair_yes),
             ):
-                q = self._candidate_for_side(
+                q, reason = self._candidate_for_side(
                     bin_index,
                     action,
                     fair,
@@ -568,17 +588,36 @@ class QuoteManager:
                     budget_remaining,
                     capital_remaining,
                 )
-                if q is not None and (
-                    best is None or q.screening_utility > best.screening_utility
-                ):
+                if q is None:
+                    note(f"side_{reason}")
+                elif best is None or q.screening_utility > best.screening_utility:
                     best = q
             if best is not None:
+                note("quoted")
                 desired.append(best)
                 cost = best.price * best.size
                 budget_remaining -= cost
                 capital_remaining -= cost
 
+        self._last_quote_diag = diag
         return desired
+
+    def _emit_quote_diag_if_changed(self, now: float) -> None:
+        """When the gate is open but no quote was produced, emit the reason
+        histogram (deduped by content) so the empty desired-set is diagnosable.
+        No-op when a quote was produced (`quoted` present)."""
+        diag = self._last_quote_diag
+        if not diag or diag.get("quoted"):
+            self._last_quote_diag_emitted = None
+            return
+        signature = tuple(sorted(diag.items()))
+        if signature == self._last_quote_diag_emitted:
+            return
+        self._last_quote_diag_emitted = signature
+        self.event_log.emit("no_quotes", now=now, reasons=dict(diag))
+        logger.info(
+            f"[{self.event_name}][MAKER] gate open, no quotes: {dict(diag)}"
+        )
 
     # ------------------------------------------------------------------
     # Reconcile
@@ -654,6 +693,7 @@ class QuoteManager:
 
         # 3. Desired set.
         desired = self.compute_desired_quotes(orderbooks, now)
+        self._emit_quote_diag_if_changed(now)
         desired_by_key = {(q.bin_index, q.action): q for q in desired}
 
         # 4. Diff: cancel stale/mispriced/expiring, then post missing.
@@ -849,6 +889,7 @@ class QuoteManager:
         self._last_gate_failure = None
 
         desired = self.compute_desired_quotes(orderbooks, now)
+        self._emit_quote_diag_if_changed(now)
         desired_by_key = {(q.bin_index, q.action): q for q in desired}
 
         kept_keys = set()
