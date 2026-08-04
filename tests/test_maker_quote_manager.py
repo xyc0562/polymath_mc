@@ -621,7 +621,8 @@ def test_quote_price_capped_by_edge_threshold():
 
 def test_no_quote_below_min_spread():
     qm, _, _, _ = make_qm()
-    desired = qm.compute_desired_quotes({0: _book(0, 0.42, 0.44, token="yes-0")})
+    # 1c spread < min_spread (0.015)
+    desired = qm.compute_desired_quotes({0: _book(0, 0.425, 0.435, token="yes-0")})
     assert desired == []
 
 
@@ -1069,7 +1070,7 @@ def test_shadow_emits_no_quotes_diag_when_gate_open(tmp_path):
     # emitted so an empty desired-set is diagnosable — the signal that was
     # missing when the shadow ran 11 days and placed zero quotes.
     qm, _, _, _ = make_qm(mode="shadow", maker_kwargs={"event_log_dir": str(tmp_path)})
-    tight = {0: _book(0, 0.42, 0.44, token="yes-0")}  # spread 0.02 < min_spread 0.03
+    tight = {0: _book(0, 0.425, 0.435, token="yes-0")}  # spread 0.01 < min_spread 0.015
     _reconcile(qm, tight)
     _reconcile(qm, tight)  # identical histogram -> deduped, no second emit
     qm.event_log.close()

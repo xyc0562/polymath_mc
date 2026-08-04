@@ -309,9 +309,16 @@ class MakerConfig:
     # churn without meaningful capture).
     min_quote_usd: float = 10.0
 
-    # Only quote bins whose YES spread is at least this wide (capture
-    # must dominate residual toxicity; quiet drift measured ~0.1-0.4c).
-    min_spread: float = 0.03
+    # Only quote bins whose YES spread is at least this wide. Originally
+    # 0.03 under the standalone spread-capture framing (capture must
+    # dominate quiet drift of ~0.1-0.4c) — but that rejected nearly every
+    # book (6,152 spread_below_min rejections vs 1 quote in 3 weeks of
+    # shadow). Reframed by the Aug 2026 execution-gap study: the maker is
+    # a cheaper ENTRY channel for positions Kelly wants anyway, and the
+    # taker's measured crossing cost is 3.5-4% mid / 8-13% tails of
+    # notional, so passive entry pays even in 1.5-2c books.
+    # See research/2026-08_execution_gap.md.
+    min_spread: float = 0.015
 
     # Activity gates: quiet = no post in quiet_window_seconds AND fewer
     # than storm_count posts in storm_window_seconds.
@@ -328,7 +335,10 @@ class MakerConfig:
     quote_zone_max: float = 0.95
 
     # Reject quoting when the orderbook snapshot is older than this.
-    max_book_age_seconds: float = 45.0
+    # 45s rejected a large share of reconciles (2,547 book_stale) because
+    # books are fetched at tick start and the tick loop itself often runs
+    # longer; 90s still bounds staleness well inside the maker's TTL.
+    max_book_age_seconds: float = 90.0
 
     # Reject quoting when the activity tracker's last successful poll is
     # older than this (blind tracker = fail closed).
