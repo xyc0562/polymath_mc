@@ -37,6 +37,11 @@ class SimulationConfig:
     spread: float = 0.02  # 2% bid-ask spread
     slippage: float = 0.005  # 0.5% slippage
 
+    # Max notional USD available at the top of the synthetic book per side
+    # (depth proxy — live books cannot absorb arbitrary size; live fill p90 is
+    # ~$250, Aug 2026 study). 0 = unlimited depth (legacy behavior).
+    max_fill_usd: float = 0.0
+
     # Whether to log trade executions
     log_trades: bool = False
 
@@ -125,11 +130,17 @@ class BacktestOrderbookProvider(OrderbookProvider):
         Creates synthetic depth levels around the bid/ask prices
         to simulate realistic orderbook structure.
         """
-        # Create synthetic depth: single level with deep liquidity
-        size_per_level = 1_000_000.0  # Effectively unlimited depth
+        # Create synthetic depth: single level. Unlimited by default; when
+        # max_fill_usd is set, each side offers only that much notional —
+        # a first-order proxy for real book depth.
+        if self.config.max_fill_usd > 0:
+            bid_size = self.config.max_fill_usd / max(yes_bid, 0.001)
+            ask_size = self.config.max_fill_usd / max(yes_ask, 0.001)
+        else:
+            bid_size = ask_size = 1_000_000.0  # Effectively unlimited depth
 
-        yes_bids = [OrderbookLevel(price=yes_bid, size=size_per_level)]
-        yes_asks = [OrderbookLevel(price=yes_ask, size=size_per_level)]
+        yes_bids = [OrderbookLevel(price=yes_bid, size=bid_size)]
+        yes_asks = [OrderbookLevel(price=yes_ask, size=ask_size)]
 
         return UnifiedOrderbook(
             bin_index=bin_index,

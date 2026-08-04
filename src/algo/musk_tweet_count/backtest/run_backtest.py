@@ -444,6 +444,27 @@ def main():
     )
 
     parser.add_argument(
+        "--tail-spread",
+        type=float,
+        default=None,
+        help="Wider simulated spread when the mid is in the tail zone (mid < tail-zone or > 1-tail-zone). Default: None (uniform --spread; legacy).",
+    )
+
+    parser.add_argument(
+        "--tail-zone",
+        type=float,
+        default=0.10,
+        help="Price band defining tail bins for --tail-spread. Default: 0.10.",
+    )
+
+    parser.add_argument(
+        "--max-fill-usd",
+        type=float,
+        default=0.0,
+        help="Max notional USD at the top of the synthetic book per side (depth proxy; live fill p90 ~$250). Default: 0 = unlimited (legacy).",
+    )
+
+    parser.add_argument(
         "--roi",
         type=float,
         default=EdgeBufferConfig.required_roi,
@@ -1228,6 +1249,9 @@ def main():
         initial_capital=args.capital,
         spread=args.spread,
         slippage=args.slippage,
+        tail_spread=args.tail_spread,
+        tail_zone=args.tail_zone,
+        max_fill_usd=args.max_fill_usd,
         trading=trading_config,
         exit_hours_before_settlement=args.exit_hours,
         verbose=args.trade_verbose,

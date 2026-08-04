@@ -101,6 +101,12 @@ class UnifiedBacktestConfig:
     # Market simulation
     spread: float = 0.02  # 2% bid-ask spread
     slippage: float = 0.005  # 0.5% slippage
+    # Friction realism (Aug 2026 fill study; see research/2026-08_execution_gap.md):
+    # wider spread in tail-priced bins, and a per-side top-of-book notional cap.
+    # Defaults preserve legacy behavior (uniform spread, unlimited depth).
+    tail_spread: Optional[float] = None
+    tail_zone: float = 0.10
+    max_fill_usd: float = 0.0
 
     # Trading configuration - uses KellyConfig directly to avoid duplication
     # Override specific fields as needed for backtest (e.g., higher rate limits)
@@ -200,6 +206,8 @@ class UnifiedBacktestRunner:
 
         # Data providers
         self.price_provider = HistoricalDataProvider(
+            tail_spread=config.tail_spread,
+            tail_zone=config.tail_zone,
             price_data_dir=price_data_dir,
             spread=config.spread,
             slippage=config.slippage,
@@ -311,6 +319,7 @@ class UnifiedBacktestRunner:
         backend_config = SimulationConfig(
             spread=self.config.spread,
             slippage=self.config.slippage,
+            max_fill_usd=self.config.max_fill_usd,
             log_trades=False,
         )
 

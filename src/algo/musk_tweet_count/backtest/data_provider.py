@@ -216,6 +216,8 @@ class HistoricalDataProvider:
         price_data_dir: Path,
         spread: float = 0.02,
         slippage: float = 0.005,
+        tail_spread: Optional[float] = None,
+        tail_zone: float = 0.10,
     ):
         """
         Initialize the data provider.
@@ -224,10 +226,17 @@ class HistoricalDataProvider:
             price_data_dir: Directory containing scraped price history
             spread: Bid-ask spread to simulate (default 2%)
             slippage: Additional execution cost (default 0.5%)
+            tail_spread: Wider spread when the mid is inside the tail zone
+                (mid < tail_zone or > 1 - tail_zone). None = uniform spread
+                (legacy behavior). Aug 2026 fill study: live crossing costs in
+                tail bins run ~13% of notional vs ~3.5% at mid prices.
+            tail_zone: Price band defining the tails (default 0.10).
         """
         self.price_data_dir = Path(price_data_dir)
         self.spread = spread
         self.slippage = slippage
+        self.tail_spread = tail_spread
+        self.tail_zone = tail_zone
 
         # Cached data
         self._events: Dict[str, EventPriceData] = {}
@@ -366,10 +375,16 @@ class HistoricalDataProvider:
         if mid_price is None:
             return None
 
+        effective_spread = self.spread
+        if self.tail_spread is not None and (
+            mid_price < self.tail_zone or mid_price > 1.0 - self.tail_zone
+        ):
+            effective_spread = self.tail_spread
+
         return SimulatedOrderbook(
             bin_index=bin_index,
             mid_price=mid_price,
-            spread=self.spread,
+            spread=effective_spread,
         )
 
     def get_all_orderbooks(

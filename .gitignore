@@ -139,3 +139,4 @@ config/hidden_files/*
 .env
 data/backtest_cache
 .claude
+data/price_history_minute/
