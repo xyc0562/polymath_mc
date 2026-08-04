@@ -1,0 +1,101 @@
+{
+  "event_id": "748763",
+  "title": "Elon Musk # tweets July 27 - July 29, 2026?",
+  "short_name": "Jul 27 - Jul 29",
+  "start_date": "2026-07-25",
+  "end_date": "2026-07-29",
+  "num_bins": 10,
+  "last_updated": "2026-08-02T15:36:44.857179",
+  "bins": [
+    {
+      "bin_index": 0,
+      "outcome": "<40",
+      "lower_bound": 0,
+      "upper_bound": 39,
+      "token_id": "86557220983959188815251279549621293389815821662054841850799079236072562533552",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 1,
+      "outcome": "40-64",
+      "lower_bound": 40,
+      "upper_bound": 64,
+      "token_id": "93248266673673344552771074662554550503281683432164403880195426862671022024373",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 2,
+      "outcome": "65-89",
+      "lower_bound": 65,
+      "upper_bound": 89,
+      "token_id": "100748098299145581291704264509992713985603574673392766273123781802977721388833",
+      "is_winner": true,
+      "final_price": 1.0
+    },
+    {
+      "bin_index": 3,
+      "outcome": "90-114",
+      "lower_bound": 90,
+      "upper_bound": 114,
+      "token_id": "48194657860786416445782992406636127608834434431190398963305106768608010208393",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 4,
+      "outcome": "115-139",
+      "lower_bound": 115,
+      "upper_bound": 139,
+      "token_id": "92354437657286786418421541133183071437779999964126289128003661821031326178958",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 5,
+      "outcome": "140-164",
+      "lower_bound": 140,
+      "upper_bound": 164,
+      "token_id": "102233533629756690314296027279221649777789012497882483213899958066392139973204",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 6,
+      "outcome": "165-189",
+      "lower_bound": 165,
+      "upper_bound": 189,
+      "token_id": "47082655233548396630224365215797332463162138751760308397818278471250868890600",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 7,
+      "outcome": "190-214",
+      "lower_bound": 190,
+      "upper_bound": 214,
+      "token_id": "66461135199948662768764336925446661349364829126989087746305125913026324314658",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 8,
+      "outcome": "215-239",
+      "lower_bound": 215,
+      "upper_bound": 239,
+      "token_id": "30609488684546956290509018009649265670300826435517523973008538828271910185942",
+      "is_winner": false,
+      "final_price": 0.0
+    },
+    {
+      "bin_index": 9,
+      "outcome": "240+",
+      "lower_bound": 240,
+      "upper_bound": 999999,
+      "token_id": "52306238653726863998571226353160677901334760042601625655478664931771284651082",
+      "is_winner": false,
+      "final_price": 0.0
+    }
+  ]
+}
