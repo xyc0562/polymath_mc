@@ -132,26 +132,13 @@ class CapitalPool:
                 )
                 return 0.0
 
-            # Check if event already has allocation (e.g., restored from positions).
-            # A restored allocation equals the positions' cost basis, which can
-            # be far below max_per_event — top it up from available capital so
-            # a restarted event trades with the same budget a fresh one gets.
+            # Check if event already has allocation (e.g., restored from positions)
             if event_id in self._allocations:
                 existing = self._allocations[event_id]
-                top_up = min(
-                    max(0.0, self.max_per_event - existing.current_value),
-                    self._available,
-                )
-                if top_up > 0:
-                    existing.current_value += top_up
-                    # Keep initial_allocation in step so realized P&L
-                    # (final_value - initial_allocation) stays meaningful.
-                    existing.initial_allocation += top_up
-                    self._available -= top_up
+                # Return existing allocation value so the event can start
                 logger.info(
                     f"[CAPITAL][ALLOCATE] event={event_id} "
-                    f"restored_allocation_reused=${existing.current_value:.2f} "
-                    f"(top_up=${top_up:.2f})"
+                    f"restored_allocation_reused=${existing.current_value:.2f}"
                 )
                 return existing.current_value
 

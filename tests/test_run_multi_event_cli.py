@@ -172,7 +172,7 @@ def test_parse_args_accepts_consensus_time_only_mode():
     assert args.consensus_time is True
     assert args.consensus_gap is False
     assert args.consensus_time_tau == 12.0
-    assert args.consensus_min_model_weight == 0.15
+    assert args.consensus_min_model_weight == 0.30
 
 
 def test_parse_args_rejects_conflicting_consensus_mode_and_flag():

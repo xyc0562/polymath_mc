@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from py_clob_client_v2.client import ClobClient
@@ -100,16 +100,6 @@ class TradingBotConfig:
     # manager queueing TickRequest objects via request_sync_tick().
     sync_driven: bool = False
 
-    # Authoritative count regression (tweet deletions / XTracker corrections).
-    # A lower trackings count is accepted only after it persists across
-    # this many consecutive reports, over at least this many seconds, AND
-    # the posts-derived count agrees within the tolerance. Until then the
-    # higher value is kept for forecasting but dead-bin detection uses the
-    # disputed lower value (never kill a bin on a contested count).
-    count_regression_min_confirmations: int = 3
-    count_regression_min_age_seconds: float = 1200.0
-    count_regression_posts_tolerance: int = 2
-
     # Legacy alias for slow_tick_interval_seconds
     @property
     def tick_interval_seconds(self) -> int:
@@ -195,13 +185,6 @@ class GASKellyTradingBot:
         # Used for dead bin detection to avoid betting on impossible bins
         self._authoritative_count: Optional[int] = None
 
-        # Count-regression dispute state: set while the trackings API keeps
-        # reporting a value LOWER than the pinned authoritative count
-        # (tweet deletion or XTracker correction vs transient glitch).
-        self._count_dispute_value: Optional[int] = None
-        self._count_dispute_first_ts: Optional[datetime] = None
-        self._count_dispute_confirmations: int = 0
-
         # Last known good count (for detecting regression/stale data)
         self._last_known_count: Optional[int] = None
 
@@ -258,11 +241,7 @@ class GASKellyTradingBot:
         """
         self._data_freshness_checker = checker
 
-    def set_authoritative_count(
-        self,
-        count: int,
-        posts_count: Optional[int] = None,
-    ) -> bool:
+    def set_authoritative_count(self, count: int) -> bool:
         """
         Set the authoritative count from XTracker trackings API.
 
@@ -270,88 +249,19 @@ class GASKellyTradingBot:
         that are impossible based on the authoritative count, even if
         the posts-based count is lower.
 
-        A LOWER count than the pinned value (tweet deletion / XTracker
-        correction) is not accepted immediately: it opens a dispute and is
-        only rebased in after it persists across
-        count_regression_min_confirmations consecutive reports spanning
-        count_regression_min_age_seconds, AND the posts-derived count
-        agrees within count_regression_posts_tolerance. A transient glitch
-        never survives all three gates; a real deletion does.
-
         Args:
             count: Authoritative count from XTracker trackings API
-            posts_count: Count derived from the posts store, used to
-                cross-confirm a regression (None = cannot confirm)
         """
         if self._authoritative_count is not None and count < self._authoritative_count:
-            return self._handle_count_regression(count, posts_count)
-
-        if self._count_dispute_value is not None:
-            logger.info(
-                f"[COUNT][DISPUTE] cleared: trackings count back to "
-                f"{count} >= pinned {self._authoritative_count}"
+            logger.warning(
+                f"Authoritative count regressed: {self._authoritative_count} -> {count}. "
+                f"Keeping higher value."
             )
-            self._clear_count_dispute()
-
+            return False
         changed = self._authoritative_count != count
         self._authoritative_count = count
         logger.debug(f"Updated authoritative count: {count}")
         return changed
-
-    def _handle_count_regression(
-        self,
-        count: int,
-        posts_count: Optional[int],
-    ) -> bool:
-        """Track a regressed trackings count; rebase down once confirmed."""
-        now = datetime.now(timezone.utc)
-
-        if self._count_dispute_value is None:
-            self._count_dispute_first_ts = now
-            self._count_dispute_confirmations = 1
-        else:
-            self._count_dispute_confirmations += 1
-        # Rebase target is the latest reported value (current XTracker state)
-        self._count_dispute_value = count
-
-        age = (now - self._count_dispute_first_ts).total_seconds()
-        min_confirmations = self.config.count_regression_min_confirmations
-        min_age = self.config.count_regression_min_age_seconds
-        tolerance = self.config.count_regression_posts_tolerance
-        posts_agrees = (
-            posts_count is not None
-            and abs(posts_count - count) <= tolerance
-        )
-
-        if (
-            self._count_dispute_confirmations >= min_confirmations
-            and age >= min_age
-            and posts_agrees
-        ):
-            old = self._authoritative_count
-            self._authoritative_count = count
-            confirmations = self._count_dispute_confirmations
-            self._clear_count_dispute()
-            logger.warning(
-                f"[COUNT][REBASE] authoritative count rebased down "
-                f"{old} -> {count} after {confirmations} confirmations "
-                f"over {age:.0f}s (posts_count={posts_count})"
-            )
-            return True
-
-        logger.warning(
-            f"[COUNT][DISPUTE] trackings count regressed "
-            f"{self._authoritative_count} -> {count}; keeping higher value "
-            f"(confirmations={self._count_dispute_confirmations}/{min_confirmations}, "
-            f"age={age:.0f}s/{min_age:.0f}s, "
-            f"posts_count={posts_count}, posts_agrees={posts_agrees})"
-        )
-        return False
-
-    def _clear_count_dispute(self) -> None:
-        self._count_dispute_value = None
-        self._count_dispute_first_ts = None
-        self._count_dispute_confirmations = 0
 
     def get_effective_count_for_dead_bins(self, computed_count: int) -> int:
         """
@@ -360,25 +270,17 @@ class GASKellyTradingBot:
         Uses max(computed_count, authoritative_count) to ensure we don't
         bet on bins that are impossible from the authoritative perspective.
 
-        While a count-regression dispute is open, the DISPUTED (lower)
-        trackings value is used as the authoritative floor instead of the
-        pinned higher one — a bin must never be marked dead on the basis
-        of a contested count.
-
         Args:
             computed_count: Count computed from posts
 
         Returns:
             Effective count for dead bin detection
         """
-        authoritative = self._authoritative_count
-        if authoritative is not None and self._count_dispute_value is not None:
-            authoritative = min(authoritative, self._count_dispute_value)
-        if authoritative is not None:
-            effective = max(computed_count, authoritative)
+        if self._authoritative_count is not None:
+            effective = max(computed_count, self._authoritative_count)
             if effective > computed_count:
                 logger.debug(
-                    f"Using authoritative count ({authoritative}) > "
+                    f"Using authoritative count ({self._authoritative_count}) > "
                     f"computed count ({computed_count}) for dead bin detection"
                 )
             return effective

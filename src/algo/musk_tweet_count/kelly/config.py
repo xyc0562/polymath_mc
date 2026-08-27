@@ -181,12 +181,8 @@ class MarketConsensusConfig:
     gap_gamma: float = 1.5
     gap_floor: float = 0.80
 
-    # Global minimum model weight after combining alpha terms — a floor on the
-    # model's blend weight that mainly bites near settlement (low hours
-    # remaining). 0.15 (more late-stage market deference) beat 0.30 on a
-    # full-history backtest: ~37% lower drawdown for ~5% less return.
-    # See research/2026-07_drawdown_and_forecast_bias.md.
-    min_model_weight: float = 0.15
+    # Global minimum model weight after combining alpha terms.
+    min_model_weight: float = 0.30
 
     # Quote quality gates for the trusted-bin subset.
     min_coverage_ratio: float = 0.0
@@ -451,12 +447,6 @@ class KellyConfig:
     # Lower α = more smoothing. α=0.3 ≈ half-life of 2 ticks (~10 min).
     # Set to 1.0 to disable smoothing (use raw probabilities).
     prob_ema_alpha: float = 0.3
-
-    # Bypass the EMA when any bin's probability moves by at least this
-    # much between ticks: that's real information (tweet burst, boundary
-    # cross), not Monte Carlo noise (~0.005 worst-case per bin at 10k
-    # sims), and smoothing it lags fair value by ~1/alpha slow ticks.
-    prob_ema_jump_threshold: float = 0.02
 
     # Execution-only market impact controls.
     market_impact: MarketImpactConfig = field(default_factory=MarketImpactConfig)
