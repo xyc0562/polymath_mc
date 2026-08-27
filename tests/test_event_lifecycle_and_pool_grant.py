@@ -10,6 +10,9 @@ from src.algo.musk_tweet_count.forecaster.multi_event_manager import (
     MultiEventManager,
 )
 from src.algo.musk_tweet_count.kelly.capital_pool import CapitalPool, CapitalPoolConfig
+from src.algo.musk_tweet_count.kelly.config import CollateralConfig, KellyConfig
+from src.algo.musk_tweet_count.kelly.integration import KellyTradingBot
+from src.algo.musk_tweet_count.kelly.portfolio import Portfolio
 
 
 def _make_pool(total=10_000.0, max_per_event=3_000.0) -> CapitalPool:
@@ -127,3 +130,76 @@ def test_settled_completed_event_not_readded():
     assert added is False
     assert "e1" not in stub._pending_events
     assert "e1" in stub._completed_events
+
+
+# ---------- item 10: pool grant top-up ----------
+
+
+def test_request_capital_tops_up_restored_allocation():
+    pool = _make_pool(total=10_000.0, max_per_event=3_000.0)
+    asyncio.run(pool.restore_allocation("e1", 800.0))
+    assert pool._available == pytest.approx(9_200.0)
+
+    granted = asyncio.run(pool.request_capital("e1"))
+
+    assert granted == pytest.approx(3_000.0)
+    assert pool._available == pytest.approx(7_000.0)
+    allocation = asyncio.run(pool.get_allocation("e1"))
+    assert allocation.initial_allocation == pytest.approx(3_000.0)
+    assert allocation.current_value == pytest.approx(3_000.0)
+
+
+def test_top_up_bounded_by_available_capital():
+    pool = _make_pool(total=1_000.0, max_per_event=3_000.0)
+    asyncio.run(pool.restore_allocation("e1", 800.0))
+    assert pool._available == pytest.approx(200.0)
+
+    granted = asyncio.run(pool.request_capital("e1"))
+
+    assert granted == pytest.approx(1_000.0)  # 800 restored + all 200 available
+    assert pool._available == pytest.approx(0.0)
+
+
+def test_no_clawback_when_restored_exceeds_max_per_event():
+    pool = _make_pool(total=10_000.0, max_per_event=3_000.0)
+    asyncio.run(pool.restore_allocation("e1", 5_000.0))
+    available_before = pool._available
+
+    granted = asyncio.run(pool.request_capital("e1"))
+
+    assert granted == pytest.approx(5_000.0)
+    assert pool._available == pytest.approx(available_before)
+
+
+# ---------- item 10: event budget respects the grant ----------
+
+
+def _budget_bot(c_event_max=3_000.0, external_limit=None) -> KellyTradingBot:
+    bot = object.__new__(KellyTradingBot)
+    bot.config = KellyConfig(collateral=CollateralConfig(c_event_max=c_event_max))
+    bot.portfolio = Portfolio(
+        initial_capital=100.0,
+        capital=100.0,
+        num_bins=1,
+        probabilities=[1.0],
+    )
+    bot.portfolio.set_external_capital_limit(external_limit)
+    return bot
+
+
+def test_event_budget_defaults_to_c_event_max():
+    bot = _budget_bot(external_limit=None)
+
+    assert bot._effective_event_budget() == pytest.approx(3_000.0)
+
+
+def test_event_budget_capped_by_short_pool_grant():
+    bot = _budget_bot(external_limit=800.0)
+
+    assert bot._effective_event_budget() == pytest.approx(800.0)
+
+
+def test_event_budget_never_exceeds_c_event_max():
+    bot = _budget_bot(external_limit=5_000.0)
+
+    assert bot._effective_event_budget() == pytest.approx(3_000.0)

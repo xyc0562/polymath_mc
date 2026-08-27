@@ -148,6 +148,12 @@ class KellyTradingBot:
         self._setup_complete = False
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
         self._ema_probabilities: Optional[List[float]] = None
+        # Pending-jump state for the persistence-gated EMA snap: the EMA
+        # vector frozen at jump detection, plus how long the displacement
+        # has persisted. None = no jump pending.
+        self._prob_jump_baseline: Optional[List[float]] = None
+        self._prob_jump_ticks: int = 0
+        self._prob_jump_first_ts: float = 0.0
         self._last_consensus_context: Optional[Dict[str, Any]] = None
         self._last_boundary_overlay_context: Optional[Dict[str, Any]] = None
         self._last_take_profit_context: Optional[LateBoundaryTakeProfitContext] = None
@@ -364,6 +370,111 @@ class KellyTradingBot:
         if self.kelly_executor:
             await self.kelly_executor.handle_stale_order(pending)
 
+    def _clear_prob_jump(self) -> None:
+        self._prob_jump_baseline = None
+        self._prob_jump_ticks = 0
+        self._prob_jump_first_ts = 0.0
+
+    def _apply_prob_ema(
+        self, probabilities: List[float], now: Optional[float] = None
+    ) -> List[float]:
+        """EMA-smooth the probability vector, snapping only on PERSISTENT jumps.
+
+        The EMA exists to dampen Monte Carlo sampling noise between ticks
+        (~0.5% per bin at 10k sims), but it also lags real information
+        (tweet burst, boundary cross) by ~1/alpha slow ticks. The July 2026
+        single-tick bypass fixed the lag and caused worse: near bin
+        boundaries the nowcast flickers, and passing every >=threshold jump
+        straight through turned transient flickers into immediate full-size
+        repositioning (80% of that era's loss-sold shares traded within
+        10min of a bypass firing, vs 33% of fills overall).
+
+        This version keeps smoothing through every jump and only snaps the
+        EMA to the raw vector once the displacement has PERSISTED: the raw
+        vector must stay >= prob_ema_jump_threshold away (max over bins)
+        from the pre-jump EMA baseline for prob_ema_jump_confirm_ticks
+        consecutive ticks spanning prob_ema_jump_confirm_seconds. A flicker
+        that reverts before confirmation only ever sees the damped path;
+        a real regime move is fully priced right after confirmation instead
+        of ~1/alpha ticks later. Maker quotes are killed at first detection
+        (suspected stale) — that part of the old design was sound.
+        """
+        alpha = self.config.prob_ema_alpha
+        if alpha >= 1.0 or self._ema_probabilities is None:
+            self._clear_prob_jump()
+            self._ema_probabilities = probabilities
+            return probabilities
+
+        now = now if now is not None else time.time()
+        threshold = self.config.prob_ema_jump_threshold
+
+        max_jump = max(
+            (
+                abs(p_new - p_old)
+                for p_new, p_old in zip(probabilities, self._ema_probabilities)
+            ),
+            default=0.0,
+        )
+
+        if self._prob_jump_baseline is None:
+            if max_jump >= threshold:
+                # New suspected jump: freeze the pre-jump EMA as baseline
+                # and kill resting quotes now — if it is real, they are
+                # stale; if it is flicker, requoting is cheap.
+                self._prob_jump_baseline = list(self._ema_probabilities)
+                self._prob_jump_ticks = 0
+                self._prob_jump_first_ts = now
+                quote_manager = getattr(self, "quote_manager", None)
+                if quote_manager is not None:
+                    quote_manager.kill("prob_jump")
+                logger.info(
+                    f"[{self.event_name}] Prob jump detected: max bin jump "
+                    f"{max_jump:.4f} >= {threshold:.4f}; smoothing while "
+                    f"awaiting persistence confirmation"
+                )
+        else:
+            displacement = max(
+                (
+                    abs(p_new - p_base)
+                    for p_new, p_base in zip(probabilities, self._prob_jump_baseline)
+                ),
+                default=0.0,
+            )
+            if displacement < threshold:
+                logger.info(
+                    f"[{self.event_name}] Prob jump reverted after "
+                    f"{self._prob_jump_ticks + 1} ticks (displacement "
+                    f"{displacement:.4f} < {threshold:.4f}); flicker absorbed"
+                )
+                self._clear_prob_jump()
+
+        if self._prob_jump_baseline is not None:
+            self._prob_jump_ticks += 1
+            elapsed = now - self._prob_jump_first_ts
+            if (
+                self._prob_jump_ticks >= self.config.prob_ema_jump_confirm_ticks
+                and elapsed >= self.config.prob_ema_jump_confirm_seconds
+            ):
+                logger.info(
+                    f"[{self.event_name}] Prob jump CONFIRMED after "
+                    f"{self._prob_jump_ticks} ticks / {elapsed:.0f}s; "
+                    f"snapping EMA to raw vector"
+                )
+                self._clear_prob_jump()
+                self._ema_probabilities = probabilities
+                return probabilities
+
+        probabilities = [
+            alpha * p_new + (1 - alpha) * p_old
+            for p_new, p_old in zip(probabilities, self._ema_probabilities)
+        ]
+        # Re-normalize after blending (EMA can drift slightly from sum=1)
+        total = sum(probabilities)
+        if total > 0:
+            probabilities = [p / total for p in probabilities]
+        self._ema_probabilities = probabilities
+        return probabilities
+
     def update_probabilities(
         self,
         current_count: int,
@@ -393,6 +504,7 @@ class KellyTradingBot:
                 logger.info(f"[{self.event_name}] Dead bins (count={current_count}): {dead_bins}")
             self._last_logged_dead_bins = dead_bins
             self._ema_probabilities = None  # Reset EMA on dead bin change
+            self._clear_prob_jump()
 
         # Get raw probabilities from model
         raw_probabilities = self.probability_model(
@@ -406,17 +518,7 @@ class KellyTradingBot:
             probabilities = raw_probabilities
 
         # EMA smooth probabilities to dampen Monte Carlo noise
-        alpha = self.config.prob_ema_alpha
-        if alpha < 1.0 and self._ema_probabilities is not None:
-            probabilities = [
-                alpha * p_new + (1 - alpha) * p_old
-                for p_new, p_old in zip(probabilities, self._ema_probabilities)
-            ]
-            # Re-normalize after blending (EMA can drift slightly from sum=1)
-            total = sum(probabilities)
-            if total > 0:
-                probabilities = [p / total for p in probabilities]
-        self._ema_probabilities = probabilities
+        probabilities = self._apply_prob_ema(probabilities)
 
         if self.boundary_overlay_model is not None:
             probabilities, overlay_context = self.boundary_overlay_model(
@@ -1726,6 +1828,20 @@ class KellyTradingBot:
                     unpriced_shares=0.0, unpriced_reserve=0.0,
                 )
 
+    def _effective_event_budget(self) -> float:
+        """Event budget: c_event_max capped by the shared pool's actual grant.
+
+        portfolio.external_capital_limit carries the CapitalPool grant (set
+        at event start). When the pool granted the full max_per_event —
+        the normal case — this equals c_event_max and behavior is
+        unchanged; it only binds when the pool was short.
+        """
+        event_budget = self.config.collateral.c_event_max
+        limit = self.portfolio.external_capital_limit
+        if limit is not None:
+            event_budget = min(event_budget, limit)
+        return event_budget
+
     async def sync_positions_from_api(self, wallet_address: str) -> Tuple[float, Dict[int, float]]:
         """
         Sync portfolio state from Polymarket API.
@@ -1960,12 +2076,12 @@ class KellyTradingBot:
         # The wallet USDC balance is shared across all events and is NOT this event's capital.
         #
         # Event capital model:
-        #   event_budget = c_event_max (maximum capital for this event)
+        #   event_budget = min(c_event_max, pool grant) (maximum capital for this event)
         #   capital = event_budget - collateral_used (available for new trades)
         #   total_value = capital + collateral_used = event_budget (constant)
         #
         # This ensures Kelly utility calculations use the correct capital base.
-        event_budget = self.config.collateral.c_event_max
+        event_budget = self._effective_event_budget()
         total_collateral = self.portfolio.total_collateral_used
 
         if event_budget > 0:

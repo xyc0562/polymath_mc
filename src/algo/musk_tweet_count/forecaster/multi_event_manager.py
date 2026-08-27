@@ -257,7 +257,9 @@ class MultiEventConfig:
     # Realtime twikit polling for provisional edge detection
     realtime_tracker_enabled: bool = True
     realtime_poll_interval_seconds: float = 20.0
-    realtime_fetch_count: int = 40
+    # X returns ~20 items per timeline page regardless of a larger request;
+    # gap detection requires fetch_count to match the real page size.
+    realtime_fetch_count: int = 20
     realtime_late_tweet_grace_seconds: float = 120.0
     realtime_cookies_path: Optional[str] = None
 
@@ -1681,21 +1683,27 @@ class MultiEventManager:
 
         # Fetch existing positions with actual values from API
         all_positions = await self.fetch_all_positions()
+        position_value = 0.0
         position_cost = 0.0
 
-        # Use actual values from API (cost basis / initialValue)
+        # Baseline uses CURRENT market value, not cost basis. Cost basis kept
+        # tokens from settled markets (worth $0) on the books forever and
+        # inflated the pool with capital that does not exist as spendable pUSD.
         for token_id, pos_info in all_positions.items():
+            position_value += pos_info["current_value"]
             position_cost += pos_info["cost_basis"]
 
-        total_capital = usdc_balance + position_cost
+        total_capital = usdc_balance + position_value
 
         # Set capital in pool
         await self.capital_pool.set_total_from_api(total_capital)
 
         logger.info(
             f"[CAPITAL][INIT_API] usdc_idle={self._fmt_usd(usdc_balance)} "
-            f"position_cost={self._fmt_usd(position_cost)} "
-            f"baseline_total={self._fmt_usd(total_capital)}"
+            f"position_value={self._fmt_usd(position_value)} "
+            f"baseline_total={self._fmt_usd(total_capital)} "
+            f"(position_cost={self._fmt_usd(position_cost)}, "
+            f"unrealized_vs_cost={self._fmt_usd(position_value - position_cost)})"
         )
 
     async def prefetch_shared_data(self, n_days: Optional[int] = None) -> None:
@@ -2668,9 +2676,10 @@ class MultiEventManager:
             computed, api_count, is_valid = await self.validate_counts_for_event(event_info)
             results[event_id] = (computed, api_count, is_valid)
 
-            # Update trading bot with authoritative count for dead bin detection
+            # Update trading bot with authoritative count for dead bin detection.
+            # The posts-derived count cross-confirms regressions (deletions).
             if api_count is not None:
-                bot.set_authoritative_count(api_count)
+                bot.set_authoritative_count(api_count, posts_count=computed)
 
         return results
 
@@ -3096,6 +3105,13 @@ class MultiEventManager:
         # Setup bot (expensive, do outside lock)
         await bot.setup(event_info.bins)
 
+        # Enforce the pool grant as this event's budget cap. Without it the
+        # per-event sync budgets c_event_max regardless of what the pool
+        # actually granted (only binds when the pool is short — a full grant
+        # equals c_event_max and nothing changes).
+        if bot.kelly_bot and bot.kelly_bot.portfolio is not None:
+            bot.kelly_bot.portfolio.set_external_capital_limit(allocated_capital)
+
         # Inject the shared activity tracker into the maker quote manager;
         # without it the maker gates fail closed and nothing is quoted.
         if bot.kelly_bot and bot.kelly_bot.quote_manager is not None:
@@ -3373,14 +3389,21 @@ class MultiEventManager:
                 final_value = allocated_capital
                 cleanup_basis = "alloc_budget"
 
-            # Log settlement P&L of remaining positions for observability.
-            # Note: this is logged ONLY — final_value still uses
-            # allocated_capital so the CapitalPool flow is unchanged
-            # (actual on-chain reconciliation runs through _sync_capital_from_api).
+            # Settlement P&L of remaining positions. When computable (event
+            # actually settled and a final count is available), it adjusts
+            # final_value so CapitalPool history records real per-event
+            # settlement P&L instead of a structurally-zero realized_pnl.
+            # Intra-week trading P&L still reconciles through the periodic
+            # _sync_capital_from_api pass.
+            settlement_pnl = None
             if event_info is not None:
-                await self._log_settlement_pnl(
+                settlement_pnl = await self._log_settlement_pnl(
                     event_id, event_info, bot, allocated_capital
                 )
+
+            if settlement_pnl is not None and allocated_capital > 0:
+                final_value = max(0.0, allocated_capital + settlement_pnl)
+                cleanup_basis = "alloc_plus_settlement_pnl"
 
             logger.info(
                 f"[CAPITAL][RELEASE] event={event_id} cleanup_basis={cleanup_basis} "
@@ -4046,13 +4069,32 @@ class MultiEventManager:
             Dict mapping token_id -> {shares, value, avg_price}
         """
         try:
-            response = requests.get(
-                f"{POLYMARKET_DATA_API}/positions",
-                params={"user": self.wallet_address.lower(), "sizeThreshold": 0},
-                timeout=30,
-            )
-            response.raise_for_status()
-            positions_data = response.json()
+            # Paginate: the Data API caps each page (default 100), and the
+            # wallet accumulates positions from settled markets over time.
+            page_limit = 500
+            positions_data: list = []
+            offset = 0
+            while True:
+                response = requests.get(
+                    f"{POLYMARKET_DATA_API}/positions",
+                    params={
+                        "user": self.wallet_address.lower(),
+                        "sizeThreshold": 0,
+                        "limit": page_limit,
+                        "offset": offset,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                page = response.json()
+                if isinstance(page, dict):
+                    page = page.get("positions", page.get("data", []))
+                if not isinstance(page, list) or not page:
+                    break
+                positions_data.extend(page)
+                if len(page) < page_limit:
+                    break
+                offset += page_limit
 
             # Debug: log raw response structure
             logger.info(f"Positions API raw response type: {type(positions_data).__name__}, len={len(positions_data) if hasattr(positions_data, '__len__') else 'N/A'}")
@@ -4082,12 +4124,17 @@ class MultiEventManager:
                 # Extract both cost basis and current market value
                 avg_price = float(pos.get("avgPrice", 0))
                 initial_value = float(pos.get("initialValue", 0))
-                current_value = float(pos.get("currentValue", 0))
 
                 # Cost basis: what we actually spent (for allocation limit tracking)
                 cost_basis = initial_value if initial_value > 0 else (size * avg_price)
-                # Current value: what it's worth now (for portfolio value tracking)
-                market_value = current_value if current_value > 0 else (size * avg_price)
+                # Current value: what it's worth now (for portfolio value tracking).
+                # Trust the API's currentValue even when it is 0 — resolved
+                # losing tokens are genuinely worth $0. Fall back to cost only
+                # when the field is missing entirely.
+                if pos.get("currentValue") is not None:
+                    market_value = float(pos["currentValue"])
+                else:
+                    market_value = size * avg_price
 
                 return token_id, {
                     "shares": size,

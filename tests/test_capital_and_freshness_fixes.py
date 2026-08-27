@@ -121,6 +121,71 @@ def _positions_page(items):
     return SimpleNamespace(raise_for_status=lambda: None, json=lambda: items)
 
 
+def test_fetch_all_positions_values_resolved_losers_at_zero(monkeypatch):
+    from src.algo.musk_tweet_count.forecaster import multi_event_manager as mem
+
+    pages = [
+        _positions_page(
+            [
+                # Live position: currentValue trusted
+                {"asset": "tok_live", "size": 100.0, "avgPrice": 0.40,
+                 "initialValue": 40.0, "currentValue": 50.0},
+                # Resolved loser: currentValue == 0 must be trusted, not cost
+                {"asset": "tok_dead", "size": 8650.0, "avgPrice": 0.0458,
+                 "initialValue": 396.98, "currentValue": 0},
+                # Missing currentValue: fall back to cost
+                {"asset": "tok_nocur", "size": 10.0, "avgPrice": 0.25,
+                 "initialValue": 2.5},
+            ]
+        )
+    ]
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(params)
+        return pages.pop(0)
+
+    monkeypatch.setattr(mem.requests, "get", fake_get)
+    stub = SimpleNamespace(wallet_address="0xABCDEF1234567890")
+
+    positions = asyncio.run(MultiEventManager.fetch_all_positions(stub))
+
+    assert positions["tok_live"]["current_value"] == 50.0
+    assert positions["tok_live"]["cost_basis"] == 40.0
+    assert positions["tok_dead"]["current_value"] == 0.0
+    assert positions["tok_dead"]["cost_basis"] == 396.98
+    assert positions["tok_nocur"]["current_value"] == 2.5
+    assert len(calls) == 1
+
+
+def test_fetch_all_positions_paginates(monkeypatch):
+    from src.algo.musk_tweet_count.forecaster import multi_event_manager as mem
+
+    full_page = [
+        {"asset": f"tok_{i}", "size": 1.0, "avgPrice": 0.5,
+         "initialValue": 0.5, "currentValue": 0.5}
+        for i in range(500)
+    ]
+    second_page = [
+        {"asset": "tok_last", "size": 1.0, "avgPrice": 0.5,
+         "initialValue": 0.5, "currentValue": 0.5}
+    ]
+    pages = [_positions_page(full_page), _positions_page(second_page)]
+    offsets = []
+
+    def fake_get(url, params=None, timeout=None):
+        offsets.append(params["offset"])
+        return pages.pop(0)
+
+    monkeypatch.setattr(mem.requests, "get", fake_get)
+    stub = SimpleNamespace(wallet_address="0xABCDEF1234567890")
+
+    positions = asyncio.run(MultiEventManager.fetch_all_positions(stub))
+
+    assert offsets == [0, 500]
+    assert len(positions) == 501
+
+
 # ---------- settlement P&L: settled-guard + posts fallback + return value ----------
 
 

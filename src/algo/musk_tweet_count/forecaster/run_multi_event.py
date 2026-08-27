@@ -1047,7 +1047,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--realtime-fetch-count",
         type=int,
         default=None,
-        help="Number of tweets to fetch per twikit poll (default: from config, 40).",
+        help="Number of tweets to fetch per twikit poll (default: from config, 20).",
     )
     parser.add_argument(
         "--realtime-late-tweet-grace",

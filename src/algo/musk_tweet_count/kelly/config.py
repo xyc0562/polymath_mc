@@ -448,6 +448,25 @@ class KellyConfig:
     # Set to 1.0 to disable smoothing (use raw probabilities).
     prob_ema_alpha: float = 0.3
 
+    # Bypass the EMA when any bin's probability moves by at least this
+    # much between ticks: that's real information (tweet burst, boundary
+    # cross), not Monte Carlo noise (~0.005 worst-case per bin at 10k
+    # sims), and smoothing it lags fair value by ~1/alpha slow ticks.
+    #
+    # A detected jump does NOT pass through immediately. The Jul 2026 live
+    # run showed single-tick pass-through converts nowcast flicker near
+    # bin boundaries into loss-realizing full-size repositioning: 80% of
+    # that era's loss-sold shares traded within 10min of a bypass firing
+    # (vs 33% of fills overall). Instead the jump must PERSIST — the raw
+    # vector staying displaced from the pre-jump EMA by at least the
+    # threshold for prob_ema_jump_confirm_ticks consecutive ticks spanning
+    # prob_ema_jump_confirm_seconds — before the EMA snaps to the raw
+    # vector. Until confirmed (or after it reverts), normal smoothing
+    # applies, so transient flickers only ever see the damped path.
+    prob_ema_jump_threshold: float = 0.02
+    prob_ema_jump_confirm_ticks: int = 3
+    prob_ema_jump_confirm_seconds: float = 120.0
+
     # Execution-only market impact controls.
     market_impact: MarketImpactConfig = field(default_factory=MarketImpactConfig)
 

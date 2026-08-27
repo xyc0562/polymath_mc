@@ -177,14 +177,68 @@ def _cmp_cdf(mean_round: float, nu_round: float) -> Tuple[np.ndarray, np.ndarray
     return xs, cdf
 
 
-def _cmp_nu_from_k(mean: float, k: float, nu_scale: float = 1.0) -> float:
-    """Map NegBin-style k to COM-Poisson ν, with optional scaling.
+# Bounds for the CMP ν solve. The lower bound is a numerical guard; the
+# old code floored the CLOSED-FORM map k/(k+μ) at 0.05, which clipped the
+# whole live parameter range (remaining mean 20-100, bucket k' = k/2.5 in
+# 0.2-1.2 → ν 0.004-0.05), delivering roughly HALF the intended std on
+# evening buckets and silently turning today_std_inflation_factor into a
+# no-op (k'=0.4 and k=1.0 both floored to the same ν).
+CMP_NU_MIN = 1e-4
+CMP_NU_MAX = 5.0
 
-    Base mapping: ν = k/(k+μ)  (matches NegBin variance)
-    nu_scale > 1 → higher ν → thinner tails (especially left)
+
+def _cmp_variance(mean_round: float, nu_round: float) -> float:
+    """Variance of the mean-matched CMP at (mean, ν) from its cached CDF."""
+    xs, cdf = _cmp_cdf(mean_round, nu_round)
+    pmf = np.diff(np.concatenate(([0.0], cdf)))
+    m = float((xs * pmf).sum())
+    return float((((xs - m) ** 2) * pmf).sum())
+
+
+@lru_cache(maxsize=512)
+def _cmp_nu_from_k(mean: float, k: float, nu_scale: float = 1.0) -> float:
+    """Solve the CMP ν that delivers the NegBin target variance μ(1+μ/k).
+
+    The closed-form map ν = k/(k+μ) relies on the approximation
+    var ≈ μ/ν, which under-delivers the target std by 30-60% across this
+    system's parameter range (measured 2026-07-09) — so solve ν
+    numerically instead. Variance is monotone decreasing in ν for the
+    mean-matched family, so a log-scale bisection converges quickly; the
+    result is lru_cached per rounded (mean, k, nu_scale) and callers pass
+    rounded args, so the solve runs once per parameter set.
+
+    ATTAINABILITY: at fixed mean μ the CMP family's variance is capped by
+    its ν→0 geometric-like limit, var ≈ μ(1+μ). NegBin targets with
+    k < 1 exceed that ceiling and saturate at it (ν pinned at CMP_NU_MIN)
+    — the sampler then delivers the widest distribution the family
+    admits. Consequence: dispersion inflation (k/s) only widens the
+    distribution while the inflated k stays ≥ ~1; beyond that the knob
+    saturates. This is a property of COM-Poisson itself, not the solve.
+
+    nu_scale > 1 → higher ν → thinner tails (applied to the solved ν).
     """
-    nu = k / (k + mean) * nu_scale
-    return max(0.05, min(nu, 5.0))
+    target_var = mean * (1.0 + mean / k)
+
+    lo, hi = CMP_NU_MIN, CMP_NU_MAX
+    if _cmp_variance(mean, round(lo, 6)) <= target_var:
+        # Even the widest admissible CMP cannot reach the target variance
+        nu = lo
+    elif _cmp_variance(mean, round(hi, 6)) >= target_var:
+        nu = hi
+    else:
+        for _ in range(40):
+            mid = math.sqrt(lo * hi)
+            if _cmp_variance(mean, round(mid, 6)) > target_var:
+                # Too wide → need thinner → raise ν
+                lo = mid
+            else:
+                hi = mid
+            if hi / lo < 1.01:
+                break
+        nu = math.sqrt(lo * hi)
+
+    nu *= nu_scale
+    return max(CMP_NU_MIN, min(nu, CMP_NU_MAX))
 
 
 
@@ -209,14 +263,14 @@ def sample_com_poisson(mean: float, k: float, size: int, rng: np.random.Generato
     """
     if mean <= 0:
         return np.zeros(size)
-    if k <= 0:
-        return np.full(size, int(round(mean)))
 
-    nu = _cmp_nu_from_k(mean, k, nu_scale)
-
-    # Round for cache hits (2 decimal places)
+    # Round args so the cached ν-solve and CDF are reused across ticks
     mean_r = round(mean, 2)
-    nu_r = round(nu, 4)
+    k_r = round(k, 4)
+    if k_r <= 0:
+        return np.full(size, int(round(mean)))
+    nu = _cmp_nu_from_k(mean_r, k_r, round(nu_scale, 4))
+    nu_r = round(nu, 6)
 
     _, cdf = _cmp_cdf(mean_r, nu_r)
     u = rng.uniform(0, 1, size)
@@ -228,12 +282,13 @@ def sample_com_poisson_scalar(mean: float, k: float, rng: np.random.Generator,
     """Sample a single value from COM-Poisson."""
     if mean <= 0:
         return 0
-    if k <= 0:
-        return int(round(mean))
 
-    nu = _cmp_nu_from_k(mean, k, nu_scale)
     mean_r = round(mean, 2)
-    nu_r = round(nu, 4)
+    k_r = round(k, 4)
+    if k_r <= 0:
+        return int(round(mean))
+    nu = _cmp_nu_from_k(mean_r, k_r, round(nu_scale, 4))
+    nu_r = round(nu, 6)
 
     _, cdf = _cmp_cdf(mean_r, nu_r)
     u = rng.random()

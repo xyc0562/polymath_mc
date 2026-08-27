@@ -48,6 +48,16 @@ class RealtimePollResult:
     events: List[TweetEvent]
     gap_detected: bool = False
     newest_timestamp: Optional[datetime] = None
+    # Non-countable activity (Musk's replies to OTHER accounts). These do
+    # NOT count toward settlement and must never enter the EventStore —
+    # but they prove he is at the keyboard, which makes them a leading
+    # indicator for countable posts (session-state covariate). Logged for
+    # the session-model study; consumers may ignore this field.
+    activity_events: List[TweetEvent] = None
+
+    def __post_init__(self):
+        if self.activity_events is None:
+            self.activity_events = []
 
 
 class RealtimeTweetTracker:
@@ -59,7 +69,10 @@ class RealtimeTweetTracker:
         contract_utils: ContractDayUtils,
         cookies_path: Path,
         poll_interval: float = 10.0,
-        fetch_count: int = 40,
+        # X's UserTweetsAndReplies GraphQL page returns ~20 items regardless
+        # of a larger requested count (verified live 2026-07-08); the gap
+        # check (len >= fetch_count) only works when this matches reality.
+        fetch_count: int = 20,
         late_tweet_grace_seconds: float = 120.0,
         recent_id_limit: int = DEFAULT_RECENT_ID_LIMIT,
         failure_backoff_seconds: float = DEFAULT_FAILURE_BACKOFF_SECONDS,
@@ -186,6 +199,24 @@ class RealtimeTweetTracker:
             return timestamp.replace(tzinfo=timezone.utc)
         return timestamp
 
+    @staticmethod
+    def _is_countable(tweet) -> bool:
+        """Resolution rule (per market terms): replies do NOT count toward
+        settlement UNLESS Musk is replying to his own thread. The
+        "Replies" timeline we poll is a superset that includes replies to
+        other accounts — counting those would inflate the provisional
+        count during reply sessions, exactly when it matters most. Keep
+        top-level posts/retweets/quotes and self-replies; treat replies
+        whose target is unknown as non-countable (a missed self-reply
+        costs minutes until the next authoritative sync, a phantom count
+        causes wrong trades).
+        """
+        legacy = getattr(tweet, "_legacy", None) or {}
+        reply_to_user = legacy.get("in_reply_to_user_id_str")
+        if reply_to_user is not None:
+            return str(reply_to_user) == MUSK_USER_ID
+        return legacy.get("in_reply_to_status_id_str") is None
+
     def _tweet_to_event(self, tweet) -> Optional[TweetEvent]:
         created_at = getattr(tweet, "created_at_datetime", None)
         if created_at is None:
@@ -239,7 +270,13 @@ class RealtimeTweetTracker:
             return RealtimePollResult(events=[])
 
         try:
-            tweets = list(await self._client.get_user_tweets(MUSK_USER_ID, "Tweets", count=self.fetch_count))
+            # "Replies" = the tweets-AND-replies profile timeline (superset
+            # of "Tweets"). Needed because the "Tweets" tab omits Musk's
+            # SELF-THREAD replies, which DO count toward settlement (the
+            # ~11% of officially-counted posts the June 2026 run missed).
+            # Replies to OTHER accounts do NOT count and are filtered out
+            # in _tweet_to_event per the resolution rules.
+            tweets = list(await self._client.get_user_tweets(MUSK_USER_ID, "Replies", count=self.fetch_count))
             tweets.sort(key=lambda tweet: getattr(tweet, "created_at_datetime", datetime.min.replace(tzinfo=self.contract_utils.tz)))
 
             if not tweets:
@@ -259,6 +296,19 @@ class RealtimeTweetTracker:
                     oldest_timestamp.isoformat(),
                     self._watermark.isoformat(),
                 )
+                # Make the gap state non-sticky: advance the watermark past
+                # the fetched window and remember its ids so the NEXT poll
+                # resumes incremental detection. Without this, once 40+
+                # tweets pass unobserved every subsequent poll re-detects
+                # the same gap and provisional detection is dead until
+                # restart (observed live 2026-06-26 and 2026-07-01). The
+                # missed middle is covered by the authoritative refresh the
+                # caller forces on gap_detected.
+                for tweet in tweets:
+                    tweet_id = getattr(tweet, "id", None)
+                    if tweet_id is not None:
+                        self._remember_id(str(tweet_id))
+                self._watermark = newest_timestamp
                 self._consecutive_errors = 0
                 self._backoff_until = None
                 return RealtimePollResult(events=[], gap_detected=True, newest_timestamp=newest_timestamp)
@@ -268,6 +318,7 @@ class RealtimeTweetTracker:
                 cutoff = self._watermark - timedelta(seconds=self.late_tweet_grace_seconds)
 
             events: List[TweetEvent] = []
+            activity_events: List[TweetEvent] = []
             for tweet in tweets:
                 event = self._tweet_to_event(tweet)
                 if event is None:
@@ -279,7 +330,20 @@ class RealtimeTweetTracker:
 
                 if event.event_id:
                     self._remember_id(event.event_id)
-                events.append(event)
+                if self._is_countable(tweet):
+                    events.append(event)
+                else:
+                    # Non-countable reply to another account: never enters
+                    # the count, but is a live session-state signal.
+                    activity_events.append(event)
+
+            if activity_events:
+                logger.info(
+                    "[ACTIVITY] %d non-countable repl%s detected (session signal), newest=%s",
+                    len(activity_events),
+                    "y" if len(activity_events) == 1 else "ies",
+                    activity_events[-1].timestamp.isoformat(),
+                )
 
             if self._watermark is None or newest_timestamp > self._watermark:
                 self._watermark = newest_timestamp
@@ -288,7 +352,11 @@ class RealtimeTweetTracker:
             self._backoff_until = None
             self._last_cookie_error = None
             self._last_cookie_error_label = None
-            return RealtimePollResult(events=events, newest_timestamp=newest_timestamp)
+            return RealtimePollResult(
+                events=events,
+                newest_timestamp=newest_timestamp,
+                activity_events=activity_events,
+            )
 
         except Exception as exc:
             self._consecutive_errors += 1
@@ -310,8 +378,12 @@ class RealtimeTweetTracker:
                     exc,
                 )
 
-            # Rotate to next cookie on failure
-            self._rotate_cookie()
+            # Rotate only on cookie/account errors. Network failures are
+            # cookie-agnostic — rotating on them (June 2026: ~18k rotations,
+            # mostly ConnectTimeout) just churns sessions and spreads
+            # rate-limit pressure across every account for no benefit.
+            if self._last_cookie_error:
+                self._rotate_cookie()
 
             if self._consecutive_errors >= 5:
                 self._backoff_until = now + timedelta(seconds=self.failure_backoff_seconds)
