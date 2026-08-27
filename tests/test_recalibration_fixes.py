@@ -93,6 +93,7 @@ def _ema_bot(alpha=0.3, threshold=0.02, confirm_ticks=3, confirm_seconds=120.0) 
     bot._prob_jump_baseline = None
     bot._prob_jump_ticks = 0
     bot._prob_jump_first_ts = 0.0
+    bot._bin_mid_history = {}
     return bot
 
 
@@ -197,3 +198,70 @@ def test_alpha_one_disables_smoothing():
     result = bot._apply_prob_ema([0.21, 0.29, 0.5], now=30.0)
 
     assert result == [0.21, 0.29, 0.5]
+
+
+def test_market_corroborated_jump_snaps_immediately():
+    bot = _ema_bot(confirm_ticks=3, confirm_seconds=120.0)
+    bot._apply_prob_ema([0.2, 0.3, 0.5], now=0.0)
+
+    jumped = [0.05, 0.15, 0.8]  # max displacement on bin 2, model direction UP
+    # Market mid for bin 2 rose 3c within the corroboration window
+    bot._bin_mid_history = {2: [(0.0, 0.50), (25.0, 0.53)]}
+
+    result = bot._apply_prob_ema(jumped, now=30.0)
+
+    assert result == jumped  # snapped on the detection tick
+    assert bot._prob_jump_baseline is None
+    assert bot._ema_probabilities == jumped
+
+
+def test_wrong_direction_market_move_does_not_corroborate():
+    bot = _ema_bot(confirm_ticks=3, confirm_seconds=120.0)
+    bot._apply_prob_ema([0.2, 0.3, 0.5], now=0.0)
+
+    jumped = [0.05, 0.15, 0.8]  # model direction UP on bin 2
+    bot._bin_mid_history = {2: [(0.0, 0.50), (25.0, 0.46)]}  # market fell
+
+    result = bot._apply_prob_ema(jumped, now=30.0)
+
+    assert result != jumped  # still damped, persistence clock running
+    assert bot._prob_jump_baseline is not None
+
+
+def test_small_market_move_does_not_corroborate():
+    bot = _ema_bot(confirm_ticks=3, confirm_seconds=120.0)
+    bot._apply_prob_ema([0.2, 0.3, 0.5], now=0.0)
+
+    jumped = [0.05, 0.15, 0.8]
+    bot._bin_mid_history = {2: [(0.0, 0.50), (25.0, 0.51)]}  # only 1c
+
+    result = bot._apply_prob_ema(jumped, now=30.0)
+
+    assert result != jumped
+    assert bot._prob_jump_baseline is not None
+
+
+def test_corroboration_confirms_pending_jump_midway():
+    bot = _ema_bot(confirm_ticks=5, confirm_seconds=600.0)
+    bot._apply_prob_ema([0.2, 0.3, 0.5], now=0.0)
+
+    jumped = [0.05, 0.15, 0.8]
+    r1 = bot._apply_prob_ema(jumped, now=30.0)   # flat market: pending
+    assert r1 != jumped and bot._prob_jump_baseline is not None
+
+    # Market catches up mid-wait -> confirm without the persistence clock
+    bot._bin_mid_history = {2: [(0.0, 0.50), (60.0, 0.54)]}
+    r2 = bot._apply_prob_ema(jumped, now=60.0)
+    assert r2 == jumped
+    assert bot._prob_jump_baseline is None
+
+
+def test_record_bin_mids_prunes_to_window():
+    bot = _ema_bot()
+    ob = SimpleNamespace(mid_price_yes=0.42)
+    win = bot.config.prob_ema_jump_market_confirm_window_seconds
+    bot._record_bin_mids({1: ob}, now=0.0)
+    bot._record_bin_mids({1: ob}, now=win + 100.0)
+
+    hist = bot._bin_mid_history[1]
+    assert len(hist) == 1 and hist[0][0] == win + 100.0

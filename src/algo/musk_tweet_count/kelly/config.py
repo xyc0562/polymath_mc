@@ -453,19 +453,30 @@ class KellyConfig:
     # cross), not Monte Carlo noise (~0.005 worst-case per bin at 10k
     # sims), and smoothing it lags fair value by ~1/alpha slow ticks.
     #
-    # A detected jump does NOT pass through immediately. The Jul 2026 live
-    # run showed single-tick pass-through converts nowcast flicker near
-    # bin boundaries into loss-realizing full-size repositioning: 80% of
-    # that era's loss-sold shares traded within 10min of a bypass firing
-    # (vs 33% of fills overall). Instead the jump must PERSIST — the raw
-    # vector staying displaced from the pre-jump EMA by at least the
-    # threshold for prob_ema_jump_confirm_ticks consecutive ticks spanning
-    # prob_ema_jump_confirm_seconds — before the EMA snaps to the raw
-    # vector. Until confirmed (or after it reverts), normal smoothing
-    # applies, so transient flickers only ever see the damped path.
+    # A detected jump does NOT pass through immediately. The Jul/Aug 2026
+    # live A/B autopsy (research/2026-08_ema_jump_forensics) showed
+    # single-tick pass-through converts nowcast flicker near bin
+    # boundaries into loss-realizing full-size repositioning — but ONLY
+    # when the model moved alone: sells into a market that had itself
+    # fallen were the profitable fast exits (+3.4c/sh vs settlement),
+    # while sells the market did not corroborate were the disasters
+    # (-$7k of eventual winners dumped while the book sat still).
+    # A pending jump therefore confirms through either of two paths:
+    #  1. MARKET CORROBORATION (fast): the max-displacement bin's market
+    #     mid has moved in the model's direction by at least
+    #     prob_ema_jump_market_confirm_move within the last
+    #     prob_ema_jump_market_confirm_window_seconds -> snap now.
+    #  2. PERSISTENCE (slow): the raw vector stays displaced from the
+    #     pre-jump EMA by >= threshold for prob_ema_jump_confirm_ticks
+    #     consecutive ticks spanning prob_ema_jump_confirm_seconds.
+    # Until confirmed (or after the displacement reverts), normal
+    # smoothing applies, so uncorroborated flickers only ever see the
+    # damped path.
     prob_ema_jump_threshold: float = 0.02
     prob_ema_jump_confirm_ticks: int = 3
     prob_ema_jump_confirm_seconds: float = 120.0
+    prob_ema_jump_market_confirm_move: float = 0.02
+    prob_ema_jump_market_confirm_window_seconds: float = 1800.0
 
     # Execution-only market impact controls.
     market_impact: MarketImpactConfig = field(default_factory=MarketImpactConfig)

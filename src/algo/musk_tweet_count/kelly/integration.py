@@ -148,12 +148,15 @@ class KellyTradingBot:
         self._setup_complete = False
         self._last_logged_dead_bins: Optional[List[int]] = None  # Track to avoid spam
         self._ema_probabilities: Optional[List[float]] = None
-        # Pending-jump state for the persistence-gated EMA snap: the EMA
-        # vector frozen at jump detection, plus how long the displacement
-        # has persisted. None = no jump pending.
+        # Pending-jump state for the gated EMA snap: the EMA vector frozen
+        # at jump detection, plus how long the displacement has persisted.
+        # None = no jump pending.
         self._prob_jump_baseline: Optional[List[float]] = None
         self._prob_jump_ticks: int = 0
         self._prob_jump_first_ts: float = 0.0
+        # Rolling per-bin market mid history (ts, mid) for the jump
+        # market-corroboration check. Pruned to the corroboration window.
+        self._bin_mid_history: Dict[int, List[Tuple[float, float]]] = {}
         self._last_consensus_context: Optional[Dict[str, Any]] = None
         self._last_boundary_overlay_context: Optional[Dict[str, Any]] = None
         self._last_take_profit_context: Optional[LateBoundaryTakeProfitContext] = None
@@ -375,6 +378,53 @@ class KellyTradingBot:
         self._prob_jump_ticks = 0
         self._prob_jump_first_ts = 0.0
 
+    def _record_bin_mids(
+        self, orderbooks: Optional[Dict[int, UnifiedOrderbook]], now: float
+    ) -> None:
+        """Append current market mids to the rolling per-bin history."""
+        if not orderbooks:
+            return
+        keep_from = now - self.config.prob_ema_jump_market_confirm_window_seconds
+        for bin_idx, ob in orderbooks.items():
+            mid = ob.mid_price_yes
+            if mid is None:
+                continue
+            hist = self._bin_mid_history.setdefault(bin_idx, [])
+            hist.append((now, mid))
+            while hist and hist[0][0] < keep_from:
+                hist.pop(0)
+
+    def _market_corroborates_jump(self, probabilities: List[float]) -> bool:
+        """True when the market itself has moved with the pending model jump.
+
+        Looks at the bin with the largest model displacement from the
+        pre-jump baseline and asks whether its market mid has moved in the
+        same direction by at least prob_ema_jump_market_confirm_move
+        within the corroboration window. Sells the market corroborated
+        were the profitable fast exits in the Jul/Aug 2026 autopsy;
+        model-only jumps (flat book) were the losses.
+        """
+        baseline = self._prob_jump_baseline
+        if baseline is None:
+            return False
+        b_star = max(
+            range(len(probabilities)),
+            key=lambda i: abs(probabilities[i] - (baseline[i] if i < len(baseline) else 0.0)),
+        )
+        model_dir = probabilities[b_star] - baseline[b_star]
+        if model_dir == 0.0:
+            return False
+        hist = self._bin_mid_history.get(b_star)
+        if not hist or len(hist) < 2:
+            return False
+        mid_now = hist[-1][1]
+        # Furthest-back retained sample (history is pruned to the window)
+        mid_then = hist[0][1]
+        market_move = mid_now - mid_then
+        if model_dir * market_move <= 0:
+            return False
+        return abs(market_move) >= self.config.prob_ema_jump_market_confirm_move
+
     def _apply_prob_ema(
         self, probabilities: List[float], now: Optional[float] = None
     ) -> List[float]:
@@ -451,13 +501,19 @@ class KellyTradingBot:
         if self._prob_jump_baseline is not None:
             self._prob_jump_ticks += 1
             elapsed = now - self._prob_jump_first_ts
-            if (
+            persisted = (
                 self._prob_jump_ticks >= self.config.prob_ema_jump_confirm_ticks
                 and elapsed >= self.config.prob_ema_jump_confirm_seconds
-            ):
+            )
+            corroborated = not persisted and self._market_corroborates_jump(probabilities)
+            if persisted or corroborated:
+                reason = (
+                    f"persisted {self._prob_jump_ticks} ticks / {elapsed:.0f}s"
+                    if persisted
+                    else "market corroborated"
+                )
                 logger.info(
-                    f"[{self.event_name}] Prob jump CONFIRMED after "
-                    f"{self._prob_jump_ticks} ticks / {elapsed:.0f}s; "
+                    f"[{self.event_name}] Prob jump CONFIRMED ({reason}); "
                     f"snapping EMA to raw vector"
                 )
                 self._clear_prob_jump()
@@ -517,7 +573,10 @@ class KellyTradingBot:
         else:
             probabilities = raw_probabilities
 
-        # EMA smooth probabilities to dampen Monte Carlo noise
+        # EMA smooth probabilities to dampen Monte Carlo noise; feed the
+        # market mid history first so a pending jump can be confirmed by
+        # market corroboration on this same tick.
+        self._record_bin_mids(orderbooks, time.time())
         probabilities = self._apply_prob_ema(probabilities)
 
         if self.boundary_overlay_model is not None:
