@@ -524,10 +524,14 @@ class GammaAPIClient:
 class XTrackerClient:
     """Client for XTracker API - Tweet count tracking data."""
 
+    TRACKINGS_CACHE_TTL_SECONDS = 600.0
+
     def __init__(self, base_url: str = XTRACKER_API_URL):
         self.base_url = base_url
         self.session = requests.Session()
-        self._trackings_cache: Dict[str, List[Dict]] = {}  # user_handle -> trackings
+        # user_handle -> (fetched_at monotonic, trackings). Expires so that
+        # trackings created after startup (every newly listed event) are found.
+        self._trackings_cache: Dict[str, Tuple[float, List[Dict]]] = {}
 
     def get_user_trackings(self, handle: str = MUSK_XTRACKER_HANDLE) -> List[Dict]:
         """
@@ -539,8 +543,9 @@ class XTrackerClient:
         Returns:
             List of tracking dictionaries with id, startDate, endDate, etc.
         """
-        if handle in self._trackings_cache:
-            return self._trackings_cache[handle]
+        cached = self._trackings_cache.get(handle)
+        if cached and time.monotonic() - cached[0] < self.TRACKINGS_CACHE_TTL_SECONDS:
+            return cached[1]
 
         try:
             response = self.session.get(
@@ -556,13 +561,13 @@ class XTrackerClient:
             else:
                 trackings = data.get("trackings", [])
 
-            self._trackings_cache[handle] = trackings
+            self._trackings_cache[handle] = (time.monotonic(), trackings)
             logger.info(f"Fetched {len(trackings)} trackings for @{handle}")
             return trackings
 
         except requests.RequestException as e:
             logger.error(f"Failed to fetch trackings for @{handle}: {e}")
-            return []
+            return cached[1] if cached else []
 
     def get_tracking_stats(self, tracking_id: str) -> Optional[Dict]:
         """
